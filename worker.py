@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from aioslsk.client import SoulSeekClient
@@ -34,7 +35,6 @@ from wanted import (
     artist_name,
     count_value,
     holes_for_search,
-    holes_from_catalog,
     is_enabled,
     optional_id,
     song_key,
@@ -571,28 +571,50 @@ class Worker:
     def _same_artist(self, left: str, right: str) -> bool:
         return (left or "").casefold().strip() == (right or "").casefold().strip()
 
+    def _cooled(self, artist: str, cooldowns: dict, now: datetime) -> bool:
+        until = cooldowns.get((artist or "").casefold().strip())
+        if not until:
+            return False
+        try:
+            stamp = datetime.fromisoformat(until)
+        except ValueError:
+            return False
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return now < stamp
+
     def choose_focus_artist(self, missing: list[dict], holes: list[dict]) -> str | None:
         if not self.cfg.focus_one_artist:
             return None
         current = self.store.focus_artist()
-        if current and not self.store.artist_on_cooldown(current):
+        cooldowns = self.store.artist_cooldowns()
+        now = datetime.now(timezone.utc)
+        if current and not self._cooled(current, cooldowns, now):
             return current
         if current:
             log.info("Artist %s is on cooldown; picking the next one", current)
+        if self.catalog.synced:
+            choices = self.store.wanted_choices()
+            for chosen in self.catalog.artist_labels():
+                if self._cooled(chosen, cooldowns, now):
+                    continue
+                if not self.catalog.has_enabled_work(chosen, choices):
+                    continue
+                self.store.set_focus_artist(chosen)
+                log.info("Focusing on artist: %s", chosen)
+                return chosen
+            self.store.set_focus_artist(None)
+            return None
         for album in sorted(missing, key=lambda a: artist_name(a).casefold()):
             chosen = artist_name(album)
-            if self.store.artist_on_cooldown(chosen):
-                continue
-            if not self._artist_searchable(chosen):
+            if self._cooled(chosen, cooldowns, now):
                 continue
             self.store.set_focus_artist(chosen)
             log.info("Focusing on artist: %s", chosen)
             return chosen
         for hole in sorted(holes, key=lambda h: (h["artist_name"] or "").casefold()):
             chosen = hole["artist_name"]
-            if self.store.artist_on_cooldown(chosen):
-                continue
-            if not self._artist_searchable(chosen):
+            if self._cooled(chosen, cooldowns, now):
                 continue
             self.store.set_focus_artist(chosen)
             log.info("Focusing on artist: %s", chosen)
@@ -607,19 +629,6 @@ class Worker:
         self.store.set_artist_cooldown(artist, days)
         self.store.set_focus_artist(None)
         log.info("Finished visit for %s; skipping them for %s days", artist, days)
-
-    def _artist_searchable(self, artist: str) -> bool:
-        if not self.catalog.synced:
-            return True
-        choices = self.store.wanted_choices()
-        related = [
-            item
-            for item in self.catalog.items()
-            if item.kind in {"album", "song"} and self._same_artist(item.artist, artist)
-        ]
-        if not related:
-            return True
-        return any(is_enabled(item.key, choices) for item in related)
 
     def _work_for_artist(
         self, artist: str, missing: list[dict], *, include_tracks: bool = True
@@ -660,15 +669,42 @@ class Worker:
                 )
         return albums, holes
 
+    def _empty_albums(self, albums: list[dict]) -> list[dict]:
+        truly_missing = []
+        for album in albums:
+            stats = album.get("statistics") or {}
+            files = count_value(stats.get("trackFileCount") if isinstance(stats, dict) else None)
+            if files > 0:
+                continue
+            truly_missing.append(album)
+        return truly_missing
+
     async def cycle(self) -> None:
         if self.control.is_stopped():
             return
         # A Sync in the desktop app keeps the wanted list in memory. Until that
         # happens, keep reading Lidarr 20 pages at a time and resume next cycle.
-        cached = self.catalog.album_payloads()
-        if cached is not None:
-            catalog = list(cached)
-            log.info("Using synced wanted list (%s albums)", len(catalog))
+        if self.catalog.synced:
+            cached = self.catalog.album_payloads() or []
+            log.info("Using synced wanted list (%s albums)", len(cached))
+            focus = self.choose_focus_artist([], [])
+            if not focus:
+                log.info("No artist ready (all cooled off or nothing missing)")
+                self.sweep_incomplete_folder()
+                return
+            choices = self.store.wanted_choices()
+            artist_albums, artist_holes = self.catalog.work_for_artist(focus)
+            truly_missing = self._empty_albums(artist_albums)
+            checked_missing = albums_for_search(truly_missing, choices)
+            covered = {int(album["id"]) for album in checked_missing if album.get("id") is not None}
+            holes = []
+            for hole in artist_holes:
+                album = hole.get("album") or {}
+                album_id = album.get("id") if isinstance(album, dict) else None
+                if album_id is not None and int(album_id) in covered:
+                    continue
+                holes.append(hole)
+            holes = holes_for_search(holes, choices)
         else:
             start_page = int(self.store.get_meta("missing_page") or "1")
             catalog, next_page, exhausted = self.lidarr.wanted_missing(
@@ -683,33 +719,17 @@ class Worker:
                 len(catalog),
                 "end of list" if exhausted else f"next page {next_page}",
             )
-        catalog.sort(key=lambda a: (artist_name(a).casefold(), (a.get("title") or "").casefold()))
-        focus = self.choose_focus_artist(catalog, [])
-        if not focus:
-            log.info("No artist ready (all cooled off or nothing missing)")
-            self.sweep_incomplete_folder()
-            return
-        missing, api_holes = self._work_for_artist(focus, catalog, include_tracks=not self.catalog.synced)
-        truly_missing = []
-        for album in missing:
-            stats = album.get("statistics") or {}
-            files = count_value(stats.get("trackFileCount") if isinstance(stats, dict) else None)
-            if files > 0:
-                continue
-            truly_missing.append(album)
-        choices = self.store.wanted_choices()
-        checked_missing = albums_for_search(truly_missing, choices)
-        if self.catalog.synced:
-            holes = [
-                hole
-                for hole in holes_from_catalog(self.catalog.items())
-                if self._same_artist(hole["artist_name"], focus)
-            ]
-            covered = {int(album["id"]) for album in checked_missing}
-            holes = [hole for hole in holes if int(hole["album"]["id"]) not in covered]
-        else:
-            holes = api_holes
-        holes = holes_for_search(holes, choices)
+            catalog.sort(key=lambda a: (artist_name(a).casefold(), (a.get("title") or "").casefold()))
+            focus = self.choose_focus_artist(catalog, [])
+            if not focus:
+                log.info("No artist ready (all cooled off or nothing missing)")
+                self.sweep_incomplete_folder()
+                return
+            missing, api_holes = self._work_for_artist(focus, catalog, include_tracks=True)
+            truly_missing = self._empty_albums(missing)
+            choices = self.store.wanted_choices()
+            checked_missing = albums_for_search(truly_missing, choices)
+            holes = holes_for_search(api_holes, choices)
         hidden = len(truly_missing) - len(checked_missing)
         if hidden:
             log.info("Left out %s unchecked album(s)", hidden)
@@ -735,7 +755,7 @@ class Worker:
             album_id = int(album["id"])
             artist = artist_name(album)
             title = album.get("title") or "Unknown Album"
-            if not is_enabled(album_key(album_id), self.store.wanted_choices()):
+            if not is_enabled(album_key(album_id), choices):
                 log.info("Skip unchecked album %s - %s", artist, title)
                 return
             async with sem:
@@ -769,6 +789,7 @@ class Worker:
                 log.exception("Could not list missing tracks")
                 return
         log.info("Lidarr missing tracks on partial albums: %s", len(holes))
+        choices = self.store.wanted_choices()
         processed = 0
         for hole in holes:
             if self.control.is_stopped():
@@ -796,7 +817,7 @@ class Worker:
                     continue
                 artist = hole.get("artist_name") or "Unknown Artist"
                 album_title = hole.get("album_title") or album.get("title") or "Unknown Album"
-                if not is_enabled(song_key(track_id), self.store.wanted_choices()):
+                if not is_enabled(song_key(track_id), choices):
                     continue
                 if self.store.should_skip_track(track_id, self.cfg.retry_hours):
                     continue

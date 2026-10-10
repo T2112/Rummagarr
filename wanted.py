@@ -138,30 +138,71 @@ class WantedCatalog:
     _items: list[WantedItem] = field(default_factory=list)
     synced: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    _grouped: dict[str, list[WantedItem]] = field(default_factory=dict)
+    _albums: list[dict] = field(default_factory=list)
+    _albums_by_artist: dict[str, list[dict]] = field(default_factory=dict)
+    _holes_by_artist: dict[str, list[dict]] = field(default_factory=dict)
+    _artist_labels: list[str] = field(default_factory=list)
 
     def replace(self, items: list[WantedItem]) -> None:
+        grouped: dict[str, list[WantedItem]] = {}
+        albums: list[dict] = []
+        albums_by_artist: dict[str, list[dict]] = {}
+        holes_by_artist: dict[str, list[dict]] = {}
+        labels: list[str] = []
+        seen_albums: set[int] = set()
+        for item in items:
+            if item.kind == "artist":
+                labels.append(item.artist)
+                continue
+            grouped.setdefault(artist_token(item.artist), []).append(item)
+            if item.kind == "album" and item.album_id is not None and item.payload and item.album_id not in seen_albums:
+                seen_albums.add(item.album_id)
+                albums.append(item.payload)
+                albums_by_artist.setdefault(artist_token(item.artist), []).append(item.payload)
+            elif item.kind == "song" and item.track and item.payload and item.payload.get("id") is not None:
+                holes_by_artist.setdefault(artist_token(item.artist), []).append(
+                    {
+                        "track": item.track,
+                        "album": item.payload,
+                        "artist_name": item.artist,
+                        "album_title": item.album,
+                    }
+                )
         with self._lock:
             self._items = list(items)
+            self._grouped = grouped
+            self._albums = albums
+            self._albums_by_artist = albums_by_artist
+            self._holes_by_artist = holes_by_artist
+            self._artist_labels = labels
             self.synced = True
 
     def items(self) -> list[WantedItem]:
         with self._lock:
             return list(self._items)
 
+    def artist_labels(self) -> list[str]:
+        with self._lock:
+            return list(self._artist_labels)
+
+    def has_enabled_work(self, artist: str, choices: dict[str, bool]) -> bool:
+        with self._lock:
+            children = self._grouped.get(artist_token(artist), [])
+        if not children:
+            return True
+        return any(is_enabled(row.key, choices) for row in children)
+
+    def work_for_artist(self, artist: str) -> tuple[list[dict], list[dict]]:
+        token = artist_token(artist)
+        with self._lock:
+            return list(self._albums_by_artist.get(token, ())), list(self._holes_by_artist.get(token, ()))
+
     def album_payloads(self) -> list[dict] | None:
         with self._lock:
             if not self.synced:
                 return None
-            albums: list[dict] = []
-            seen: set[int] = set()
-            for item in self._items:
-                if item.kind != "album" or item.album_id is None or not item.payload:
-                    continue
-                if item.album_id in seen:
-                    continue
-                seen.add(item.album_id)
-                albums.append(item.payload)
-            return albums
+            return list(self._albums)
 
 
 def build_catalog(albums: list[dict], holes: list[dict] | None = None) -> list[WantedItem]:
@@ -292,39 +333,92 @@ def filter_view(items: list[WantedItem], view: str) -> list[WantedItem]:
     return list(items)
 
 
-def item_checked(item: WantedItem, items: list[WantedItem], choices: dict[str, bool]) -> bool:
+def artist_token(name: str) -> str:
+    return (name or "").casefold().strip()
+
+
+def children_by_artist(items: list[WantedItem]) -> dict[str, list[WantedItem]]:
+    """Albums and songs keyed by artist. Built once so checks are not O(n) per row."""
+    grouped: dict[str, list[WantedItem]] = {}
+    for row in items:
+        if row.kind == "artist":
+            continue
+        grouped.setdefault(artist_token(row.artist), []).append(row)
+    return grouped
+
+
+def item_checked(
+    item: WantedItem,
+    items: list[WantedItem],
+    choices: dict[str, bool],
+    grouped: dict[str, list[WantedItem]] | None = None,
+) -> bool:
     if item.kind != "artist":
         return is_enabled(item.key, choices)
-    children = [row for row in items if row.kind != "artist" and same_artist(row.artist, item.artist)]
+    if grouped is None:
+        grouped = children_by_artist(items)
+    children = grouped.get(artist_token(item.artist), [])
     if not children:
         return is_enabled(item.key, choices)
     return all(is_enabled(row.key, choices) for row in children)
 
 
-def choice_updates(item: WantedItem, enabled: bool, items: list[WantedItem]) -> dict[str, bool]:
+def choice_updates(
+    item: WantedItem,
+    enabled: bool,
+    items: list[WantedItem],
+    grouped: dict[str, list[WantedItem]] | None = None,
+) -> dict[str, bool]:
     if item.kind != "artist":
         return {item.key: enabled}
-    keys = [item.key]
-    keys.extend(row.key for row in items if row.kind != "artist" and same_artist(row.artist, item.artist))
-    return {key: enabled for key in keys}
-
-
-def select_all_updates(visible: list[WantedItem], items: list[WantedItem], enabled: bool) -> dict[str, bool]:
-    updates: dict[str, bool] = {}
-    for item in visible:
-        updates.update(choice_updates(item, enabled, items))
+    if grouped is None:
+        grouped = children_by_artist(items)
+    updates = {item.key: enabled}
+    for row in grouped.get(artist_token(item.artist), []):
+        updates[row.key] = enabled
     return updates
 
 
-def select_all_state(visible: list[WantedItem], items: list[WantedItem], choices: dict[str, bool]) -> str:
+def select_all_updates(visible: list[WantedItem], items: list[WantedItem], enabled: bool) -> dict[str, bool]:
+    grouped = children_by_artist(items)
+    updates: dict[str, bool] = {}
+    for item in visible:
+        updates.update(choice_updates(item, enabled, items, grouped))
+    return updates
+
+
+def select_all_state(
+    visible: list[WantedItem],
+    items: list[WantedItem],
+    choices: dict[str, bool],
+    grouped: dict[str, list[WantedItem]] | None = None,
+) -> str:
     if not visible:
         return "empty"
-    flags = [item_checked(item, items, choices) for item in visible]
+    if grouped is None:
+        grouped = children_by_artist(items)
+    flags = [item_checked(item, items, choices, grouped) for item in visible]
     if all(flags):
         return "all"
     if not any(flags):
         return "none"
     return "some"
+
+
+_SORT_FIELDS = {
+    "kind": lambda item: item.kind,
+    "artist": lambda item: item.artist.casefold(),
+    "album": lambda item: item.album.casefold(),
+    "song": lambda item: item.song.casefold(),
+    "detail": lambda item: item.detail.casefold(),
+}
+
+
+def sort_items(items: list[WantedItem], column: str, reverse: bool = False) -> list[WantedItem]:
+    key = _SORT_FIELDS.get(column)
+    if key is None:
+        return list(items)
+    return sorted(items, key=key, reverse=reverse)
 
 
 def albums_for_search(albums: list[dict], choices: dict[str, bool]) -> list[dict]:
@@ -368,18 +462,59 @@ def holes_from_catalog(items: list[WantedItem]) -> list[dict]:
     return holes
 
 
-def catalog_from_lidarr(client, *, max_pages: int = 100, page_size: int = 250, on_progress=None) -> tuple[list[WantedItem], bool]:
-    """Read Lidarr wanted/missing and the missing songs on those albums."""
+def catalog_from_lidarr(
+    client,
+    *,
+    max_pages: int = 100,
+    page_size: int = 250,
+    on_progress=None,
+    should_cancel=None,
+) -> tuple[list[WantedItem], bool]:
+    """Read Lidarr wanted/missing and the missing songs on those albums.
+
+    ``on_progress(done, total)`` is called as songs are read. ``total`` is 0
+    while album pages are still loading. ``should_cancel`` stops the read
+    without returning a partial catalog.
+    """
+    last_report = -10_000
+
+    def report(done: int, total: int, *, force: bool = False) -> None:
+        nonlocal last_report
+        if on_progress is None:
+            return
+        if not force and done - last_report < 500:
+            return
+        last_report = done
+        on_progress(done, total)
+
+    def page_loaded(count: int) -> None:
+        report(count, 0, force=True)
+
     albums, _next_page, exhausted = client.wanted_missing(
         start_page=1,
         max_pages=max(1, int(max_pages)),
         page_size=page_size,
+        on_page=page_loaded,
+        should_cancel=should_cancel,
     )
+    if should_cancel is not None and should_cancel():
+        return [], False
+    expected = 0
+    for album in albums:
+        if not isinstance(album, dict):
+            continue
+        files, total = _stats(album)
+        expected += max(total - files, 0)
+    if expected <= 0:
+        expected = max(len(albums), 1)
     holes: list[dict] = []
-    total = len(albums)
-    for index, album in enumerate(albums):
-        if on_progress is not None:
-            on_progress(index, total)
+    seen = 0
+    for album in albums:
+        if should_cancel is not None and should_cancel():
+            return [], False
+        if not isinstance(album, dict):
+            log.warning("Skipping an album that is not an object")
+            continue
         album_id = optional_id(album.get("id"))
         if album_id is None:
             log.warning("Skipping album %s: no usable id", album.get("title") or "?")
@@ -417,6 +552,11 @@ def catalog_from_lidarr(client, *, max_pages: int = 100, page_size: int = 250, o
                         "album_title": title,
                     }
                 )
+                seen += 1
             except Exception:
                 log.exception("Skipping a track on %s — %s", artist, title)
+        report(seen, expected)
+    report(max(seen, expected), max(seen, expected), force=True)
+    if should_cancel is not None and should_cancel():
+        return [], False
     return build_catalog(albums, holes), bool(exhausted)

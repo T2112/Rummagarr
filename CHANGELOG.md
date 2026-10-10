@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [1.6.0] — 2026-10-10
+
+### Fixed
+
+- The Wanted tab no longer locks up the window on a large Lidarr list. Sync runs off the UI thread, shows progress such as "Syncing 45,000 / 100,000", and can be cancelled.
+- The list only draws the rows on screen. Checkboxes, Select all, the artist / album / song filters, and column sorting stay, and they no longer walk the whole list once per row.
+- Selections are saved in one database transaction. The worker looks up the focused artist's albums and songs from an index instead of rescanning the full wanted list on every pass.
+
 ## [1.5.0] — 2026-10-10
 
 ### Added

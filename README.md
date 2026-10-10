@@ -1,6 +1,6 @@
 # Lidarr Soulseek Worker
 
-**Version 1.5.0** — Windows desktop app. No Docker. No slskd.
+**Version 1.6.0** — Windows desktop app. No Docker. No slskd.
 
 The worker reads Lidarr **Wanted → Missing**, searches Soulseek, downloads matching albums or individual missing tracks, converts FLAC/WAV to MP3 when needed, asks Lidarr to import and rename, then cleans leftover files.
 
@@ -52,7 +52,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 That installs the Python dependencies and PyInstaller, freezes `desktop_app.py`, and compiles `packaging\LidarrSoulseek.iss` with Inno Setup 6. If Inno Setup is not already installed, the script downloads it. The setup program is written to:
 
 ```text
-dist\LidarrSoulseek-Setup-1.5.0.exe
+dist\LidarrSoulseek-Setup-1.6.0.exe
 ```
 
 The same steps run in GitHub Actions (`.github/workflows/windows-installer.yml`) on `windows-latest`. Pull requests and pushes to `main` upload the installer as a workflow artifact.
@@ -62,6 +62,12 @@ To publish a public download, push a tag `v<version>` that matches the `VERSION`
 This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs on, and Inno Setup is a Windows program. Push the branch and let that workflow produce the `.exe`.
 
 `python main.py` still runs the worker without the window, for the original script install below.
+
+## What's new in 1.6.0
+
+- Wanted sync stays responsive on a list of about 100,000 songs, with progress and Cancel
+- The Wanted tab only draws the visible rows, so Select all and the filters stay quick
+- Full changelog: [CHANGELOG.md](CHANGELOG.md)
 
 ## What's new in 1.5.0
 

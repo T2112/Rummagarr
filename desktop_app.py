@@ -6,6 +6,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
@@ -43,11 +44,13 @@ from wanted import (
     VIEWS,
     WantedItem,
     catalog_from_lidarr,
+    children_by_artist,
     choice_updates,
     filter_view,
     item_checked,
     select_all_state,
     select_all_updates,
+    sort_items,
 )
 from worker import Worker
 
@@ -56,6 +59,12 @@ log = logging.getLogger("lidarr_slsk.desktop")
 CHECKED = "☑"
 UNCHECKED = "☐"
 DONE_TRANSFER = {"COMPLETE", "FAILED", "ABORTED"}
+# 2,000 pages × 250 albums. Sync can be cancelled before it finishes.
+WANTED_SYNC_PAGES = 2000
+WANTED_WINDOW_MIN = 12
+# Small choice edits stay on the caller so tests see them immediately.
+# A select-all of a huge view is written in one transaction off the UI thread.
+_SYNC_CHOICE_LIMIT = 400
 
 
 def enable_windows_dpi() -> None:
@@ -802,8 +811,16 @@ class DesktopApp(tk.Tk):
         self._update_prompt: UpdatePrompt | None = None
         self._download_progress: DownloadProgress | None = None
         self._syncing = False
+        self._sync_cancel = threading.Event()
         self._updating_select_all = False
         self._row_items: dict[str, WantedItem] = {}
+        self._wanted_rows: list[WantedItem] = []
+        self._wanted_grouped: dict[str, list[WantedItem]] = {}
+        self._wanted_offset = 0
+        self._wanted_window = WANTED_WINDOW_MIN
+        self._wanted_sort: tuple[str, bool] | None = None
+        self._choices_cache: dict[str, bool] | None = None
+        self._choice_job = 0
         self._transfer_index: dict[str, int] = {}
         self.title(f"Lidarr Soulseek {app_version()}")
         self.geometry("1100x720")
@@ -953,20 +970,37 @@ class DesktopApp(tk.Tk):
         self.select_all.pack(side="right")
         self.count_label = ttk.Label(parent, textvariable=self.wanted_status, style="Muted.TLabel")
         self.count_label.pack(anchor="w", pady=(0, 6))
-        frame, self.wanted = scrolled_tree(
-            parent,
-            (
-                ("mark", "", 46, False),
-                ("kind", "Kind", 80, False),
-                ("artist", "Artist", 180, True),
-                ("album", "Album", 220, True),
-                ("song", "Song", 200, True),
-                ("detail", "Detail", 180, True),
-            ),
+        frame = ttk.Frame(parent)
+        columns = (
+            ("mark", "", 46, False),
+            ("kind", "Kind", 80, False),
+            ("artist", "Artist", 180, True),
+            ("album", "Album", 220, True),
+            ("song", "Song", 200, True),
+            ("detail", "Detail", 180, True),
         )
+        names = [column[0] for column in columns]
+        self.wanted = ttk.Treeview(frame, columns=names, show="headings", selectmode="browse")
+        self.wanted_scroll = ttk.Scrollbar(frame, orient="vertical", command=self._wanted_scroll)
+        self.wanted.grid(row=0, column=0, sticky="nsew")
+        self.wanted_scroll.grid(row=0, column=1, sticky="ns")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        for name, heading, width, stretch in columns:
+            if name == "mark":
+                self.wanted.heading(name, text=heading)
+            else:
+                self.wanted.heading(name, text=heading, command=lambda column=name: self.on_wanted_sort(column))
+            self.wanted.column(name, width=width, minwidth=40, anchor="w", stretch=stretch)
         frame.pack(fill="both", expand=True)
         self.wanted.bind("<Button-1>", self.on_wanted_click)
         self.wanted.bind("<space>", self.on_wanted_space)
+        self.wanted.bind("<MouseWheel>", self._wanted_wheel)
+        self.wanted.bind("<Button-4>", self._wanted_wheel)
+        self.wanted.bind("<Button-5>", self._wanted_wheel)
+        self.wanted.bind("<Up>", self._wanted_key)
+        self.wanted.bind("<Down>", self._wanted_key)
+        self.wanted.bind("<Configure>", self._wanted_resized)
 
     def _tick(self) -> None:
         if self._shutting_down:
@@ -1158,24 +1192,50 @@ class DesktopApp(tk.Tk):
             self.recent.yview_moveto(yview[0])
 
     def on_view(self) -> None:
+        self._wanted_offset = 0
         self.refresh_wanted()
 
     def on_sync(self) -> None:
         if self._syncing:
+            self._sync_cancel.set()
+            self.wanted_status.set("Cancelling sync…")
             return
         self._syncing = True
-        self.sync_button.state(["disabled"])
-        self.wanted_status.set("Syncing from Lidarr…")
+        self._sync_cancel = threading.Event()
+        self.sync_button.configure(text="Cancel")
+        self.wanted_status.set("Loading albums from Lidarr…")
         cfg = self.worker.cfg
+        cancel = self._sync_cancel
+        last_paint = 0.0
+
+        def progress(done: int, total: int) -> None:
+            nonlocal last_paint
+            now = time.monotonic()
+            if total and done < total and now - last_paint < 0.15:
+                return
+            last_paint = now
+            if total <= 0:
+                text = f"Loading albums {done:,}…"
+            else:
+                text = f"Syncing {done:,} / {total:,}"
+            self._post(lambda text=text: self.wanted_status.set(text))
 
         def work() -> None:
             client = LidarrClient(cfg.lidarr_url, cfg.lidarr_api_key)
             try:
-                def progress(index: int, total: int) -> None:
-                    self._post(lambda i=index, n=total: self.wanted_status.set(f"Syncing songs {i + 1} of {n}…"))
-
-                items, exhausted = catalog_from_lidarr(client, max_pages=100, on_progress=progress)
-                self._post(lambda: self._sync_finished(None, items, exhausted))
+                items, exhausted = catalog_from_lidarr(
+                    client,
+                    max_pages=WANTED_SYNC_PAGES,
+                    on_progress=progress,
+                    should_cancel=cancel.is_set,
+                )
+                if cancel.is_set():
+                    self._post(lambda: self._sync_finished(None, [], True, cancelled=True))
+                    return
+                self.worker.store.remember_wanted_keys([item.key for item in items])
+                self.worker.catalog.replace(items)
+                choices = self.worker.store.wanted_choices()
+                self._post(lambda: self._sync_finished(None, items, exhausted, choices=choices))
             except Exception as exc:
                 self._post(lambda exc=exc: self._sync_finished(exc, [], True))
             finally:
@@ -1189,29 +1249,42 @@ class DesktopApp(tk.Tk):
         except tk.TclError:
             pass
 
-    def _sync_finished(self, error: Exception | None, items: list[WantedItem], exhausted: bool) -> None:
+    def _sync_finished(
+        self,
+        error: Exception | None,
+        items: list[WantedItem],
+        exhausted: bool,
+        *,
+        cancelled: bool = False,
+        choices: dict[str, bool] | None = None,
+    ) -> None:
         self._syncing = False
         try:
-            self.sync_button.state(["!disabled"])
+            self.sync_button.configure(text="Sync")
         except tk.TclError:
+            return
+        if cancelled:
+            self.wanted_status.set("Sync cancelled.")
             return
         if error is not None:
             self.wanted_status.set(f"Sync failed: {error}")
             return
-        self.worker.store.remember_wanted_keys([item.key for item in items])
-        self.worker.catalog.replace(items)
+        if choices is not None:
+            self._choices_cache = choices
+        else:
+            self._choices_cache = None
+        self._wanted_offset = 0
         self.refresh_wanted()
-        more = "" if exhausted else " Lidarr still has more pages; this pass kept the first 100."
-        self.wanted_status.set(f"Synced {len(items)} rows from Lidarr. {self.wanted_status.get()}{more}")
+        more = "" if exhausted else " Lidarr still has more pages; Sync again to continue, or raise the page cap."
+        self.wanted_status.set(f"Synced {len(items):,} rows from Lidarr.{more}")
 
     def on_select_all(self) -> None:
         if self._updating_select_all:
             return
         items = self.worker.catalog.items()
-        visible = filter_view(items, self.view_var.get() or VIEW_EVERYTHING)
+        visible = self._ordered_rows(items)
         enabled = bool(self.select_all_var.get())
-        self.worker.store.set_wanted_choices(select_all_updates(visible, items, enabled))
-        self.refresh_wanted()
+        self._apply_choices(select_all_updates(visible, items, enabled))
 
     def on_wanted_click(self, event) -> None:
         if self.wanted.identify_region(event.y) not in {"cell", "tree"}:
@@ -1233,43 +1306,170 @@ class DesktopApp(tk.Tk):
         if item is None:
             return
         items = self.worker.catalog.items()
-        enabled = not item_checked(item, items, self.worker.store.wanted_choices())
-        self.worker.store.set_wanted_choices(choice_updates(item, enabled, items))
+        grouped = children_by_artist(items)
+        enabled = not item_checked(item, items, self._choices(), grouped)
+        self._apply_choices(choice_updates(item, enabled, items, grouped))
+
+    def _choices(self) -> dict[str, bool]:
+        if self._choices_cache is None:
+            self._choices_cache = self.worker.store.wanted_choices()
+        return self._choices_cache
+
+    def _apply_choices(self, updates: dict[str, bool]) -> None:
+        if not updates:
+            self.refresh_wanted()
+            return
+        self._choices().update(updates)
+        if len(updates) <= _SYNC_CHOICE_LIMIT:
+            self.worker.store.set_wanted_choices(updates)
+            self.refresh_wanted()
+            return
+        self._choice_job += 1
+        token = self._choice_job
+        self.wanted_status.set(f"Saving {len(updates):,} selections…")
         self.refresh_wanted()
+
+        def work() -> None:
+            error = None
+            try:
+                self.worker.store.set_wanted_choices(updates)
+            except Exception as exc:
+                error = exc
+            self._post(lambda: self._choices_saved(token, error))
+
+        threading.Thread(target=work, name="wanted-choices", daemon=True).start()
+
+    def _choices_saved(self, token: int, error: Exception | None) -> None:
+        if token != self._choice_job:
+            return
+        if error is not None:
+            self._choices_cache = None
+            self.wanted_status.set(f"Could not save selections: {error}")
+        self.refresh_wanted()
+
+    def _ordered_rows(self, items: list[WantedItem] | None = None) -> list[WantedItem]:
+        if items is None:
+            items = self.worker.catalog.items()
+        visible = filter_view(items, self.view_var.get() or VIEW_EVERYTHING)
+        if self._wanted_sort:
+            column, reverse = self._wanted_sort
+            visible = sort_items(visible, column, reverse)
+        return visible
+
+    def on_wanted_sort(self, column: str) -> None:
+        if self._wanted_sort and self._wanted_sort[0] == column:
+            self._wanted_sort = (column, not self._wanted_sort[1])
+        else:
+            self._wanted_sort = (column, False)
+        self._wanted_offset = 0
+        self.refresh_wanted()
+
+    def _wanted_resized(self, event) -> None:
+        row_px = 28
+        window = max(WANTED_WINDOW_MIN, int(event.height) // row_px or 1)
+        if window == self._wanted_window:
+            return
+        self._wanted_window = window
+        if self._wanted_rows:
+            self._paint_wanted(self._choices(), self._wanted_grouped)
+
+    def _wanted_scroll(self, *args) -> None:
+        total = len(self._wanted_rows)
+        window = max(1, self._wanted_window)
+        if total <= window:
+            return
+        if args[0] == "moveto":
+            self._wanted_offset = int(float(args[1]) * total)
+        elif args[0] == "scroll":
+            step = int(args[1])
+            if len(args) > 2 and args[2] == "pages":
+                step *= window
+            self._wanted_offset += step
+        self._wanted_offset = max(0, min(self._wanted_offset, total - window))
+        self._paint_wanted(self._choices(), self._wanted_grouped)
+
+    def _wanted_wheel(self, event):
+        if getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
+            self._wanted_scroll("scroll", 3, "units")
+        else:
+            self._wanted_scroll("scroll", -3, "units")
+        return "break"
+
+    def _wanted_key(self, event):
+        children = self.wanted.get_children()
+        selected = self.wanted.selection()
+        if not children or not selected or selected[0] not in children:
+            return
+        index = children.index(selected[0])
+        if event.keysym == "Down" and index == len(children) - 1 and self._wanted_offset + len(children) < len(self._wanted_rows):
+            self._wanted_scroll("scroll", 1, "units")
+            last = self.wanted.get_children()
+            if last:
+                self.wanted.selection_set(last[-1])
+                self.wanted.focus(last[-1])
+            return "break"
+        if event.keysym == "Up" and index == 0 and self._wanted_offset > 0:
+            self._wanted_scroll("scroll", -1, "units")
+            first = self.wanted.get_children()
+            if first:
+                self.wanted.selection_set(first[0])
+                self.wanted.focus(first[0])
+            return "break"
 
     def refresh_wanted(self) -> None:
         items = self.worker.catalog.items()
-        view = self.view_var.get() or VIEW_EVERYTHING
-        visible = filter_view(items, view)
-        choices = self.worker.store.wanted_choices()
-        yview = self.wanted.yview()
-        self.wanted.delete(*self.wanted.get_children())
-        self._row_items.clear()
-        if not visible:
-            if not items:
-                self.wanted.insert("", "end", values=("", "", "Click Sync to load the wanted list from Lidarr.", "", "", ""))
-            else:
-                self.wanted.insert("", "end", values=("", "", f"Nothing in {view}.", "", "", ""))
-        else:
-            for item in visible:
-                mark = CHECKED if item_checked(item, items, choices) else UNCHECKED
-                iid = self.wanted.insert(
-                    "",
-                    "end",
-                    values=(mark, item.kind.title(), item.artist, item.album, item.song, item.detail),
-                )
-                self._row_items[iid] = item
-        state = select_all_state(visible, items, choices)
-        checked = sum(1 for item in visible if item_checked(item, items, choices))
+        visible = self._ordered_rows(items)
+        choices = self._choices()
+        grouped = children_by_artist(items)
+        self._wanted_rows = visible
+        self._wanted_grouped = grouped
+        self._paint_wanted(choices, grouped)
+        state = select_all_state(visible, items, choices, grouped)
+        checked = sum(1 for item in visible if item_checked(item, items, choices, grouped))
         self._updating_select_all = True
         try:
             self.select_all_var.set(1 if state == "all" and visible else 0)
         finally:
             self._updating_select_all = False
-        if items and not self._syncing:
-            self.wanted_status.set(f"{checked} of {len(visible)} selected in this view.")
-        if yview and visible:
-            self.wanted.yview_moveto(yview[0])
+        if items and not self._syncing and not str(self.wanted_status.get()).startswith("Saving "):
+            self.wanted_status.set(f"{checked:,} of {len(visible):,} selected in this view.")
+
+    def _paint_wanted(self, choices: dict[str, bool], grouped: dict[str, list[WantedItem]]) -> None:
+        rows = self._wanted_rows
+        window = max(1, self._wanted_window)
+        total = len(rows)
+        if total <= window:
+            self._wanted_offset = 0
+        else:
+            self._wanted_offset = max(0, min(self._wanted_offset, total - window))
+        shown = rows[self._wanted_offset : self._wanted_offset + window]
+        self._row_items.clear()
+        children = self.wanted.get_children()
+        if not shown:
+            self.wanted.delete(*children)
+            if not self.worker.catalog.items():
+                text = "Click Sync to load the wanted list from Lidarr."
+            else:
+                text = f"Nothing in {self.view_var.get() or VIEW_EVERYTHING}."
+            self.wanted.insert("", "end", values=("", "", text, "", "", ""))
+            self.wanted_scroll.set(0, 1)
+            return
+        if len(children) != len(shown):
+            self.wanted.delete(*children)
+            children = []
+            for item in shown:
+                children.append(self.wanted.insert("", "end", values=self._wanted_values(item, choices, grouped)))
+        for iid, item in zip(children, shown):
+            self.wanted.item(iid, values=self._wanted_values(item, choices, grouped))
+            self._row_items[iid] = item
+        if total <= window:
+            self.wanted_scroll.set(0, 1)
+        else:
+            self.wanted_scroll.set(self._wanted_offset / total, (self._wanted_offset + len(shown)) / total)
+
+    def _wanted_values(self, item: WantedItem, choices: dict[str, bool], grouped: dict[str, list[WantedItem]]) -> tuple:
+        mark = CHECKED if item_checked(item, self._wanted_rows, choices, grouped) else UNCHECKED
+        return (mark, item.kind.title(), item.artist, item.album, item.song, item.detail)
 
 
     def check_for_updates(self, manual: bool = True) -> None:
