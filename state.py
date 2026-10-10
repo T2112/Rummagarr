@@ -7,6 +7,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
+# The status page can ask for up to 250 recent files, so keep at least that many.
+COMPLETED_DOWNLOAD_LIMIT = 250
+
+
 class JobStore:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -58,6 +62,15 @@ class JobStore:
                 username TEXT,
                 kind TEXT,
                 finished_at TEXT NOT NULL
+            )
+            """
+        )
+        self._db.commit()
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS wanted_choices (
+                key TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL
             )
             """
         )
@@ -229,9 +242,10 @@ class JobStore:
                 """
                 DELETE FROM completed_downloads
                 WHERE id NOT IN (
-                    SELECT id FROM completed_downloads ORDER BY id DESC LIMIT 50
+                    SELECT id FROM completed_downloads ORDER BY id DESC LIMIT ?
                 )
-                """
+                """,
+                (COMPLETED_DOWNLOAD_LIMIT,),
             )
             self._db.commit()
 
@@ -248,3 +262,40 @@ class JobStore:
             ).fetchall()
         keys = ("artist", "title", "filename", "username", "kind", "finished_at")
         return [dict(zip(keys, row)) for row in rows]
+
+    def wanted_enabled(self, key: str) -> bool:
+        with self._lock:
+            row = self._db.execute("SELECT enabled FROM wanted_choices WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return True
+        return bool(row[0])
+
+    def wanted_choices(self) -> dict[str, bool]:
+        with self._lock:
+            rows = self._db.execute("SELECT key, enabled FROM wanted_choices").fetchall()
+        return {key: bool(enabled) for key, enabled in rows}
+
+    def set_wanted_choices(self, updates: dict[str, bool]) -> None:
+        if not updates:
+            return
+        with self._lock:
+            self._db.executemany(
+                """
+                INSERT INTO wanted_choices(key, enabled) VALUES(?, ?)
+                ON CONFLICT(key) DO UPDATE SET enabled=excluded.enabled
+                """,
+                [(key, 1 if enabled else 0) for key, enabled in updates.items()],
+            )
+            self._db.commit()
+
+    def remember_wanted_keys(self, keys: list[str]) -> None:
+        """Record newly seen wanted rows as checked. Existing choices are kept."""
+        fresh = [(key,) for key in keys if key]
+        if not fresh:
+            return
+        with self._lock:
+            self._db.executemany(
+                "INSERT INTO wanted_choices(key, enabled) VALUES(?, 1) ON CONFLICT(key) DO NOTHING",
+                fresh,
+            )
+            self._db.commit()

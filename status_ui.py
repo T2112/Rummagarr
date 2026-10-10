@@ -171,10 +171,13 @@ class StatusHandler(BaseHTTPRequestHandler):
             body = json.loads(raw.decode("utf-8") or "{}")
         except json.JSONDecodeError:
             body = {}
-        assert self.loop is not None
+        loop = getattr(self.worker, "_loop", None) or self.loop
+        if loop is None:
+            self._send(503, b'{"ok":false,"error":"worker is not running"}', "application/json")
+            return
         fut = asyncio.run_coroutine_threadsafe(
             self.worker.cancel_downloads(all_items=bool(body.get("all")), index=body.get("index")),
-            self.loop,
+            loop,
         )
         try:
             fut.result(timeout=15)

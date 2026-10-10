@@ -1,11 +1,47 @@
 # Lidarr Soulseek Worker
 
-**Version 1.2.0** — Windows package. No Docker. No slskd.
+**Version 1.3.0** — Windows desktop app. No Docker. No slskd.
 
 The worker reads Lidarr **Wanted → Missing**, searches Soulseek, downloads matching albums or individual missing tracks, converts FLAC/WAV to MP3 when needed, asks Lidarr to import and rename, then cleans leftover files.
 
 Custom Lidarr import list (MusicBrainz IDs):  
 https://raw.githubusercontent.com/T2112/lidarr-soulseek/main/lists/lidarr-custom-list.json
+
+## Desktop app
+
+Most people should install the desktop app instead of setting up Python.
+
+1. Download `LidarrSoulseek-Setup-1.3.0.exe` from the **Windows installer** workflow artifacts on GitHub (Actions → the latest successful run → Artifacts).
+2. Run the installer. It copies the app into your user programs folder and adds a **Start Menu** shortcut named Lidarr Soulseek. An optional task can also start the app when you sign in.
+3. The first window asks for the Lidarr URL, the Lidarr API key, the Soulseek username and password, and the Incomplete / Complete folders. Use **Test Lidarr**, then **Save**. You do not edit `config.toml` by hand.
+4. Open **Status**. **Start** begins searching. **Pause** holds the current work and resumes it later. **Stop** ends the run and keeps your place. **Skip** drops the album or song it is on and moves to the next one.
+5. Open **Wanted**. **Sync** loads the missing list from Lidarr. Uncheck anything the worker should leave alone. **Select all** applies to the current view: Everything, Incomplete artists, Incomplete albums, or Incomplete songs. Those checkboxes are remembered after a restart.
+
+The browser page at `http://127.0.0.1:8787` still works while the worker is running. The desktop window does not need a browser.
+
+ffmpeg is still separate if you want FLAC converted to MP3: `winget install Gyan.FFmpeg`. The Status tab says so when it is missing.
+
+Config, the database, and the log for an installed copy live in `%LOCALAPPDATA%\Lidarr Soulseek\`.
+
+### Build the installer
+
+On a Windows machine, from this folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
+```
+
+That installs the Python dependencies and PyInstaller, freezes `desktop_app.py`, and compiles `packaging\LidarrSoulseek.iss` with Inno Setup 6. If Inno Setup is not already installed, the script downloads it. The setup program is written to:
+
+```text
+dist\LidarrSoulseek-Setup-1.3.0.exe
+```
+
+The same steps run in GitHub Actions (`.github/workflows/windows-installer.yml`) on `windows-latest`, and the installer is uploaded as an artifact.
+
+This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs on, and Inno Setup is a Windows program. Push the branch and let that workflow produce the `.exe`.
+
+`python main.py` still runs the worker without the window, for the original script install below.
 
 ## What's new in 1.2.0
 

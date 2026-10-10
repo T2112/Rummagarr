@@ -5,6 +5,7 @@ import logging
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -23,8 +24,19 @@ from aioslsk.settings import (
 from aioslsk.shares.model import DirectoryShareMode
 
 from config_loader import Config
+from control import WorkerControl
 from lidarr_client import LidarrClient
-from status_ui import start_status_ui
+from status_ui import normalize_recent_limit, start_status_ui
+from wanted import (
+    WantedCatalog,
+    album_key,
+    albums_for_search,
+    artist_name,
+    holes_for_search,
+    holes_from_catalog,
+    is_enabled,
+    song_key,
+)
 from match import (
     AUDIO_EXT,
     build_queries,
@@ -47,11 +59,6 @@ def safe_name(text: str) -> str:
 def album_year(album: dict) -> str | None:
     raw = album.get("releaseDate") or ""
     return raw[:4] if raw and raw[:4].isdigit() else None
-
-
-def artist_name(album: dict) -> str:
-    artist = album.get("artist") or {}
-    return artist.get("artistName") or album.get("artistName") or "Unknown Artist"
 
 
 def monitored_missing_tracks(tracks: list[dict]) -> list[dict]:
@@ -323,6 +330,12 @@ class Worker:
         self.job_info: dict = {"phase": "idle", "artist": "", "title": ""}
         self.cancel_requested = False
         self._ui = None
+        self.control = WorkerControl()
+        self.catalog = WantedCatalog()
+        self.current_key: str | None = None
+        self._active_keys: set[str] = set()
+        self._key_lock = threading.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     def close(self) -> None:
         if self._ui:
@@ -365,10 +378,33 @@ class Worker:
         if removed:
             log.info("Swept %s old file(s) from Incomplete", removed)
 
+    def _activate(self, key: str) -> None:
+        with self._key_lock:
+            self._active_keys.add(key)
+            self.current_key = key
+
+    def _deactivate(self, key: str) -> None:
+        with self._key_lock:
+            self._active_keys.discard(key)
+            if self.current_key == key:
+                self.current_key = next(iter(self._active_keys), None)
+
+    def ensure_status_ui(self) -> None:
+        if self._ui:
+            return
+        try:
+            self._ui = start_status_ui(self, self.cfg.status_bind, self.cfg.status_port)
+        except OSError as exc:
+            if getattr(exc, "errno", None) in {98, 10048}:
+                log.info("Status page already running on %s:%s", self.cfg.status_bind, self.cfg.status_port)
+            else:
+                log.exception("Could not bind status page on %s:%s", self.cfg.status_bind, self.cfg.status_port)
+
     def set_job(self, phase: str, artist: str = "", title: str = "") -> None:
         self.job_info = {"phase": phase, "artist": artist, "title": title}
 
-    def ui_snapshot(self) -> dict:
+    def ui_snapshot(self, recent_limit: int = 10) -> dict:
+        limit = normalize_recent_limit(recent_limit)
         transfers = []
         for item in list(self.active_transfers):
             transfers.append(
@@ -383,9 +419,41 @@ class Worker:
             "logged_in": self.soulseek_logged_in(),
             "job": dict(self.job_info),
             "transfers": transfers,
-            "recent": self.store.recent_completed_downloads(10),
+            "recent": self.store.recent_completed_downloads(limit),
             "cancel_requested": self.cancel_requested,
+            "run_state": self.control.state,
+            "current_key": self.current_key or "",
         }
+
+    def _mark_album(self, album_id: int, artist: str, title: str, signal: str) -> None:
+        status = "skipped" if signal == "skip" else "stopped"
+        self.store.upsert(album_id, artist, title, status, status)
+
+    def _mark_track(self, hole: dict, signal: str) -> None:
+        track = hole["track"]
+        album = hole["album"]
+        status = "skipped" if signal == "skip" else "stopped"
+        self.store.upsert_track(
+            int(track["id"]),
+            int(album["id"]),
+            hole["artist_name"],
+            track.get("title") or "Unknown Track",
+            status,
+            status,
+        )
+
+    async def _abandon_transfers(self, transfers) -> None:
+        if self.client:
+            for transfer in list(transfers):
+                try:
+                    await abort_transfer(self.client, transfer)
+                    log.info("Stopped %s", transfer_filename(transfer))
+                except Exception:
+                    log.exception("Could not abort %s", transfer_filename(transfer))
+        if transfers:
+            self.discard_failed_downloads(list(transfers))
+        self.active_transfers = []
+        self.cancel_requested = False
 
     def remember_completed(self, transfers, artist: str, title: str, kind: str) -> None:
         seen: set[int] = getattr(self, "_remembered_ids", set())
@@ -429,14 +497,19 @@ class Worker:
         self.client = SoulSeekClient(build_slsk_settings(self.cfg))
         await self.client.start()
         await self.client.login()
-        await asyncio.sleep(2)
+        signal = await self.control.gate(sleep=2)
+        if signal == "stop":
+            await self.stop_soulseek()
+            return
         if not self.soulseek_logged_in():
             raise RuntimeError("Soulseek login returned but session is not active")
         log.info("Logged in to Soulseek as %s", self.cfg.slsk_username)
 
-    async def ensure_soulseek(self) -> None:
+    async def ensure_soulseek(self) -> bool:
+        if self.control.is_stopped():
+            return False
         if self.soulseek_logged_in():
-            return
+            return True
         log.warning("Soulseek session dropped; reconnecting")
         try:
             if self.client:
@@ -444,31 +517,53 @@ class Worker:
         except Exception:
             log.exception("Error while stopping dead Soulseek client")
         self.client = None
-        await asyncio.sleep(5)
+        signal = await self.control.gate(sleep=5)
+        if signal == "stop" or self.control.is_stopped():
+            return False
         await self.start_soulseek()
+        return self.soulseek_logged_in() and not self.control.is_stopped()
 
     async def stop_soulseek(self) -> None:
         if self.client:
             await self.client.stop()
             self.client = None
 
-    async def run_forever(self) -> None:
-        status = self.lidarr.ping()
-        log.info("Lidarr OK: %s", status.get("version") or status.get("appName") or "connected")
+    async def run_forever(self, *, autostart: bool = True) -> None:
+        if autostart and self.control.is_stopped():
+            self.control.start()
+        if self.control.is_stopped():
+            return
+        self._loop = asyncio.get_running_loop()
         try:
-            self._ui = start_status_ui(self, self.cfg.status_bind, self.cfg.status_port)
-        except OSError:
-            log.exception("Could not bind status page on %s:%s", self.cfg.status_bind, self.cfg.status_port)
-        await self.start_soulseek()
-        try:
-            while True:
+            status = self.lidarr.ping()
+            log.info("Lidarr OK: %s", status.get("version") or status.get("appName") or "connected")
+            self.ensure_status_ui()
+            await self.start_soulseek()
+            if self.control.is_stopped():
+                return
+            if not self.soulseek_logged_in():
+                raise RuntimeError("Soulseek login returned but session is not active")
+            while not self.control.is_stopped():
                 try:
                     await self.cycle()
                 except Exception:
                     log.exception("Cycle failed")
-                await asyncio.sleep(self.cfg.cycle_seconds)
+                if self.control.is_stopped():
+                    break
+                signal = await self.control.gate(sleep=self.cfg.cycle_seconds)
+                if signal == "stop":
+                    break
+        except Exception as exc:
+            log.exception("Worker stopped")
+            self.set_job("error", "", str(exc)[:240])
+            if not self.control.is_stopped():
+                self.control.stop()
+            raise
         finally:
-            await self.stop_soulseek()
+            try:
+                await self.stop_soulseek()
+            except Exception:
+                log.exception("Error while stopping Soulseek")
 
     def _same_artist(self, left: str, right: str) -> bool:
         return (left or "").casefold().strip() == (right or "").casefold().strip()
@@ -485,12 +580,16 @@ class Worker:
             chosen = artist_name(album)
             if self.store.artist_on_cooldown(chosen):
                 continue
+            if not self._artist_searchable(chosen):
+                continue
             self.store.set_focus_artist(chosen)
             log.info("Focusing on artist: %s", chosen)
             return chosen
         for hole in sorted(holes, key=lambda h: (h["artist_name"] or "").casefold()):
             chosen = hole["artist_name"]
             if self.store.artist_on_cooldown(chosen):
+                continue
+            if not self._artist_searchable(chosen):
                 continue
             self.store.set_focus_artist(chosen)
             log.info("Focusing on artist: %s", chosen)
@@ -506,10 +605,25 @@ class Worker:
         self.store.set_focus_artist(None)
         log.info("Finished visit for %s; skipping them for %s days", artist, days)
 
-    def _work_for_artist(self, artist: str, missing: list[dict]) -> tuple[list[dict], list[dict]]:
+    def _artist_searchable(self, artist: str) -> bool:
+        if not self.catalog.synced:
+            return True
+        choices = self.store.wanted_choices()
+        related = [
+            item
+            for item in self.catalog.items()
+            if item.kind in {"album", "song"} and self._same_artist(item.artist, artist)
+        ]
+        if not related:
+            return True
+        return any(is_enabled(item.key, choices) for item in related)
+
+    def _work_for_artist(
+        self, artist: str, missing: list[dict], *, include_tracks: bool = True
+    ) -> tuple[list[dict], list[dict]]:
         albums = [album for album in missing if self._same_artist(artist_name(album), artist)]
         holes: list[dict] = []
-        if not self.cfg.fill_missing_tracks:
+        if not include_tracks or not self.cfg.fill_missing_tracks:
             return albums, holes
         artist_id = None
         for album in albums:
@@ -542,27 +656,35 @@ class Worker:
         return albums, holes
 
     async def cycle(self) -> None:
-        # Names only, 20 pages at a time. Next cycle continues where this left off.
-        start_page = int(self.store.get_meta("missing_page") or "1")
-        catalog, next_page, exhausted = self.lidarr.wanted_missing(
-            start_page=start_page,
-            max_pages=self.cfg.max_missing_pages,
-        )
-        self.store.set_meta("missing_page", str(next_page))
-        log.info(
-            "Wanted missing pages %s-%s (%s albums, %s)",
-            start_page,
-            start_page + self.cfg.max_missing_pages - 1,
-            len(catalog),
-            "end of list" if exhausted else f"next page {next_page}",
-        )
+        if self.control.is_stopped():
+            return
+        # A Sync in the desktop app keeps the wanted list in memory. Until that
+        # happens, keep reading Lidarr 20 pages at a time and resume next cycle.
+        cached = self.catalog.album_payloads()
+        if cached is not None:
+            catalog = list(cached)
+            log.info("Using synced wanted list (%s albums)", len(catalog))
+        else:
+            start_page = int(self.store.get_meta("missing_page") or "1")
+            catalog, next_page, exhausted = self.lidarr.wanted_missing(
+                start_page=start_page,
+                max_pages=self.cfg.max_missing_pages,
+            )
+            self.store.set_meta("missing_page", str(next_page))
+            log.info(
+                "Wanted missing pages %s-%s (%s albums, %s)",
+                start_page,
+                start_page + self.cfg.max_missing_pages - 1,
+                len(catalog),
+                "end of list" if exhausted else f"next page {next_page}",
+            )
         catalog.sort(key=lambda a: (artist_name(a).casefold(), (a.get("title") or "").casefold()))
         focus = self.choose_focus_artist(catalog, [])
         if not focus:
             log.info("No artist ready (all cooled off or nothing missing)")
             self.sweep_incomplete_folder()
             return
-        missing, holes = self._work_for_artist(focus, catalog)
+        missing, api_holes = self._work_for_artist(focus, catalog, include_tracks=not self.catalog.synced)
         truly_missing = []
         for album in missing:
             stats = album.get("statistics") or {}
@@ -570,7 +692,28 @@ class Worker:
             if files > 0:
                 continue
             truly_missing.append(album)
-        missing = truly_missing
+        choices = self.store.wanted_choices()
+        checked_missing = albums_for_search(truly_missing, choices)
+        if self.catalog.synced:
+            holes = [
+                hole
+                for hole in holes_from_catalog(self.catalog.items())
+                if self._same_artist(hole["artist_name"], focus)
+            ]
+            covered = {int(album["id"]) for album in checked_missing}
+            holes = [hole for hole in holes if int(hole["album"]["id"]) not in covered]
+        else:
+            holes = api_holes
+        holes = holes_for_search(holes, choices)
+        hidden = len(truly_missing) - len(checked_missing)
+        if hidden:
+            log.info("Left out %s unchecked album(s)", hidden)
+        missing = checked_missing
+        if not missing and not holes:
+            log.info("Artist %s has no checked items; moving on without a cooldown", focus)
+            self.store.set_focus_artist(None)
+            self.sweep_incomplete_folder()
+            return
         log.info("Artist %s: %s empty albums, %s partial tracks", focus, len(missing), len(holes))
         batch = []
         for album in missing:
@@ -587,7 +730,12 @@ class Worker:
             album_id = int(album["id"])
             artist = artist_name(album)
             title = album.get("title") or "Unknown Album"
+            if not is_enabled(album_key(album_id), self.store.wanted_choices()):
+                log.info("Skip unchecked album %s - %s", artist, title)
+                return
             async with sem:
+                if self.control.is_stopped():
+                    return
                 self.store.upsert(album_id, artist, title, "searching")
                 self.set_job("searching album", artist, title)
                 ok = await self.process_album(album)
@@ -597,8 +745,14 @@ class Worker:
         if batch:
             await asyncio.gather(*(run_one(album) for album in batch), return_exceptions=True)
         self.set_job("idle")
+        if self.control.is_stopped():
+            self.set_job("stopped")
+            return
         if self.cfg.fill_missing_tracks and holes:
             await self.cycle_tracks(holes)
+        if self.control.is_stopped():
+            self.set_job("stopped")
+            return
         self._finish_artist_visit(focus)
         self.sweep_incomplete_folder()
 
@@ -612,6 +766,8 @@ class Worker:
         log.info("Lidarr missing tracks on partial albums: %s", len(holes))
         processed = 0
         for hole in holes:
+            if self.control.is_stopped():
+                break
             if processed >= self.cfg.max_tracks_per_cycle:
                 break
             track = hole["track"]
@@ -621,6 +777,8 @@ class Worker:
             artist = hole["artist_name"]
             album_title = hole["album_title"]
             title = track.get("title") or "Unknown Track"
+            if not is_enabled(song_key(track_id), self.store.wanted_choices()):
+                continue
             if self.store.should_skip_track(track_id, self.cfg.retry_hours):
                 continue
             self.store.upsert_track(track_id, album_id, artist, title, "searching")
@@ -632,7 +790,19 @@ class Worker:
                 log.info("No usable track yet for %s - %s - %s", artist, album_title, title)
 
     async def process_track(self, hole: dict) -> bool:
-        await self.ensure_soulseek()
+        track = hole["track"]
+        key = song_key(int(track["id"]))
+        self._activate(key)
+        try:
+            return await self._process_track(hole, key)
+        finally:
+            self._deactivate(key)
+
+    async def _process_track(self, hole: dict, key: str) -> bool:
+        if not await self.ensure_soulseek():
+            if self.control.is_stopped():
+                self._mark_track(hole, "stop")
+            return False
         assert self.client is not None
         track = hole["track"]
         album = hole["album"]
@@ -649,8 +819,19 @@ class Worker:
         best_user = ""
         best_score = 0.0
         for query in queries:
+            signal = await self.control.gate(key)
+            if signal != "ok":
+                self._mark_track(hole, signal)
+                return False
             request = await self.client.searches.search(query)
-            await asyncio.sleep(self.cfg.search_wait_seconds)
+            signal = await self.control.gate(key, sleep=self.cfg.search_wait_seconds)
+            if signal != "ok":
+                try:
+                    self.client.searches.remove_request(request)
+                except Exception:
+                    pass
+                self._mark_track(hole, signal)
+                return False
             for result in request.results:
                 username = getattr(result, "username", "") or ""
                 if username.lower() in self.cfg.ignored_users:
@@ -693,10 +874,14 @@ class Worker:
         self.store.upsert_track(track_id, album_id, artist, title, "downloading", best_user)
         self.cancel_requested = False
         self.set_job("downloading track", artist, title)
+        signal = await self.control.gate(key)
+        if signal != "ok":
+            self._mark_track(hole, signal)
+            return False
         transfer = await self.client.transfers.download(best_user, best_item.filename)
         self.active_transfers = [transfer]
-        deadline = asyncio.get_event_loop().time() + min(self.cfg.download_timeout_minutes, 30) * 60
-        while asyncio.get_event_loop().time() < deadline:
+        deadline = [asyncio.get_running_loop().time() + min(self.cfg.download_timeout_minutes, 30) * 60]
+        while asyncio.get_running_loop().time() < deadline[0]:
             name = state_name(transfer)
             if name in {"COMPLETE", "FAILED", "ABORTED"}:
                 break
@@ -704,8 +889,12 @@ class Worker:
                 await abort_transfer(self.client, transfer)
                 break
             log.info("Track download %s: %s", title, name or "waiting")
-            await asyncio.sleep(2)
             self.remember_completed([transfer], artist, title, "track")
+            signal = await self.control.gate(key, sleep=2, deadline=deadline)
+            if signal != "ok":
+                await self._abandon_transfers([transfer])
+                self._mark_track(hole, signal)
+                return False
 
         self.remember_completed([transfer], artist, title, "track")
         self.active_transfers = []
@@ -740,11 +929,22 @@ class Worker:
         return True
 
     async def process_album(self, album: dict) -> bool:
-        await self.ensure_soulseek()
-        assert self.client is not None
         album_id = int(album["id"])
         artist = artist_name(album)
         title = album.get("title") or "Unknown Album"
+        key = album_key(album_id)
+        self._activate(key)
+        try:
+            return await self._process_album(album, key, album_id, artist, title)
+        finally:
+            self._deactivate(key)
+
+    async def _process_album(self, album: dict, key: str, album_id: int, artist: str, title: str) -> bool:
+        if not await self.ensure_soulseek():
+            if self.control.is_stopped():
+                self._mark_album(album_id, artist, title, "stop")
+            return False
+        assert self.client is not None
         year = album_year(album)
         tracks = self.lidarr.tracks_for_album(album_id)
         needed_tracks = monitored_missing_tracks(tracks)
@@ -767,8 +967,19 @@ class Worker:
 
         best = None
         for query in queries:
+            signal = await self.control.gate(key)
+            if signal != "ok":
+                self._mark_album(album_id, artist, title, signal)
+                return False
             request = await self.client.searches.search(query)
-            await asyncio.sleep(self.cfg.search_wait_seconds)
+            signal = await self.control.gate(key, sleep=self.cfg.search_wait_seconds)
+            if signal != "ok":
+                try:
+                    self.client.searches.remove_request(request)
+                except Exception:
+                    pass
+                self._mark_album(album_id, artist, title, signal)
+                return False
             folders = group_results(request.results, self.cfg.ignored_users)
             for folder in folders:
                 scored = score_folder(
@@ -808,6 +1019,11 @@ class Worker:
         self.set_job("downloading album", artist, title)
         transfers = []
         for item in best.files:
+            signal = await self.control.gate(key)
+            if signal != "ok":
+                await self._abandon_transfers(transfers)
+                self._mark_album(album_id, artist, title, signal)
+                return False
             transfer = await self.client.transfers.download(best.username, item.filename)
             transfers.append(transfer)
             if self.cancel_requested:
@@ -829,8 +1045,8 @@ class Worker:
                 if src is not None:
                     sources.append(src)
 
-        deadline = asyncio.get_event_loop().time() + self.cfg.download_timeout_minutes * 60
-        while asyncio.get_event_loop().time() < deadline:
+        deadline = [asyncio.get_running_loop().time() + self.cfg.download_timeout_minutes * 60]
+        while asyncio.get_running_loop().time() < deadline[0]:
             names = [state_name(t) for t in transfers]
             await stage_finished()
             done = all(n in {"COMPLETE", "FAILED", "ABORTED"} for n in names)
@@ -843,8 +1059,12 @@ class Worker:
                 break
             complete = sum(1 for n in names if n == "COMPLETE")
             log.info("Download progress %s/%s complete", complete, len(transfers))
-            await asyncio.sleep(2)
             self.remember_completed(transfers, artist, title, "album")
+            signal = await self.control.gate(key, sleep=2, deadline=deadline)
+            if signal != "ok":
+                await self._abandon_transfers(transfers)
+                self._mark_album(album_id, artist, title, signal)
+                return False
 
         await stage_finished()
         self.remember_completed(transfers, artist, title, "album")

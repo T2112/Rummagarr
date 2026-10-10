@@ -65,3 +65,5 @@ download_timeout_minutes = 90
 # Local status page. Open http://127.0.0.1:8787 while the worker runs.
 status_bind = "127.0.0.1"
 status_port = 8787
+# Desktop app: start downloading when the window opens.
+start_on_launch = false
