@@ -72,23 +72,30 @@ jobs:
             exit 1
           fi
           asset="dist/LidarrSoulseek-Setup-${version}.exe"
+          checksum="dist/LidarrSoulseek-Setup-${version}.exe.sha256"
           if [ ! -f "$asset" ]; then
             echo "Installer not found: $asset" >&2
             ls -la dist >&2 || true
             exit 1
           fi
+          (
+            cd dist
+            sha256sum "LidarrSoulseek-Setup-${version}.exe"
+          ) > "$checksum"
           notes=$(printf '%s\n' \
             "Windows installer for Lidarr Soulseek ${version}." \
             "" \
             "Download LidarrSoulseek-Setup-${version}.exe and run it. The first window asks for the Lidarr URL, API key, and Soulseek login." \
             "" \
+            "Installed copies of 1.4.0 and later can install this from Help → Check for updates. The .sha256 file is the installer checksum." \
+            "" \
             "ffmpeg is separate if you want FLAC converted to MP3: winget install Gyan.FFmpeg.")
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "$asset" --clobber
+            gh release upload "$tag" "$asset" "$checksum" --clobber
           else
-            gh release create "$tag" "$asset" \
+            gh release create "$tag" "$asset" "$checksum" \
               --title "Lidarr Soulseek ${version}" \
               --notes "$notes" \
               --target "${{ github.sha }}"
           fi
-          echo "Published ${asset} on ${tag}"
+          echo "Published ${asset} and ${checksum} on ${tag}"

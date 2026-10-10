@@ -2,7 +2,7 @@
 ; Build with scripts/build_windows.ps1, which passes /DMyAppVersion from VERSION.
 
 #ifndef MyAppVersion
-#define MyAppVersion "1.3.0"
+#define MyAppVersion "1.4.0"
 #endif
 
 #define MyAppName "Lidarr Soulseek"
@@ -29,6 +29,8 @@ AppMutex=LidarrSoulseekMutex
 CloseApplications=yes
 UninstallDisplayIcon={app}\{#MyAppExeName}
 LicenseFile=..\LICENSE.txt
+; Settings, state.sqlite3, and the log live in {localappdata}\Lidarr Soulseek,
+; outside {app}. An upgrade replaces the program files and leaves that folder alone.
 
 [Tasks]
 Name: startup; Description: "Start Lidarr Soulseek when I sign in to Windows"; Flags: unchecked
@@ -41,4 +43,7 @@ Name: "{autoprograms}\Lidarr Soulseek"; Filename: "{app}\{#MyAppExeName}"
 Name: "{userstartup}\Lidarr Soulseek"; Filename: "{app}\{#MyAppExeName}"; Tasks: startup
 
 [Run]
+; Interactive setup still offers the launch checkbox. A silent upgrade from the
+; app (Update now) must start the new version on its own.
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch Lidarr Soulseek"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait skipifnotsilent

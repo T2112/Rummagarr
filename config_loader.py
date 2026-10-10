@@ -50,6 +50,7 @@ class Config:
     status_bind: str = "127.0.0.1"
     status_port: int = 8787
     start_on_launch: bool = False
+    check_updates: bool = True
 
 
 def app_data_dir() -> Path:
@@ -138,6 +139,7 @@ def default_config(**overrides) -> Config:
         status_bind=str(overrides.pop("status_bind", "127.0.0.1")),
         status_port=int(overrides.pop("status_port", 8787)),
         start_on_launch=bool(overrides.pop("start_on_launch", True)),
+        check_updates=bool(overrides.pop("check_updates", True)),
     )
     if overrides:
         cfg = replace(cfg, **overrides)
@@ -216,6 +218,7 @@ def save_config(path: Path, cfg: Config) -> None:
             f"status_bind = {_toml_str(cfg.status_bind)}",
             f"status_port = {int(cfg.status_port)}",
             f"start_on_launch = {_toml_bool(cfg.start_on_launch)}",
+            f"check_updates = {_toml_bool(cfg.check_updates)}",
             "",
         ]
     )
@@ -312,5 +315,7 @@ def try_load_config(path: Path) -> Config:
         download_timeout_minutes=int(runtime.get("download_timeout_minutes", 90)),
         status_bind=str(runtime.get("status_bind", "127.0.0.1")),
         status_port=int(runtime.get("status_port", 8787)),
+        # Missing check_updates stays on, so an existing config starts checking.
         start_on_launch=bool(runtime.get("start_on_launch", False)),
+        check_updates=bool(runtime.get("check_updates", True)),
     )

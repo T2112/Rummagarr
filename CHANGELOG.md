@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [1.4.0] — 2026-10-10
+
+The installed app can update itself from GitHub Releases.
+
+### Added
+
+- On launch, the desktop app checks https://api.github.com/repos/T2112/lidarr-soulseek/releases/latest in the background. Help → Check for updates runs the same check and says when this copy is already current.
+- A newer release opens a dialog with the version and release notes. Update now downloads `LidarrSoulseek-Setup-<version>.exe`, checks the file size and the published SHA-256, stops the worker, and runs a silent upgrade. The installer starts the app again. Later asks next time. Skip this version is remembered.
+- Settings includes "Check for updates when the app opens", on by default. A copy started from source reports the new version and opens the release page instead of running the installer.
+- The window title, the header, and Help → About show the current version.
+
 ## [1.3.0] — 2026-10-10
 
 Desktop app and Windows installer.
