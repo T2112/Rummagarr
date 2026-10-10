@@ -1,5 +1,6 @@
 # Copy this file to config.toml and fill in every CHANGEME value.
 # Do not commit config.toml. It holds passwords and API keys.
+# The desktop app edits these same values from Settings → Connection and Settings → Behavior.
 
 [lidarr]
 url = "http://127.0.0.1:8686"

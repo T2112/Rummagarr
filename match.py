@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -9,13 +10,60 @@ from pathlib import Path
 from aioslsk.protocol.primitives import AttributeKey
 
 AUDIO_EXT = {".flac", ".mp3", ".wav", ".aiff", ".aif", ".ogg", ".opus", ".m4a", ".ape", ".wv"}
+_MAX_ALIASES = 3
+
+# Quotes and dashes that should compare equal before the rest of the punctuation is dropped.
+_PUNCT = str.maketrans(
+    "\u2018\u2019\u201a\u201b\u2032\u00b4`\u201c\u201d\u201e\u201f\u2013\u2014\u2015\u2212",
+    "'''''''" + '""""' + "----",
+)
+# Letters NFKD does not split into a base letter plus a mark.
+_LETTERS = str.maketrans(
+    {
+        "ø": "o",
+        "ł": "l",
+        "đ": "d",
+        "ð": "d",
+        "þ": "th",
+        "æ": "ae",
+        "œ": "oe",
+        "ı": "i",
+        "ß": "ss",
+    }
+)
 
 
 def normalize(text: str) -> str:
-    text = text.lower()
+    """Fold a name so Lidarr spelling and Soulseek filenames can be compared.
+
+    Diacritics become their base letters (Mötley Crüe and Motley Crue). Quotes and
+    dashes are unified, & becomes "and", and a letter standing in for a symbol
+    (P!nk, Ke$ha) is put back. Other punctuation becomes a space.
+    """
+    text = unicodedata.normalize("NFKD", text or "")
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.casefold().translate(_LETTERS).translate(_PUNCT)
+    text = re.sub(r"(?<=\w)!(?=\w)", "i", text)
+    text = re.sub(r"(?<=\w)\$(?=\w)", "s", text)
+    text = text.replace("&", " and ")
     text = re.sub(r"[\[\(\{].*?[\]\)\}]", " ", text)
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _plain(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _add_query(out: list[str], seen: set[str], query: str) -> None:
+    query = re.sub(r"\s+", " ", (query or "").strip())
+    if not query:
+        return
+    key = query.casefold()
+    if key in seen:
+        return
+    seen.add(key)
+    out.append(query)
 
 
 def similarity(a: str, b: str) -> float:
@@ -54,20 +102,85 @@ class FolderCandidate:
     reason: str = ""
 
 
-def build_queries(artist: str, album: str, year: str | None) -> list[str]:
+def aliases_from_album(album: dict | None) -> list[str]:
+    """Artist aliases already sitting on a Lidarr album. No extra request."""
+    if not isinstance(album, dict):
+        return []
+    artist = album.get("artist") or {}
+    if not isinstance(artist, dict):
+        return []
+    primary = artist.get("artistName") or album.get("artistName") or ""
+    primary_key = normalize(str(primary))
+    raw = artist.get("aliases") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    names: list[str] = []
+    seen = set()
+    for item in raw:
+        if isinstance(item, str):
+            name = item.strip()
+        elif isinstance(item, dict):
+            name = str(item.get("name") or item.get("aliasName") or "").strip()
+        else:
+            continue
+        if not name:
+            continue
+        folded = normalize(name)
+        token = name.casefold()
+        if not folded or folded == primary_key or token in seen:
+            continue
+        seen.add(token)
+        names.append(name)
+        if len(names) >= _MAX_ALIASES:
+            break
+    return names
+
+
+def build_queries(
+    artist: str,
+    album: str,
+    year: str | None,
+    aliases: list[str] | None = None,
+) -> list[str]:
+    """Folded ASCII search first, then the original spelling, then a few aliases.
+
+    The worker stops once a query scores a useful hit, so the original spelling
+    is only used when the folded query does not.
+    """
     artist_q = normalize(artist)
     album_q = normalize(album)
-    queries = []
-    if year and year.isdigit() and not year.startswith("2026"):
-        queries.append(f"{artist_q} {album_q} {year}")
-    queries.append(f"{artist_q} {album_q}")
+    year_text = str(year) if year else ""
+    use_year = bool(year_text.isdigit() and not year_text.startswith("2026"))
+    artist_raw = _plain(artist)
+    album_raw = _plain(album)
     seen: set[str] = set()
-    out = []
-    for q in queries:
-        key = normalize(q)
-        if key and key not in seen:
-            seen.add(key)
-            out.append(key)
+    out: list[str] = []
+
+    def emit(artist_part: str, album_part: str, with_year: bool) -> None:
+        parts = [artist_part, album_part]
+        if with_year:
+            parts.append(year_text)
+        _add_query(out, seen, " ".join(part for part in parts if part))
+
+    if artist_q or album_q:
+        if use_year:
+            emit(artist_q, album_q, True)
+        emit(artist_q, album_q, False)
+    original_differs = artist_raw.casefold() != artist_q or album_raw.casefold() != album_q
+    if original_differs and (artist_raw or album_raw):
+        if use_year:
+            emit(artist_raw, album_raw, True)
+        emit(artist_raw, album_raw, False)
+    for alias in (aliases or [])[:_MAX_ALIASES]:
+        alias_q = normalize(alias)
+        if not alias_q or alias_q == artist_q:
+            continue
+        if use_year:
+            emit(alias_q, album_q, True)
+        emit(alias_q, album_q, False)
+        alias_raw = _plain(alias)
+        if alias_raw.casefold() != alias_q:
+            emit(alias_raw, album_raw, False)
     return out
 
 
@@ -128,22 +241,38 @@ def score_folder(
     return candidate
 
 
-def build_track_queries(artist: str, album: str, track: str) -> list[str]:
+def build_track_queries(
+    artist: str,
+    album: str,
+    track: str,
+    aliases: list[str] | None = None,
+) -> list[str]:
     artist_q = normalize(artist)
     album_q = normalize(album)
     track_q = normalize(track)
-    queries = []
-    if artist_q and track_q and album_q:
-        queries.append(f"{artist_q} {album_q} {track_q}")
-    if artist_q and track_q:
-        queries.append(f"{artist_q} {track_q}")
+    artist_raw = _plain(artist)
+    album_raw = _plain(album)
+    track_raw = _plain(track)
+    differs = (
+        artist_raw.casefold() != artist_q
+        or album_raw.casefold() != album_q
+        or track_raw.casefold() != track_q
+    )
     seen: set[str] = set()
-    out = []
-    for q in queries:
-        key = normalize(q)
-        if key and key not in seen:
-            seen.add(key)
-            out.append(key)
+    out: list[str] = []
+    if artist_q and track_q and album_q:
+        _add_query(out, seen, f"{artist_q} {album_q} {track_q}")
+    if differs and artist_raw and track_raw and album_raw:
+        _add_query(out, seen, f"{artist_raw} {album_raw} {track_raw}")
+    if artist_q and track_q:
+        _add_query(out, seen, f"{artist_q} {track_q}")
+    if differs and artist_raw and track_raw:
+        _add_query(out, seen, f"{artist_raw} {track_raw}")
+    for alias in (aliases or [])[:_MAX_ALIASES]:
+        alias_q = normalize(alias)
+        if not alias_q or alias_q == artist_q or not track_q:
+            continue
+        _add_query(out, seen, f"{alias_q} {track_q}")
     return out
 
 

@@ -1,6 +1,6 @@
 # Lidarr Soulseek Worker
 
-**Version 1.4.1** — Windows desktop app. No Docker. No slskd.
+**Version 1.5.0** — Windows desktop app. No Docker. No slskd.
 
 The worker reads Lidarr **Wanted → Missing**, searches Soulseek, downloads matching albums or individual missing tracks, converts FLAC/WAV to MP3 when needed, asks Lidarr to import and rename, then cleans leftover files.
 
@@ -31,7 +31,9 @@ Most people should install the desktop app instead of setting up Python.
 
 The browser page at `http://127.0.0.1:8787` still works while the worker is running. The desktop window does not need a browser.
 
-The installed app checks GitHub Releases when it opens. **Help → Check for updates** runs that check immediately. A newer version can be installed from the dialog. **Skip this version** remembers that release, and Settings can turn the automatic check off. A copy started from source only shows the new version and opens the release page.
+The installed app checks GitHub Releases when it opens. **Help → Check for updates** runs that check immediately. A newer version can be installed from the dialog. **Skip this version** remembers that release, and Settings → Behavior can turn the automatic check off. A copy started from source only shows the new version and opens the release page.
+
+**Settings → Behavior** edits the rest of `config.toml`: how many albums run at once, how long an artist is skipped, formats, MP3 conversion, timeouts, and the status page. Restore defaults puts those options back. Search and download changes apply on the next pass. Login, folders, and the status page address apply after you stop and start the worker.
 
 The version is on the window title and under **Help → About**.
 
@@ -50,7 +52,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 That installs the Python dependencies and PyInstaller, freezes `desktop_app.py`, and compiles `packaging\LidarrSoulseek.iss` with Inno Setup 6. If Inno Setup is not already installed, the script downloads it. The setup program is written to:
 
 ```text
-dist\LidarrSoulseek-Setup-1.4.1.exe
+dist\LidarrSoulseek-Setup-1.5.0.exe
 ```
 
 The same steps run in GitHub Actions (`.github/workflows/windows-installer.yml`) on `windows-latest`. Pull requests and pushes to `main` upload the installer as a workflow artifact.
@@ -60,6 +62,12 @@ To publish a public download, push a tag `v<version>` that matches the `VERSION`
 This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs on, and Inno Setup is a Windows program. Push the branch and let that workflow produce the `.exe`.
 
 `python main.py` still runs the worker without the window, for the original script install below.
+
+## What's new in 1.5.0
+
+- Soulseek search folds accented names (`Mötley Crüe`, Beyoncé, Björk) and symbols (`P!nk`, `Ke$ha`, `&`) so the ASCII filename is still found
+- Settings → Behavior exposes the config-file options, with Restore defaults
+- Full changelog: [CHANGELOG.md](CHANGELOG.md)
 
 ## What's new in 1.4.1
 

@@ -41,6 +41,7 @@ from wanted import (
 )
 from match import (
     AUDIO_EXT,
+    aliases_from_album,
     build_queries,
     build_track_queries,
     group_results,
@@ -832,7 +833,7 @@ class Worker:
         album_title = hole["album_title"]
         title = track.get("title") or "Unknown Track"
         year = album_year(album)
-        queries = build_track_queries(artist, album_title, title)
+        queries = build_track_queries(artist, album_title, title, aliases_from_album(album))
         log.info("Track search: %s", " | ".join(queries))
 
         best_item = None
@@ -982,7 +983,7 @@ class Worker:
             self.store.upsert(album_id, artist, title, "partial", "use track fill")
             return False
         titles = track_titles(needed_tracks)
-        queries = build_queries(artist, title, year)
+        queries = build_queries(artist, title, year, aliases_from_album(album))
         log.info("Searching: %s", " | ".join(queries))
 
         best = None
