@@ -41,6 +41,8 @@ class LidarrClient:
         page_size: int = 250,
         start_page: int = 1,
         max_pages: int = 20,
+        on_page=None,
+        should_cancel=None,
     ) -> tuple[list[dict[str, Any]], int, bool]:
         # Lidarr often reports totalPages=1 even when more exist. Page until a
         # short page, but only max_pages at a time so a huge wanted list does
@@ -51,6 +53,8 @@ class LidarrClient:
         exhausted = False
         limit = max(1, int(max_pages or 20))
         while fetched < limit:
+            if should_cancel is not None and should_cancel():
+                return albums, page, False
             data = self._get(
                 "/wanted/missing",
                 params={
@@ -68,6 +72,8 @@ class LidarrClient:
                 exhausted = True
                 break
             albums.extend(records)
+            if on_page is not None:
+                on_page(len(albums))
             if len(records) < page_size:
                 exhausted = True
                 break

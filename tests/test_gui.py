@@ -278,6 +278,29 @@ def test_settings_apply_message_says_when_a_restart_is_required():
     assert "next time the app opens" in settings_apply_message(old, launch)
 
 
+def test_wanted_list_draws_only_the_visible_rows(desktop):
+    from tests.conftest import album
+    from wanted import build_catalog
+
+    albums = [album(index, f"Artist {index:04d}", f"Album {index}", artist_id=index) for index in range(1, 401)]
+    items = build_catalog(albums, [])
+    desktop.worker.catalog.replace(items)
+    desktop.worker.store.remember_wanted_keys([item.key for item in items])
+    desktop._choices_cache = None
+    desktop._wanted_offset = 0
+    desktop.refresh_wanted()
+    desktop.update()
+    shown = desktop.wanted.get_children()
+    assert len(items) == 800
+    assert 0 < len(shown) < 80
+    first = desktop.wanted.set(shown[0], "artist")
+    desktop._wanted_scroll("moveto", 1)
+    desktop.update()
+    shown = desktop.wanted.get_children()
+    assert desktop.wanted.set(shown[-1], "artist") != first
+    assert len(shown) < 80
+
+
 def test_status_line_matches_the_web_page_fields():
     text = format_status_line(
         {
