@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.0] — 2026-10-10
+
+Desktop app and Windows installer.
+
+### Added
+
+- `LidarrSoulseek.exe` with a Status tab and a Wanted tab. The Status tab shows the same live transfers, cancel actions, and recent-history size choices as the page on port 8787, plus Start, Pause, Stop, and Skip.
+- Pause holds the current download and the saved place in line. Resume continues it. Skip drops the item in progress and moves to the next one. Stop ends the run and keeps the database, wanted checkboxes, and artist place.
+- Wanted tab: Sync loads Lidarr's wanted/missing list into memory. Every artist, album, and song has a checkbox. Select all follows the current view. Views are Everything, Incomplete artists, Incomplete albums, and Incomplete songs. Unchecked rows are stored in `state.sqlite3` and are the only ones the worker searches. A fresh install with no saved choices still searches everything.
+- First-run setup window for the Lidarr URL, API key, Soulseek username and password, and folders. Settings in the app writes `config.toml`.
+- Inno Setup installer (`scripts/build_windows.ps1`) with a Start Menu shortcut. GitHub Actions workflow `Windows installer` builds it and uploads the `.exe`.
+
+### Changed
+
+- The status snapshot honors the recent-history limit, and completed downloads are kept up to 250 instead of 50.
+
 ## [1.2.0] — 2026-10-09
 
 Big-list pass so a huge Lidarr wanted list spends less time building and more time downloading.

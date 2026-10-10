@@ -3,3 +3,6 @@ state.sqlite3
 lidarr-soulseek.log
 __pycache__/
 .venv/
+dist/
+packaging/pyi-build/
+.pytest_cache/
