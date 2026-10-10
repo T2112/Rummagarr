@@ -139,6 +139,28 @@ def test_checked_empty_album_is_grabbed_without_also_grabbing_its_songs(tmp_path
         worker.close()
 
 
+def test_vinyl_track_is_searched_and_a_bad_row_is_skipped(tmp_path):
+    worker = make_worker(tmp_path)
+    worker.control.start()
+    good = hole(11, 1, "Miles Davis", "Kind of Blue", "So What", number="A1")
+    bad = hole(12, 1, "Miles Davis", "Kind of Blue", "Broken", number="B2")
+    bad["track"]["id"] = "A1"
+    later = hole(13, 1, "Miles Davis", "Kind of Blue", "Freddie Freeloader", number="B12")
+    seen: list[str] = []
+
+    async def fake_track(row):
+        seen.append(row["track"]["title"])
+        assert row["track"]["trackNumber"] in {"A1", "B12"}
+        return False
+
+    worker.process_track = fake_track
+    try:
+        asyncio.run(worker.cycle_tracks([bad, good, later]))
+        assert seen == ["So What", "Freddie Freeloader"]
+    finally:
+        worker.close()
+
+
 def test_without_a_sync_the_worker_still_pages_lidarr(tmp_path):
     worker = make_worker(tmp_path)
     worker.control.start()

@@ -32,9 +32,11 @@ from wanted import (
     album_key,
     albums_for_search,
     artist_name,
+    count_value,
     holes_for_search,
     holes_from_catalog,
     is_enabled,
+    optional_id,
     song_key,
 )
 from match import (
@@ -638,8 +640,10 @@ class Worker:
             if not album.get("monitored", True):
                 continue
             stats = album.get("statistics") or {}
-            files = int(stats.get("trackFileCount") or 0)
-            total = int(stats.get("totalTrackCount") or stats.get("trackCount") or 0)
+            files = count_value(stats.get("trackFileCount") if isinstance(stats, dict) else None)
+            total = count_value(
+                (stats.get("totalTrackCount") or stats.get("trackCount")) if isinstance(stats, dict) else None
+            )
             if files <= 0 or total <= 0 or files >= total:
                 continue
             for track in self.lidarr.tracks_for_album(int(album["id"])):
@@ -688,7 +692,7 @@ class Worker:
         truly_missing = []
         for album in missing:
             stats = album.get("statistics") or {}
-            files = int(stats.get("trackFileCount") or 0)
+            files = count_value(stats.get("trackFileCount") if isinstance(stats, dict) else None)
             if files > 0:
                 continue
             truly_missing.append(album)
@@ -770,24 +774,40 @@ class Worker:
                 break
             if processed >= self.cfg.max_tracks_per_cycle:
                 break
-            track = hole["track"]
-            track_id = int(track["id"])
-            album = hole["album"]
-            album_id = int(album["id"])
-            artist = hole["artist_name"]
-            album_title = hole["album_title"]
-            title = track.get("title") or "Unknown Track"
-            if not is_enabled(song_key(track_id), self.store.wanted_choices()):
-                continue
-            if self.store.should_skip_track(track_id, self.cfg.retry_hours):
-                continue
-            self.store.upsert_track(track_id, album_id, artist, title, "searching")
-            self.set_job("searching track", artist, title)
-            ok = await self.process_track(hole)
-            self.set_job("idle")
-            processed += 1
-            if not ok:
-                log.info("No usable track yet for %s - %s - %s", artist, album_title, title)
+            try:
+                if not isinstance(hole, dict):
+                    log.warning("Skipping a missing track that is not an object")
+                    continue
+                track = hole.get("track") or {}
+                album = hole.get("album") or {}
+                if not isinstance(track, dict) or not isinstance(album, dict):
+                    log.warning("Skipping a missing track with no track or album")
+                    continue
+                track_id = optional_id(track.get("id"))
+                album_id = optional_id(album.get("id"))
+                title = track.get("title") or "Unknown Track"
+                if track_id is None or album_id is None:
+                    log.warning(
+                        "Skipping %s: no usable id (track number %s)",
+                        title,
+                        track.get("trackNumber") or "",
+                    )
+                    continue
+                artist = hole.get("artist_name") or "Unknown Artist"
+                album_title = hole.get("album_title") or album.get("title") or "Unknown Album"
+                if not is_enabled(song_key(track_id), self.store.wanted_choices()):
+                    continue
+                if self.store.should_skip_track(track_id, self.cfg.retry_hours):
+                    continue
+                self.store.upsert_track(track_id, album_id, artist, title, "searching")
+                self.set_job("searching track", artist, title)
+                ok = await self.process_track(hole)
+                self.set_job("idle")
+                processed += 1
+                if not ok:
+                    log.info("No usable track yet for %s - %s - %s", artist, album_title, title)
+            except Exception:
+                log.exception("Skipping a missing track")
 
     async def process_track(self, hole: dict) -> bool:
         track = hole["track"]

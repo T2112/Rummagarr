@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## [1.4.1] — 2026-10-10
+
+### Fixed
+
+- Wanted sync no longer fails when Lidarr sends a non-numeric track number such as `A1`, `B12`, or `1a`. Those numbers stay on the row and sort by side, then number. A row with no usable id is logged and skipped, and the rest of the sync still finishes.
+
 ## [1.4.0] — 2026-10-10
 
 The installed app can update itself from GitHub Releases.
