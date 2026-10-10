@@ -2,6 +2,34 @@
 
 All notable changes to this project are documented here.
 
+## [1.2.0] — 2026-10-09
+
+Big-list pass so a huge Lidarr wanted list spends less time building and more time downloading.
+
+### Added
+
+- `artist_cooldown_days` (default 7). After one visit, that artist is skipped for a week.
+- `max_missing_pages` (default 20). Each cycle reads only that many Lidarr wanted/missing pages (page size 250). The next cycle continues, then wraps to page 1.
+
+### Changed
+
+- One artist per cycle. The worker no longer stays on the same artist until every album is done.
+- Wanted-list scan no longer fetches every album's tracks. Partial-track fill is limited to the focused artist.
+- Artist focus still walks A–Z, skipping anyone on cooldown.
+
+### Upgrade
+
+1. Stop the worker (Ctrl+C, or stop the scheduled task).
+2. Copy `worker.py`, `state.py`, `config_loader.py`, `lidarr_client.py`, and `check.py` over your install. Keep `config.toml`.
+3. Add under `[search]`:
+
+```toml
+artist_cooldown_days = 7
+max_missing_pages = 20
+```
+
+4. Start one copy only. Ports 2234 and 2235 cannot be shared.
+
 ## [1.1.0] — 2026-09-24
 
 First feature release after the initial Windows package.
