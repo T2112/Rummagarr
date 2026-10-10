@@ -96,6 +96,82 @@ class FakeLidarr:
         return self.tracks
 
 
+def test_vinyl_track_numbers_stay_visible_and_sort():
+    albums = [album(7, "Miles Davis", "Kind of Blue", files=1, total=8)]
+    holes = [
+        hole(1, 7, "Miles Davis", "Kind of Blue", "No number", number=""),
+        hole(2, 7, "Miles Davis", "Kind of Blue", "Side B late", number="B12"),
+        hole(3, 7, "Miles Davis", "Kind of Blue", "Side A", number="A1"),
+        hole(4, 7, "Miles Davis", "Kind of Blue", "Suffix", number="1a"),
+        hole(5, 7, "Miles Davis", "Kind of Blue", "Ten", number="10"),
+        hole(6, 7, "Miles Davis", "Kind of Blue", "Two", number="2"),
+        hole(8, 7, "Miles Davis", "Kind of Blue", "Side A two", number="A2"),
+        hole(9, 7, "Miles Davis", "Kind of Blue", "Disc two", number="A1"),
+    ]
+    holes[-1]["track"]["mediumNumber"] = 2
+    items = build_catalog(albums, holes)
+    songs = [item for item in items if item.kind == "song"]
+    assert [item.song for item in songs] == [
+        "Suffix",
+        "Two",
+        "Ten",
+        "Side A",
+        "Side A two",
+        "Side B late",
+        "No number",
+        "Disc two",
+    ]
+    details = {item.song: item.detail for item in songs}
+    assert details["Side A"] == "Track A1"
+    assert details["Side A two"] == "Track A2"
+    assert details["Side B late"] == "Track B12"
+    assert details["Suffix"] == "Track 1a"
+    assert details["Ten"] == "Track 10"
+    assert details["No number"] == "Missing song"
+    assert details["Disc two"] == "Disc 2 · Track A1"
+
+
+def test_one_bad_lidarr_row_does_not_abort_sync():
+    class Client:
+        def wanted_missing(self, **_kwargs):
+            return [
+                album(7, "Miles Davis", "Kind of Blue", files=1, total=4),
+                {"title": "Broken record", "artist": {"artistName": "Nobody"}},
+            ], 1, True
+
+        def tracks_for_album(self, album_id: int):
+            assert album_id == 7
+            return [
+                {
+                    "id": 70,
+                    "title": "So What",
+                    "trackNumber": "A1",
+                    "mediumNumber": 1,
+                    "monitored": True,
+                    "hasFile": False,
+                },
+                {"id": "A1", "title": "Bad id", "trackNumber": "1", "monitored": True, "hasFile": False},
+                {"title": "No id", "trackNumber": "B2", "monitored": True, "hasFile": False},
+                "not-a-track",
+                {
+                    "id": 71,
+                    "title": "Freddie Freeloader",
+                    "trackNumber": "B12",
+                    "mediumNumber": "B",
+                    "monitored": True,
+                    "hasFile": False,
+                },
+            ]
+
+    items, exhausted = catalog_from_lidarr(Client())
+    assert exhausted is True
+    songs = [item for item in items if item.kind == "song"]
+    assert [item.song for item in songs] == ["So What", "Freddie Freeloader"]
+    assert songs[0].detail == "Track A1"
+    assert songs[1].detail == "Disc B · Track B12"
+    assert [item.album for item in items if item.kind == "album"] == ["Kind of Blue"]
+
+
 def test_catalog_from_lidarr_keeps_missing_monitored_songs_only():
     items, exhausted = catalog_from_lidarr(FakeLidarr(), max_pages=3)
     assert exhausted is True

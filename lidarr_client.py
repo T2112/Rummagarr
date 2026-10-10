@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
+
+from wanted import count_value, optional_id
+
+log = logging.getLogger("lidarr_slsk")
 
 
 class LidarrClient:
@@ -93,29 +98,51 @@ class LidarrClient:
         """Monitored tracks that have no file, on albums that already have at least one file."""
         holes: list[dict[str, Any]] = []
         for album in self.albums():
-            if not album.get("monitored", True):
-                continue
-            stats = album.get("statistics") or {}
-            files = int(stats.get("trackFileCount") or 0)
-            total = int(stats.get("totalTrackCount") or stats.get("trackCount") or 0)
-            if files <= 0 or total <= 0 or files >= total:
-                continue
-            artist = album.get("artist") or {}
-            for track in self.tracks_for_album(int(album["id"])):
-                if not track.get("monitored", True):
+            try:
+                if not isinstance(album, dict) or not album.get("monitored", True):
                     continue
-                if track.get("hasFile"):
+                album_id = optional_id(album.get("id"))
+                if album_id is None:
+                    log.warning("Skipping album %s: no usable id", album.get("title") or "?")
                     continue
-                holes.append(
-                    {
-                        "track": track,
-                        "album": album,
-                        "artist_name": artist.get("artistName")
-                        or album.get("artistName")
-                        or "Unknown Artist",
-                        "album_title": album.get("title") or "Unknown Album",
-                    }
+                stats = album.get("statistics") or {}
+                files = count_value(stats.get("trackFileCount") if isinstance(stats, dict) else None)
+                total = count_value(
+                    (stats.get("totalTrackCount") or stats.get("trackCount")) if isinstance(stats, dict) else None
                 )
+                if files <= 0 or total <= 0 or files >= total:
+                    continue
+                artist = album.get("artist") or {}
+                artist_name = (
+                    artist.get("artistName") or album.get("artistName") or "Unknown Artist"
+                    if isinstance(artist, dict)
+                    else album.get("artistName") or "Unknown Artist"
+                )
+                title = album.get("title") or "Unknown Album"
+                for track in self.tracks_for_album(album_id) or []:
+                    if not isinstance(track, dict):
+                        log.warning("Skipping a track on %s — %s that is not an object", artist_name, title)
+                        continue
+                    if not track.get("monitored", True) or track.get("hasFile"):
+                        continue
+                    if optional_id(track.get("id")) is None:
+                        log.warning(
+                            "Skipping %s on %s — %s: no usable track id",
+                            track.get("trackNumber") or track.get("title") or "?",
+                            artist_name,
+                            title,
+                        )
+                        continue
+                    holes.append(
+                        {
+                            "track": track,
+                            "album": album,
+                            "artist_name": artist_name,
+                            "album_title": title,
+                        }
+                    )
+            except Exception:
+                log.exception("Skipping album %s while listing missing tracks", album.get("title") if isinstance(album, dict) else "?")
         return holes
 
     def scan_downloaded(self, path: str) -> Any:
