@@ -25,6 +25,8 @@ class Config:
     max_tracks_per_cycle: int
     fill_missing_tracks: bool
     focus_one_artist: bool
+    artist_cooldown_days: float
+    max_missing_pages: int
     cycle_seconds: int
     retry_hours: int
     min_filename_ratio: float
@@ -53,7 +55,7 @@ def load_config(path: Path) -> Config:
             "Every text value must stay inside double quotes.\n"
             "Wrong:  api_key = 1a2b3c4d5e6f\n"
             'Right:  api_key = "1a2b3c4d5e6f"\n'
-            "Same for url, username, password, and all folder paths.\n"
+            'Same for url, username, password, and all folder paths.\n'
             r'Windows paths use doubled backslashes: "D:\\Media\\Incoming\\Soulseek"'
         ) from exc
     lidarr = raw["lidarr"]
@@ -61,6 +63,7 @@ def load_config(path: Path) -> Config:
     paths = raw["paths"]
     search = raw["search"]
     runtime = raw.get("runtime", {})
+
     base = path.parent
     download_dir = Path(paths["download_dir"])
     complete_dir = Path(paths["complete_dir"])
@@ -70,6 +73,7 @@ def load_config(path: Path) -> Config:
         state_db = base / state_db
     if not log_file.is_absolute():
         log_file = base / log_file
+
     for key, value in (
         ("lidarr.api_key", lidarr.get("api_key", "")),
         ("soulseek.username", slsk.get("username", "")),
@@ -77,8 +81,10 @@ def load_config(path: Path) -> Config:
     ):
         if not value or value == "CHANGEME":
             raise SystemExit(f"Edit config.toml: {key} is still CHANGEME")
+
     download_dir.mkdir(parents=True, exist_ok=True)
     complete_dir.mkdir(parents=True, exist_ok=True)
+
     return Config(
         lidarr_url=lidarr["url"].rstrip("/"),
         lidarr_api_key=lidarr["api_key"],
@@ -98,6 +104,8 @@ def load_config(path: Path) -> Config:
         max_tracks_per_cycle=int(search.get("max_tracks_per_cycle", 5)),
         fill_missing_tracks=bool(search.get("fill_missing_tracks", True)),
         focus_one_artist=bool(search.get("focus_one_artist", True)),
+        artist_cooldown_days=float(search.get("artist_cooldown_days", 7)),
+        max_missing_pages=int(search.get("max_missing_pages", 20)),
         cycle_seconds=int(search.get("cycle_seconds", 300)),
         retry_hours=int(search.get("retry_hours", 12)),
         min_filename_ratio=float(search.get("min_filename_ratio", 0.5)),
