@@ -31,10 +31,21 @@ class LidarrClient:
         r.raise_for_status()
         return r.json()
 
-    def wanted_missing(self, page_size: int = 250) -> list[dict[str, Any]]:
+    def wanted_missing(
+        self,
+        page_size: int = 250,
+        start_page: int = 1,
+        max_pages: int = 20,
+    ) -> tuple[list[dict[str, Any]], int, bool]:
+        # Lidarr often reports totalPages=1 even when more exist. Page until a
+        # short page, but only max_pages at a time so a huge wanted list does
+        # not block the cycle.
         albums: list[dict[str, Any]] = []
-        page = 1
-        while page <= 200:
+        page = max(1, int(start_page or 1))
+        fetched = 0
+        exhausted = False
+        limit = max(1, int(max_pages or 20))
+        while fetched < limit:
             data = self._get(
                 "/wanted/missing",
                 params={
@@ -47,13 +58,17 @@ class LidarrClient:
                 },
             )
             records = data.get("records") or []
+            fetched += 1
             if not records:
+                exhausted = True
                 break
             albums.extend(records)
             if len(records) < page_size:
+                exhausted = True
                 break
             page += 1
-        return albums
+        next_page = 1 if exhausted else page
+        return albums, next_page, exhausted
 
     def tracks_for_album(self, album_id: int) -> list[dict[str, Any]]:
         return self._get("/track", params={"albumId": album_id}) or []
@@ -61,7 +76,21 @@ class LidarrClient:
     def albums(self) -> list[dict[str, Any]]:
         return self._get("/album") or []
 
+    def albums_for_artist(self, artist_id: int) -> list[dict[str, Any]]:
+        return self._get("/album", params={"artistId": artist_id}) or []
+
+    def artist_id_by_name(self, name: str) -> int | None:
+        wanted = (name or "").casefold().strip()
+        if not wanted:
+            return None
+        for artist in self._get("/artist") or []:
+            label = (artist.get("artistName") or "").casefold().strip()
+            if label == wanted:
+                return int(artist["id"])
+        return None
+
     def missing_tracks_on_partial_albums(self) -> list[dict[str, Any]]:
+        """Monitored tracks that have no file, on albums that already have at least one file."""
         holes: list[dict[str, Any]] = []
         for album in self.albums():
             if not album.get("monitored", True):
