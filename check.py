@@ -20,8 +20,8 @@ def main() -> None:
     try:
         status = client.ping()
         print(f"Lidarr OK: version={status.get('version')} app={status.get('appName')}")
-        missing = client.wanted_missing()
-        print(f"Missing monitored albums: {len(missing)}")
+        missing, next_page, exhausted = client.wanted_missing(max_pages=1)
+        print(f"Missing monitored albums on page 1: {len(missing)}")
         for album in missing[:8]:
             artist = (album.get("artist") or {}).get("artistName") or "?"
             print(f"  - {artist} / {album.get('title')}")
