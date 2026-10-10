@@ -67,3 +67,5 @@ status_bind = "127.0.0.1"
 status_port = 8787
 # Desktop app: start downloading when the window opens.
 start_on_launch = false
+# Installed app: look for a newer GitHub Release when the window opens.
+check_updates = true

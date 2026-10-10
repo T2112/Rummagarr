@@ -1,6 +1,6 @@
 # Lidarr Soulseek Worker
 
-**Version 1.3.0** — Windows desktop app. No Docker. No slskd.
+**Version 1.4.0** — Windows desktop app. No Docker. No slskd.
 
 The worker reads Lidarr **Wanted → Missing**, searches Soulseek, downloads matching albums or individual missing tracks, converts FLAC/WAV to MP3 when needed, asks Lidarr to import and rename, then cleans leftover files.
 
@@ -31,6 +31,10 @@ Most people should install the desktop app instead of setting up Python.
 
 The browser page at `http://127.0.0.1:8787` still works while the worker is running. The desktop window does not need a browser.
 
+The installed app checks GitHub Releases when it opens. **Help → Check for updates** runs that check immediately. A newer version can be installed from the dialog. **Skip this version** remembers that release, and Settings can turn the automatic check off. A copy started from source only shows the new version and opens the release page.
+
+The version is on the window title and under **Help → About**.
+
 ffmpeg is still separate if you want FLAC converted to MP3: `winget install Gyan.FFmpeg`. The Status tab says so when it is missing.
 
 Config, the database, and the log for an installed copy live in `%LOCALAPPDATA%\Lidarr Soulseek\`.
@@ -46,7 +50,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 That installs the Python dependencies and PyInstaller, freezes `desktop_app.py`, and compiles `packaging\LidarrSoulseek.iss` with Inno Setup 6. If Inno Setup is not already installed, the script downloads it. The setup program is written to:
 
 ```text
-dist\LidarrSoulseek-Setup-1.3.0.exe
+dist\LidarrSoulseek-Setup-1.4.0.exe
 ```
 
 The same steps run in GitHub Actions (`.github/workflows/windows-installer.yml`) on `windows-latest`. Pull requests and pushes to `main` upload the installer as a workflow artifact.
@@ -56,6 +60,12 @@ To publish a public download, push a tag `v<version>` that matches the `VERSION`
 This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs on, and Inno Setup is a Windows program. Push the branch and let that workflow produce the `.exe`.
 
 `python main.py` still runs the worker without the window, for the original script install below.
+
+## What's new in 1.4.0
+
+- The installed app updates itself from GitHub Releases
+- Help → Check for updates, with Update now, Later, and Skip this version
+- Full changelog: [CHANGELOG.md](CHANGELOG.md)
 
 ## What's new in 1.2.0
 

@@ -4,13 +4,15 @@ import asyncio
 import logging
 import os
 import shutil
+import tempfile
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
+import webbrowser
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from config_loader import (
     Config,
@@ -25,6 +27,17 @@ from config_loader import (
 from lidarr_client import LidarrClient
 from main import setup_logging
 from status_ui import DEFAULT_RECENT_LIMIT, RECENT_LIMITS, normalize_recent_limit
+from updater import (
+    UpdateStatus,
+    check_for_update,
+    download_verified,
+    launch_installer,
+    load_skipped_update,
+    prompt_kind,
+    remember_skipped_update,
+    versions_equal,
+    wait_for_worker_stop,
+)
 from wanted import (
     VIEW_EVERYTHING,
     VIEWS,
@@ -155,6 +168,14 @@ def format_progress(percent) -> str:
     return "█" * filled + "░" * (cells - filled) + f" {round(value)}%"
 
 
+def format_bytes(size: int) -> str:
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MB"
+    if size >= 1024:
+        return f"{size / 1024:.0f} KB"
+    return f"{size} B"
+
+
 def format_when(iso: str | None) -> str:
     if not iso:
         return ""
@@ -211,6 +232,7 @@ class SettingsForm(ttk.Frame):
         self.obfs_var = tk.StringVar(value=str(cfg.obfuscated_port if cfg else 2235))
         self.upnp_var = tk.BooleanVar(value=(cfg.enable_upnp if cfg else True))
         self.launch_var = tk.BooleanVar(value=(cfg.start_on_launch if cfg else True))
+        self.updates_var = tk.BooleanVar(value=(cfg.check_updates if cfg else True))
         self.message_var = tk.StringVar(value="")
         self._build()
 
@@ -245,11 +267,14 @@ class SettingsForm(ttk.Frame):
         ttk.Checkbutton(self, text="Start downloading when the app opens", variable=self.launch_var).grid(
             row=12, column=0, columnspan=3, sticky="w", pady=2
         )
+        ttk.Checkbutton(self, text="Check for updates when the app opens", variable=self.updates_var).grid(
+            row=13, column=0, columnspan=3, sticky="w", pady=2
+        )
         ttk.Label(self, textvariable=self.message_var, wraplength=620).grid(
-            row=13, column=0, columnspan=3, sticky="w", pady=(8, 4)
+            row=14, column=0, columnspan=3, sticky="w", pady=(8, 4)
         )
         buttons = ttk.Frame(self)
-        buttons.grid(row=14, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        buttons.grid(row=15, column=0, columnspan=3, sticky="w", pady=(8, 0))
         ttk.Button(buttons, text="Test Lidarr", command=self.test_lidarr).pack(side="left")
         ttk.Button(buttons, text="Save", style="Start.TButton", command=self.save).pack(side="left", padx=(8, 0))
         ttk.Button(buttons, text="Cancel", command=self.on_cancel).pack(side="left", padx=(8, 0))
@@ -259,7 +284,7 @@ class SettingsForm(ttk.Frame):
             text="API key: Lidarr → Settings → General → Security. Folders are created if they are missing.",
             style="Muted.TLabel",
             wraplength=620,
-        ).grid(row=15, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        ).grid(row=16, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
     def _path_row(self, row: int, label: str, variable: tk.StringVar) -> None:
         ttk.Label(self, text=label).grid(row=row, column=0, sticky="w", pady=4)
@@ -306,6 +331,7 @@ class SettingsForm(ttk.Frame):
             download_dir=Path(download),
             complete_dir=Path(complete),
             start_on_launch=bool(self.launch_var.get()),
+            check_updates=bool(self.updates_var.get()),
         )
         if self.base is None:
             return default_config(**fields)
@@ -353,6 +379,81 @@ class SettingsForm(ttk.Frame):
         return True
 
 
+class UpdatePrompt(tk.Toplevel):
+    """Newer release: install it, ask again later, or skip this version."""
+
+    def __init__(self, master: tk.Misc, status: UpdateStatus, on_install, on_skip, on_later) -> None:
+        super().__init__(master)
+        self.title("Update Lidarr Soulseek")
+        self.transient(master)
+        self.resizable(True, True)
+        self.minsize(480, 320)
+        self.geometry("540x380")
+        apply_theme(self)
+        frame = ttk.Frame(self, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=f"Version {status.latest} is available", style="Title.TLabel").pack(anchor="w")
+        if status.can_install:
+            detail = (
+                f"You are on {status.current}. Update now downloads the installer, stops the worker, "
+                "and opens the new version when the upgrade finishes."
+            )
+        else:
+            detail = (
+                f"You are on {status.current}. This copy was started from source, so it will not run the installer. "
+                "Open the release page to download it."
+            )
+        ttk.Label(frame, text=detail, style="Muted.TLabel", wraplength=490).pack(anchor="w", pady=(6, 8))
+        notes = tk.Text(
+            frame,
+            height=8,
+            wrap="word",
+            relief="flat",
+            background="#1c1c1c",
+            foreground="#eeeeee",
+            insertbackground="#eeeeee",
+            highlightthickness=0,
+        )
+        notes.pack(fill="both", expand=True)
+        notes.insert("1.0", status.notes or "No release notes were published.")
+        notes.configure(state="disabled")
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(12, 0))
+        primary = "Update now" if status.can_install else "Open release page"
+        ttk.Button(buttons, text=primary, style="Start.TButton", command=on_install).pack(side="left")
+        ttk.Button(buttons, text="Later", command=on_later).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Skip this version", command=on_skip).pack(side="left", padx=(8, 0))
+        self.protocol("WM_DELETE_WINDOW", on_later)
+        self.bind("<Escape>", lambda _event: on_later())
+
+
+class DownloadProgress(tk.Toplevel):
+    def __init__(self, master: tk.Misc) -> None:
+        super().__init__(master)
+        self.title("Downloading update")
+        self.transient(master)
+        self.resizable(False, False)
+        apply_theme(self)
+        frame = ttk.Frame(self, padding=16)
+        frame.pack(fill="both", expand=True)
+        self.label_var = tk.StringVar(value="Starting the download…")
+        ttk.Label(frame, textvariable=self.label_var, wraplength=420).pack(anchor="w")
+        self.bar = ttk.Progressbar(frame, length=420, mode="determinate", maximum=100)
+        self.bar.pack(fill="x", pady=(10, 0))
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+
+    def report(self, done: int, total: int) -> None:
+        if total > 0:
+            self.bar.stop()
+            self.bar.configure(mode="determinate", maximum=total, value=done)
+            self.label_var.set(f"Downloaded {format_bytes(done)} of {format_bytes(total)}")
+            return
+        if str(self.bar.cget("mode")) != "indeterminate":
+            self.bar.configure(mode="indeterminate")
+            self.bar.start(12)
+        self.label_var.set(f"Downloaded {format_bytes(done)}")
+
+
 class DesktopApp(tk.Tk):
     def __init__(
         self,
@@ -361,6 +462,7 @@ class DesktopApp(tk.Tk):
         *,
         start_status_server: bool = False,
         honor_start_on_launch: bool = False,
+        check_updates: bool = False,
         poll_ms: int = 2000,
     ) -> None:
         super().__init__()
@@ -369,6 +471,11 @@ class DesktopApp(tk.Tk):
         self.poll_ms = poll_ms
         self._run_lock = threading.Lock()
         self._thread: threading.Thread | None = None
+        self._update_busy = False
+        self._update_manual = False
+        self._shutting_down = False
+        self._update_prompt: UpdatePrompt | None = None
+        self._download_progress: DownloadProgress | None = None
         self._syncing = False
         self._updating_select_all = False
         self._row_items: dict[str, WantedItem] = {}
@@ -392,11 +499,15 @@ class DesktopApp(tk.Tk):
         self.refresh_wanted()
         if honor_start_on_launch and worker.cfg.start_on_launch:
             self.after(300, self.on_start)
+        if check_updates:
+            self.after(400, lambda: self.check_for_updates(manual=False))
 
     def _build(self) -> None:
+        self._build_menu()
         header = ttk.Frame(self, padding=(16, 12, 16, 0))
         header.pack(fill="x")
         ttk.Label(header, text="Lidarr Soulseek", style="Title.TLabel").pack(side="left")
+        ttk.Label(header, text=app_version(), style="Muted.TLabel").pack(side="left", padx=(10, 0), pady=(4, 0))
         ttk.Button(header, text="Settings", command=self.open_settings).pack(side="right")
 
         self.notebook = ttk.Notebook(self)
@@ -407,6 +518,24 @@ class DesktopApp(tk.Tk):
         self.notebook.add(self.wanted_tab, text="Wanted")
         self._build_status(self.status_tab)
         self._build_wanted(self.wanted_tab)
+
+    def _build_menu(self) -> None:
+        menu = tk.Menu(self, tearoff=0)
+        help_menu = tk.Menu(menu, tearoff=0)
+        help_menu.add_command(label="Check for updates", command=lambda: self.check_for_updates(manual=True))
+        help_menu.add_command(label="About", command=self.show_about)
+        menu.add_cascade(label="Help", menu=help_menu)
+        self.configure(menu=menu)
+        self.help_menu = help_menu
+
+    def show_about(self) -> None:
+        messagebox.showinfo(
+            "About Lidarr Soulseek",
+            f"Lidarr Soulseek {app_version()}\n\n"
+            "Downloads missing music from Soulseek into Lidarr.\n"
+            "Help → Check for updates looks for a newer release.",
+            parent=self,
+        )
 
     def _build_status(self, parent: ttk.Frame) -> None:
         controls = ttk.Frame(parent)
@@ -515,6 +644,8 @@ class DesktopApp(tk.Tk):
         self.wanted.bind("<space>", self.on_wanted_space)
 
     def _tick(self) -> None:
+        if self._shutting_down:
+            return
         try:
             if not self.winfo_exists():
                 return
@@ -524,6 +655,7 @@ class DesktopApp(tk.Tk):
         self.after(self.poll_ms, self._tick)
 
     def _on_close(self) -> None:
+        self._shutting_down = True
         try:
             self.worker.control.stop()
         except Exception:
@@ -537,7 +669,7 @@ class DesktopApp(tk.Tk):
     def open_settings(self) -> None:
         window = tk.Toplevel(self)
         window.title("Lidarr Soulseek settings")
-        window.geometry("720x700")
+        window.geometry("720x760")
         window.transient(self)
         apply_theme(window)
 
@@ -803,10 +935,183 @@ class DesktopApp(tk.Tk):
             self.wanted.yview_moveto(yview[0])
 
 
+    def check_for_updates(self, manual: bool = True) -> None:
+        if self._shutting_down:
+            return
+        if self._update_busy:
+            if manual:
+                self._update_manual = True
+            return
+        self._update_busy = True
+        self._update_manual = manual
+        if manual:
+            self.notice_var.set("Checking for updates…")
+
+        def work() -> None:
+            try:
+                skipped = load_skipped_update(self.worker.store)
+                status = check_for_update(app_version(), skipped)
+            except Exception as exc:
+                log.exception("Update check failed")
+                status = UpdateStatus(current=app_version(), error=f"Could not check for updates: {exc}")
+            self._post(lambda: self._update_check_finished(status, self._update_manual))
+
+        threading.Thread(target=work, name="update-check", daemon=True).start()
+
+    def _update_check_finished(self, status: UpdateStatus, manual: bool) -> None:
+        self._update_busy = False
+        if self._shutting_down:
+            return
+        kind = prompt_kind(status, manual=manual)
+        if kind == "quiet":
+            if status.error and not self.notice_var.get():
+                self.notice_var.set(status.error)
+            elif status.error:
+                log.info("Update check: %s", status.error)
+            return
+        if kind == "current":
+            self.notice_var.set("")
+            if status.latest and not versions_equal(status.latest, status.current):
+                message = f"You're on {status.current}. The latest published release is {status.latest}."
+            else:
+                message = f"You're on {status.current}, which is the latest release."
+            messagebox.showinfo("Lidarr Soulseek", message, parent=self)
+            return
+        if kind == "error":
+            self.notice_var.set(status.error or "Could not check for updates.")
+            messagebox.showerror("Lidarr Soulseek", status.error or "Could not check for updates.", parent=self)
+            return
+        self.notice_var.set("")
+        self._show_update_prompt(status)
+
+    def _show_update_prompt(self, status: UpdateStatus) -> None:
+        if self._update_prompt is not None:
+            try:
+                if self._update_prompt.winfo_exists():
+                    self._update_prompt.lift()
+                    return
+            except tk.TclError:
+                self._update_prompt = None
+
+        def later() -> None:
+            self._close_update_prompt()
+
+        def skip() -> None:
+            if status.latest:
+                try:
+                    remember_skipped_update(self.worker.store, status.latest)
+                except Exception:
+                    log.exception("Could not remember the skipped version")
+            self.notice_var.set(f"Skipped version {status.latest}.")
+            self._close_update_prompt()
+
+        def install() -> None:
+            self._close_update_prompt()
+            if status.can_install:
+                self._begin_download(status)
+                return
+            webbrowser.open(status.page_url)
+
+        self._update_prompt = UpdatePrompt(self, status, install, skip, later)
+
+    def _close_update_prompt(self) -> None:
+        prompt = self._update_prompt
+        self._update_prompt = None
+        if prompt is None:
+            return
+        try:
+            prompt.destroy()
+        except tk.TclError:
+            pass
+
+    def _begin_download(self, status: UpdateStatus) -> None:
+        progress = DownloadProgress(self)
+        self._download_progress = progress
+
+        def on_progress(done: int, total: int) -> None:
+            def paint() -> None:
+                if self._shutting_down:
+                    return
+                try:
+                    if progress.winfo_exists():
+                        progress.report(done, total)
+                except tk.TclError:
+                    pass
+
+            self._post(paint)
+
+        def work() -> None:
+            try:
+                folder = Path(tempfile.mkdtemp(prefix="lidarr-soulseek-update-"))
+                dest = folder / (status.asset_name or "LidarrSoulseek-Setup.exe")
+                download_verified(status, dest, on_progress=on_progress)
+            except Exception as exc:
+                log.exception("Update download failed")
+                self._post(lambda: self._download_failed(exc))
+                return
+            self._post(lambda: self._download_ready(dest))
+
+        threading.Thread(target=work, name="update-download", daemon=True).start()
+
+    def _close_progress(self) -> None:
+        progress = self._download_progress
+        self._download_progress = None
+        if progress is None:
+            return
+        try:
+            progress.destroy()
+        except tk.TclError:
+            pass
+
+    def _download_failed(self, exc: Exception) -> None:
+        self._close_progress()
+        if self._shutting_down:
+            return
+        message = str(exc) or "Could not download the update."
+        self.notice_var.set(message)
+        messagebox.showerror("Lidarr Soulseek", message, parent=self)
+
+    def _download_ready(self, dest: Path) -> None:
+        if self._shutting_down:
+            return
+        progress = self._download_progress
+        if progress is not None:
+            try:
+                progress.label_var.set("Stopping the worker so the installer can replace the app…")
+            except tk.TclError:
+                pass
+
+        def work() -> None:
+            stopped = wait_for_worker_stop(self.worker.control, self._thread, timeout=25)
+            if not stopped:
+                log.warning("Worker was still stopping; the installer will close the app")
+            self._post(lambda: self._launch_update(dest))
+
+        threading.Thread(target=work, name="update-stop", daemon=True).start()
+
+    def _launch_update(self, dest: Path) -> None:
+        self._shutting_down = True
+        try:
+            launch_installer(dest)
+        except OSError as exc:
+            log.exception("Could not start the installer")
+            self._shutting_down = False
+            self._close_progress()
+            messagebox.showerror("Lidarr Soulseek", f"Could not start the installer: {exc}", parent=self)
+            return
+        try:
+            if self._thread is None or not self._thread.is_alive():
+                self.worker.close()
+        except Exception:
+            log.exception("Could not close the worker")
+        self._close_progress()
+        self.destroy()
+
+
 def run_setup(config_path: Path) -> Config | None:
     root = tk.Tk()
     root.title("Lidarr Soulseek setup")
-    root.geometry("740x700")
+    root.geometry("740x760")
     apply_theme(root)
     saved: dict[str, Config] = {}
 
@@ -846,6 +1151,7 @@ def main() -> None:
         path,
         start_status_server=True,
         honor_start_on_launch=True,
+        check_updates=cfg.check_updates,
     )
     app.mainloop()
 

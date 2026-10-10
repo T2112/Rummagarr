@@ -5,7 +5,9 @@ import time
 
 import pytest
 
+from config_loader import app_version
 from desktop_app import CHECKED, UNCHECKED, DesktopApp, SettingsForm, format_status_line
+from updater import UpdateStatus
 from status_ui import RECENT_LIMITS
 from tests.conftest import album, hole, make_worker
 from wanted import VIEW_ALBUMS, VIEW_ARTISTS, VIEW_SONGS, build_catalog
@@ -52,6 +54,43 @@ def _row(app, **match):
         if all(getattr(item, field) == value for field, value in match.items()):
             return iid, item
     raise AssertionError(f"no wanted row matching {match}")
+
+
+def test_window_shows_version_and_update_actions(desktop):
+    assert app_version() in desktop.title()
+    assert desktop.help_menu.entrycget(0, "label") == "Check for updates"
+    assert desktop.help_menu.entrycget(1, "label") == "About"
+    status = UpdateStatus(
+        current="1.4.0",
+        latest="1.5.0",
+        notes="Stops cleanly before the installer runs.",
+        newer=True,
+        can_install=False,
+        page_url="https://example.test/releases/v1.5.0",
+    )
+    desktop._show_update_prompt(status)
+    desktop.update()
+    prompt = desktop._update_prompt
+    assert prompt is not None
+    labels = [child.cget("text") for child in _buttons(prompt)]
+    assert "Open release page" in labels
+    assert "Later" in labels
+    assert "Skip this version" in labels
+    next(button for button in _buttons(prompt) if button.cget("text") == "Skip this version").invoke()
+    desktop.update()
+    assert desktop.worker.store.get_meta("skipped_update_version") == "1.5.0"
+    assert desktop._update_prompt is None
+
+
+def _buttons(widget):
+    from tkinter import ttk
+
+    found = []
+    for child in widget.winfo_children():
+        if isinstance(child, ttk.Button):
+            found.append(child)
+        found.extend(_buttons(child))
+    return found
 
 
 def test_status_tab_shows_history_choices_and_controls(desktop):

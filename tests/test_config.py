@@ -30,6 +30,7 @@ def test_round_trip_keeps_secrets_and_windows_paths(tmp_path: Path):
     assert loaded.slsk_password == 'p@ss"word'
     assert loaded.lidarr_scan_path == r"D:\Media\Incoming"
     assert loaded.start_on_launch is True
+    assert loaded.check_updates is True
     assert loaded.ignored_users == {"badpeer"}
     assert loaded.preferred_extensions == ["flac", "mp3"]
     assert loaded.download_dir == tmp_path / "in"
@@ -62,3 +63,21 @@ def test_changeme_and_bad_toml_are_errors(tmp_path: Path):
         assert "CHANGEME" in str(exc)
     else:
         raise AssertionError("placeholder secrets should fail")
+
+
+def test_check_updates_defaults_on_when_the_key_is_missing(tmp_path: Path):
+    path = tmp_path / "config.toml"
+    cfg = default_config(
+        lidarr_api_key="abc123",
+        slsk_username="souluser",
+        slsk_password="soulpass",
+        download_dir=tmp_path / "in",
+        complete_dir=tmp_path / "out",
+        check_updates=False,
+    )
+    save_config(path, cfg)
+    assert try_load_config(path).check_updates is False
+    text = path.read_text(encoding="utf-8").replace("check_updates = false\n", "")
+    path.write_text(text, encoding="utf-8")
+    assert "check_updates =" not in text
+    assert try_load_config(path).check_updates is True
