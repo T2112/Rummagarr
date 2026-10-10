@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [1.5.0] — 2026-10-10
+
+### Added
+
+- Soulseek searches fold accented and symbolic names to ASCII (`Mötley Crüe` is also searched as `Motley Crue`, and the same for Beyoncé, Sigur Rós, Queensrÿche, Blue Öyster Cult, Björk, P!nk, Ke$ha, and `&` / `and`). The original spelling is searched too when it differs, and up to three Lidarr artist aliases already on the album are extra search terms. Match scoring uses the same folding. A folder that is a different artist still fails.
+- Settings has a Behavior tab for the options that used to be config-file only: concurrent albums, the artist retry period, quality and format preferences, ffmpeg conversion, polling, timeouts, the status page address, history size, and the update check. Each field has a range and a short explanation. Restore defaults puts them back without clearing the login. Search and download changes apply on the next pass. Connection, folders, and the status page ask you to stop and start the worker.
+
 ## [1.4.1] — 2026-10-10
 
 ### Fixed

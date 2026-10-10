@@ -5,8 +5,17 @@ import time
 
 import pytest
 
-from config_loader import app_version
-from desktop_app import CHECKED, UNCHECKED, DesktopApp, SettingsForm, format_status_line
+from dataclasses import replace
+
+from config_loader import app_version, default_config
+from desktop_app import (
+    CHECKED,
+    UNCHECKED,
+    DesktopApp,
+    SettingsForm,
+    format_status_line,
+    settings_apply_message,
+)
 from updater import UpdateStatus
 from status_ui import RECENT_LIMITS
 from tests.conftest import album, hole, make_worker
@@ -205,6 +214,68 @@ def test_settings_form_writes_a_loadable_config(tmp_path):
     assert saved["cfg"].slsk_password == 'p@ss"word'
     assert saved["cfg"].start_on_launch is True
     root.destroy()
+
+
+def test_behavior_tab_saves_ranges_and_restore_defaults(tmp_path):
+    _tk_or_skip()
+    import tkinter as tk
+
+    from tests.conftest import make_worker
+
+    root = tk.Tk()
+    worker = make_worker(tmp_path)
+    path = tmp_path / "config.toml"
+    saved = {}
+    form = SettingsForm(
+        root,
+        path,
+        worker.cfg,
+        lambda cfg: saved.update(cfg=cfg),
+        root.destroy,
+        store=worker.store,
+    )
+    form.fields["concurrent_albums"].set("4")
+    form.fields["artist_cooldown_days"].set("3")
+    form.fields["preferred_extensions"].set("mp3, flac")
+    form.updates_var.set(False)
+    form.history_var.set("50")
+    assert form.save() is True
+    assert saved["cfg"].concurrent_albums == 4
+    assert saved["cfg"].artist_cooldown_days == 3.0
+    assert saved["cfg"].preferred_extensions == ["mp3", "flac"]
+    assert saved["cfg"].check_updates is False
+    assert saved["cfg"].slsk_password == "soulpass"
+    assert worker.store.get_meta("gui_recent_limit") == "50"
+    loaded = path.read_text(encoding="utf-8")
+    assert "concurrent_albums = 4" in loaded
+    assert "check_updates = false" in loaded
+
+    form.fields["concurrent_albums"].set("0")
+    assert form.save() is False
+    assert "Albums at once" in form.message_var.get()
+    assert "concurrent_albums = 4" in path.read_text(encoding="utf-8")
+
+    form.restore_defaults()
+    assert form.fields["concurrent_albums"].get() == "3"
+    assert form.api_var.get() == "test-key"
+    assert form.fields["state_db"].get() == str(worker.cfg.state_db)
+    assert form.history_var.get() == "10"
+    assert form.save() is True
+    assert saved["cfg"].concurrent_albums == 3
+    assert saved["cfg"].check_updates is True
+    root.destroy()
+
+
+def test_settings_apply_message_says_when_a_restart_is_required():
+    old = default_config(lidarr_api_key="key", slsk_username="user", slsk_password="pass")
+    live = replace(old, concurrent_albums=4, artist_cooldown_days=2)
+    live_text = settings_apply_message(old, live)
+    assert "next pass" in live_text
+    assert "Stop and start" not in live_text
+    restarted = replace(old, status_port=8790, lidarr_url="http://127.0.0.1:8686")
+    assert "Stop and start" in settings_apply_message(old, restarted)
+    launch = replace(old, check_updates=False)
+    assert "next time the app opens" in settings_apply_message(old, launch)
 
 
 def test_status_line_matches_the_web_page_fields():

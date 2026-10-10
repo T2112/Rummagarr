@@ -9,7 +9,7 @@ import threading
 import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
-from dataclasses import replace
+from dataclasses import dataclass, fields as dataclass_fields, replace
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -204,6 +204,103 @@ def scrolled_tree(parent: tk.Misc, columns: tuple[tuple[str, str, int, bool], ..
     return frame, tree
 
 
+@dataclass(frozen=True)
+class BehaviorField:
+    key: str
+    label: str
+    kind: str
+    unit: str
+    help: str
+    low: float | None = None
+    high: float | None = None
+    restore: bool = True
+
+
+BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
+    BehaviorField("concurrent_albums", "Albums at once", "int", "", "How many albums to search or download together. 1 is one after another.", 1, 8),
+    BehaviorField("search_wait_seconds", "Search wait", "float", "seconds", "How long to wait for Soulseek results before scoring them.", 1, 90),
+    BehaviorField("max_albums_per_cycle", "Albums per pass", "int", "", "Album searches started in one pass.", 1, 20),
+    BehaviorField("focus_one_artist", "One artist at a time", "bool", "", "Stay on a single artist, then move on."),
+    BehaviorField("artist_cooldown_days", "Artist retry period", "float", "days", "After a visit, skip that artist for this many days. 0 retries every pass.", 0, 90),
+    BehaviorField("max_missing_pages", "Wanted pages per pass", "int", "pages", "Lidarr wanted/missing pages read each pass. Each page is 250 albums.", 1, 200),
+    BehaviorField("fill_missing_tracks", "Fill missing songs", "bool", "", "Search Soulseek for individual songs on albums Lidarr already has in part."),
+    BehaviorField("max_tracks_per_cycle", "Songs per pass", "int", "", "Individual song searches started in one pass. 0 turns song fill off for that pass.", 0, 50),
+    BehaviorField("cycle_seconds", "Pause between passes", "int", "seconds", "How long to wait after a pass before the next one.", 15, 7200),
+    BehaviorField("retry_hours", "Retry a miss after", "int", "hours", "How long to wait before searching again for an album or song that did not match.", 0, 168),
+    BehaviorField("min_filename_ratio", "Filename match", "float", "0–1", "How close a filename must be to the Lidarr title. Higher is stricter.", 0.2, 0.95),
+    BehaviorField("track_count_tolerance", "Track count slack", "int", "tracks", "How many extra or missing files an album folder may have.", 0, 15),
+    BehaviorField("preferred_extensions", "Formats, in order", "csv", "", "Tried in this order. Example: mp3, flac, wav."),
+    BehaviorField("min_mp3_bitrate", "Minimum MP3 bitrate", "int", "kbps", "Reject MP3s below this bitrate when Soulseek reports one.", 96, 320),
+    BehaviorField("convert_to_mp3", "Convert to MP3", "bool", "", "Convert FLAC and WAV to MP3 with ffmpeg before Lidarr imports them."),
+    BehaviorField("convert_bitrate", "Convert bitrate", "int", "kbps", "Bitrate ffmpeg uses for the MP3.", 128, 320),
+    BehaviorField("delete_sources_after_import", "Delete source after import", "bool", "", "Remove the original FLAC or WAV from Incomplete after Lidarr is asked to import the MP3."),
+    BehaviorField("clean_incomplete_on_fail", "Clean up failed downloads", "bool", "", "Delete leftover files in Incomplete when a download fails or is cancelled."),
+    BehaviorField("incomplete_max_age_hours", "Delete old Incomplete files", "float", "hours", "Also delete Incomplete files older than this. 0 turns the sweep off.", 0, 168),
+    BehaviorField("ignored_users", "Ignored Soulseek users", "csv", "", "Comma-separated usernames the worker will not download from. Leave blank to ignore nobody."),
+    BehaviorField("download_timeout_minutes", "Download timeout", "int", "minutes", "Give up on an album download after this long.", 5, 720),
+    BehaviorField("status_bind", "Status page address", "text", "", "Address the browser status page listens on. 127.0.0.1 is this PC only. Restart to apply.", restore=True),
+    BehaviorField("status_port", "Status page port", "int", "", "Port for the browser status page. Restart to apply.", 1, 65535),
+    BehaviorField("check_updates", "Check for updates on launch", "bool", "", "Look for a newer GitHub Release when the app opens."),
+    BehaviorField("share_dir", "Folder to share", "path", "", "Optional library folder Soulseek may share. Leave empty to share nothing. Restart to apply.", restore=False),
+    BehaviorField("state_db", "Database file", "text", "", "SQLite file for progress and wanted checkboxes. Restart to apply.", restore=False),
+    BehaviorField("log_file", "Log file", "text", "", "Where the worker writes its log. Restart to apply.", restore=False),
+)
+
+_RESTART_FIELDS = frozenset(
+    {
+        "lidarr_url",
+        "lidarr_api_key",
+        "lidarr_scan_path",
+        "slsk_username",
+        "slsk_password",
+        "listen_port",
+        "obfuscated_port",
+        "enable_upnp",
+        "download_dir",
+        "complete_dir",
+        "share_dir",
+        "state_db",
+        "log_file",
+        "status_bind",
+        "status_port",
+    }
+)
+_LAUNCH_FIELDS = frozenset({"start_on_launch", "check_updates"})
+
+
+def _display_number(value) -> str:
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _config_same(left, right) -> bool:
+    if isinstance(left, Path) or isinstance(right, Path):
+        return Path(left) == Path(right)
+    if isinstance(left, set) or isinstance(right, set):
+        return set(left) == set(right)
+    return left == right
+
+
+def settings_apply_message(old: Config, new: Config) -> str:
+    """Tell the user which saved values wait for a restart."""
+    changed = {
+        item.name
+        for item in dataclass_fields(Config)
+        if not _config_same(getattr(old, item.name), getattr(new, item.name))
+    }
+    if not changed:
+        return "Saved."
+    parts = ["Saved."]
+    if changed & _RESTART_FIELDS:
+        parts.append("Stop and start the worker to apply connection, folder, and status-page changes.")
+    if changed - _RESTART_FIELDS - _LAUNCH_FIELDS:
+        parts.append("Search and download settings apply on the next pass.")
+    if changed & _LAUNCH_FIELDS:
+        parts.append("The update check and start-on-launch apply the next time the app opens.")
+    return " ".join(parts)
+
+
 class SettingsForm(ttk.Frame):
     """First-run and later edits of the Lidarr and Soulseek settings."""
 
@@ -214,12 +311,15 @@ class SettingsForm(ttk.Frame):
         cfg: Config | None,
         on_saved,
         on_cancel,
+        store=None,
     ) -> None:
         super().__init__(master, padding=16)
         self.config_path = config_path
         self.base = cfg
         self.on_saved = on_saved
         self.on_cancel = on_cancel
+        self.store = store
+        source = cfg if cfg is not None else default_config()
         download, complete = default_media_dirs()
         self.url_var = tk.StringVar(value=(cfg.lidarr_url if cfg else "http://127.0.0.1:8686"))
         self.api_var = tk.StringVar(value=(cfg.lidarr_api_key if cfg else ""))
@@ -232,69 +332,288 @@ class SettingsForm(ttk.Frame):
         self.obfs_var = tk.StringVar(value=str(cfg.obfuscated_port if cfg else 2235))
         self.upnp_var = tk.BooleanVar(value=(cfg.enable_upnp if cfg else True))
         self.launch_var = tk.BooleanVar(value=(cfg.start_on_launch if cfg else True))
-        self.updates_var = tk.BooleanVar(value=(cfg.check_updates if cfg else True))
+        self.fields: dict[str, tk.Variable] = {}
+        for spec in BEHAVIOR_FIELDS:
+            self.fields[spec.key] = self._variable(spec, getattr(source, spec.key))
+        self.updates_var = self.fields["check_updates"]
+        if store is not None:
+            saved_limit = store.get_meta("gui_recent_limit")
+            self.history_var: tk.StringVar | None = tk.StringVar(
+                value=str(normalize_recent_limit(saved_limit or DEFAULT_RECENT_LIMIT))
+            )
+        else:
+            self.history_var = None
         self.message_var = tk.StringVar(value="")
+        self._behavior_canvas: tk.Canvas | None = None
         self._build()
 
+    def _variable(self, spec: BehaviorField, value) -> tk.Variable:
+        if spec.kind == "bool":
+            return tk.BooleanVar(value=bool(value))
+        if spec.kind == "csv":
+            if spec.key == "ignored_users":
+                text = ", ".join(sorted(value))
+            else:
+                text = ", ".join(value)
+            return tk.StringVar(value=text)
+        if spec.kind in {"int", "float"}:
+            return tk.StringVar(value=_display_number(value))
+        return tk.StringVar(value="" if value is None else str(value))
+
+    def _set_field(self, spec: BehaviorField, value) -> None:
+        variable = self.fields[spec.key]
+        if spec.kind == "bool":
+            variable.set(bool(value))
+            return
+        if spec.kind == "csv":
+            if spec.key == "ignored_users":
+                variable.set(", ".join(sorted(value)))
+            else:
+                variable.set(", ".join(value))
+            return
+        if spec.kind in {"int", "float"}:
+            variable.set(_display_number(value))
+            return
+        variable.set("" if value is None else str(value))
+
     def _build(self) -> None:
-        ttk.Label(self, text="Lidarr Soulseek setup", style="Title.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(self, text="Lidarr Soulseek setup", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(
             self,
-            text="Enter the Lidarr address and API key, then the Soulseek account this PC should use.",
+            text="Connection holds the login and folders. Behavior holds the search, conversion, and update options.",
             style="Muted.TLabel",
-            wraplength=620,
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 12))
-        rows = (
-            (2, "Lidarr URL", self.url_var, False),
-            (3, "Lidarr API key", self.api_var, False),
-            (4, "Soulseek username", self.user_var, False),
-            (5, "Soulseek password", self.password_var, True),
-        )
-        for row, label, variable, secret in rows:
-            ttk.Label(self, text=label).grid(row=row, column=0, sticky="w", pady=4)
-            entry = ttk.Entry(self, textvariable=variable, width=52, show="*" if secret else "")
-            entry.grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
-        self._path_row(6, "Incomplete folder", self.download_var)
-        self._path_row(7, "Complete folder", self.complete_var)
-        self._path_row(8, "Lidarr scan path", self.scan_var)
-        ttk.Label(self, text="Listen port").grid(row=9, column=0, sticky="w", pady=4)
-        ttk.Entry(self, textvariable=self.listen_var, width=10).grid(row=9, column=1, sticky="w", pady=4)
-        ttk.Label(self, text="Obfuscated port").grid(row=10, column=0, sticky="w", pady=4)
-        ttk.Entry(self, textvariable=self.obfs_var, width=10).grid(row=10, column=1, sticky="w", pady=4)
-        ttk.Checkbutton(self, text="Try to open the listen ports with UPnP", variable=self.upnp_var).grid(
-            row=11, column=0, columnspan=3, sticky="w", pady=(8, 2)
-        )
-        ttk.Checkbutton(self, text="Start downloading when the app opens", variable=self.launch_var).grid(
-            row=12, column=0, columnspan=3, sticky="w", pady=2
-        )
-        ttk.Checkbutton(self, text="Check for updates when the app opens", variable=self.updates_var).grid(
-            row=13, column=0, columnspan=3, sticky="w", pady=2
-        )
-        ttk.Label(self, textvariable=self.message_var, wraplength=620).grid(
-            row=14, column=0, columnspan=3, sticky="w", pady=(8, 4)
-        )
+            wraplength=900,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 8))
+        self.notebook = ttk.Notebook(self)
+        self.notebook.grid(row=2, column=0, sticky="nsew")
+        connection = ttk.Frame(self.notebook, padding=12)
+        behavior = ttk.Frame(self.notebook, padding=(4, 8, 4, 4))
+        self.notebook.add(connection, text="Connection")
+        self.notebook.add(behavior, text="Behavior")
+        self._build_connection(connection)
+        self._build_behavior(behavior)
+        ttk.Label(self, textvariable=self.message_var, wraplength=900).grid(row=3, column=0, sticky="w", pady=(8, 4))
         buttons = ttk.Frame(self)
-        buttons.grid(row=15, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        buttons.grid(row=4, column=0, sticky="w")
         ttk.Button(buttons, text="Test Lidarr", command=self.test_lidarr).pack(side="left")
         ttk.Button(buttons, text="Save", style="Start.TButton", command=self.save).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Restore defaults", command=self.restore_defaults).pack(side="left", padx=(8, 0))
         ttk.Button(buttons, text="Cancel", command=self.on_cancel).pack(side="left", padx=(8, 0))
-        self.columnconfigure(1, weight=1)
         ttk.Label(
             self,
-            text="API key: Lidarr → Settings → General → Security. Folders are created if they are missing.",
+            text="API key: Lidarr → Settings → General → Security. Restore defaults does not clear the login or save until you click Save.",
             style="Muted.TLabel",
-            wraplength=620,
-        ).grid(row=16, column=0, columnspan=3, sticky="w", pady=(12, 0))
+            wraplength=900,
+        ).grid(row=5, column=0, sticky="w", pady=(12, 0))
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
 
-    def _path_row(self, row: int, label: str, variable: tk.StringVar) -> None:
-        ttk.Label(self, text=label).grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Entry(self, textvariable=variable, width=52).grid(row=row, column=1, sticky="ew", pady=4)
-        ttk.Button(self, text="Browse", command=lambda var=variable: self._browse(var)).grid(row=row, column=2, padx=(8, 0))
+    def _build_connection(self, parent: ttk.Frame) -> None:
+        rows = (
+            (0, "Lidarr URL", self.url_var, False),
+            (1, "Lidarr API key", self.api_var, False),
+            (2, "Soulseek username", self.user_var, False),
+            (3, "Soulseek password", self.password_var, True),
+        )
+        for row, label, variable, secret in rows:
+            ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
+            ttk.Entry(parent, textvariable=variable, width=52, show="*" if secret else "").grid(
+                row=row, column=1, columnspan=2, sticky="ew", pady=4
+            )
+        self._path_row(parent, 4, "Incomplete folder", self.download_var)
+        self._path_row(parent, 5, "Complete folder", self.complete_var)
+        self._path_row(parent, 6, "Lidarr scan path", self.scan_var)
+        ttk.Label(parent, text="Listen port").grid(row=7, column=0, sticky="w", pady=4)
+        ttk.Entry(parent, textvariable=self.listen_var, width=10).grid(row=7, column=1, sticky="w", pady=4)
+        ttk.Label(parent, text="Soulseek listen port. Restart to apply.", style="Muted.TLabel").grid(
+            row=8, column=1, columnspan=2, sticky="w"
+        )
+        ttk.Label(parent, text="Obfuscated port").grid(row=9, column=0, sticky="w", pady=4)
+        ttk.Entry(parent, textvariable=self.obfs_var, width=10).grid(row=9, column=1, sticky="w", pady=4)
+        ttk.Label(parent, text="Must be different from the listen port. Restart to apply.", style="Muted.TLabel").grid(
+            row=10, column=1, columnspan=2, sticky="w"
+        )
+        ttk.Checkbutton(parent, text="Try to open the listen ports with UPnP", variable=self.upnp_var).grid(
+            row=11, column=0, columnspan=3, sticky="w", pady=(8, 2)
+        )
+        ttk.Checkbutton(parent, text="Start downloading when the app opens", variable=self.launch_var).grid(
+            row=12, column=0, columnspan=3, sticky="w", pady=2
+        )
+        ttk.Label(
+            parent,
+            text="Search limits, conversion, the status page, and the update check are on the Behavior tab.",
+            style="Muted.TLabel",
+            wraplength=760,
+        ).grid(row=13, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        parent.columnconfigure(1, weight=1)
 
-    def _browse(self, variable: tk.StringVar) -> None:
-        chosen = filedialog.askdirectory(initialdir=variable.get() or str(Path.home()))
+    def _build_behavior(self, parent: ttk.Frame) -> None:
+        ttk.Label(
+            parent,
+            text="Each option is the same value config.toml already uses. A short note under the field says what it changes.",
+            style="Muted.TLabel",
+            wraplength=860,
+        ).pack(anchor="w", pady=(0, 6))
+        canvas = tk.Canvas(parent, highlightthickness=0, background="#111111", borderwidth=0)
+        self._behavior_canvas = canvas
+        scroll = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _fit(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfigure(window_id, width=canvas.winfo_width())
+
+        inner.bind("<Configure>", _fit)
+        canvas.bind("<Configure>", _fit)
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        canvas.bind("<Enter>", self._wheel_on)
+        canvas.bind("<Leave>", self._wheel_off)
+        canvas.bind("<Destroy>", self._wheel_off)
+        row = 0
+        if self.history_var is not None:
+            ttk.Label(inner, text="Recent history").grid(row=row, column=0, sticky="w", pady=(2, 0))
+            ttk.Combobox(
+                inner,
+                textvariable=self.history_var,
+                values=[str(number) for number in RECENT_LIMITS],
+                state="readonly",
+                width=8,
+            ).grid(row=row, column=1, sticky="w", pady=(2, 0))
+            ttk.Label(inner, text="items", style="Muted.TLabel").grid(row=row, column=2, sticky="w", padx=(8, 0))
+            row += 1
+            ttk.Label(
+                inner,
+                text="How many finished downloads the Status tab lists. The browser page uses the same number.",
+                style="Muted.TLabel",
+                wraplength=720,
+            ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8))
+            row += 1
+        for spec in BEHAVIOR_FIELDS:
+            self._behavior_row(inner, row, spec)
+            row += 2
+        inner.columnconfigure(1, weight=1)
+
+    def _behavior_row(self, parent: ttk.Frame, row: int, spec: BehaviorField) -> None:
+        if spec.kind == "bool":
+            ttk.Checkbutton(parent, text=spec.label, variable=self.fields[spec.key]).grid(
+                row=row, column=0, columnspan=3, sticky="w", pady=(8, 0)
+            )
+        else:
+            ttk.Label(parent, text=spec.label).grid(row=row, column=0, sticky="w", pady=(8, 0), padx=(0, 12))
+            width = 48 if spec.kind in {"text", "csv", "path"} else 12
+            ttk.Entry(parent, textvariable=self.fields[spec.key], width=width).grid(
+                row=row, column=1, sticky="ew" if spec.kind in {"text", "csv", "path"} else "w", pady=(8, 0)
+            )
+            if spec.kind == "path":
+                ttk.Button(parent, text="Browse", command=lambda var=self.fields[spec.key]: self._browse(var)).grid(
+                    row=row, column=2, padx=(8, 0), pady=(8, 0)
+                )
+            elif spec.unit:
+                ttk.Label(parent, text=spec.unit, style="Muted.TLabel").grid(
+                    row=row, column=2, sticky="w", padx=(8, 0), pady=(8, 0)
+                )
+        ttk.Label(parent, text=spec.help, style="Muted.TLabel", wraplength=720).grid(
+            row=row + 1, column=0, columnspan=3, sticky="w", pady=(0, 2)
+        )
+
+    def _wheel_on(self, _event) -> None:
+        canvas = self._behavior_canvas
+        if canvas is None:
+            return
+        canvas.bind_all("<Button-4>", self._wheel)
+        canvas.bind_all("<Button-5>", self._wheel)
+        canvas.bind_all("<MouseWheel>", self._wheel)
+
+    def _wheel_off(self, _event) -> None:
+        canvas = self._behavior_canvas
+        if canvas is None:
+            return
+        for sequence in ("<Button-4>", "<Button-5>", "<MouseWheel>"):
+            canvas.unbind_all(sequence)
+
+    def _wheel(self, event) -> None:
+        canvas = self._behavior_canvas
+        if canvas is None:
+            return
+        if getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
+            canvas.yview_scroll(1, "units")
+        else:
+            canvas.yview_scroll(-1, "units")
+
+    def _path_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar) -> None:
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Entry(parent, textvariable=variable, width=52).grid(row=row, column=1, sticky="ew", pady=4)
+        ttk.Button(parent, text="Browse", command=lambda var=variable: self._browse(var)).grid(
+            row=row, column=2, padx=(8, 0)
+        )
+
+    def _browse(self, variable: tk.Variable) -> None:
+        chosen = filedialog.askdirectory(initialdir=str(variable.get()) or str(Path.home()))
         if chosen:
             variable.set(chosen)
+
+    def restore_defaults(self) -> None:
+        fresh = default_config()
+        for spec in BEHAVIOR_FIELDS:
+            if not spec.restore:
+                continue
+            self._set_field(spec, getattr(fresh, spec.key))
+        if self.history_var is not None:
+            self.history_var.set(str(DEFAULT_RECENT_LIMIT))
+        self.message_var.set(
+            "Defaults restored for the Behavior options, except the share folder, database, and log file. Click Save to keep them."
+        )
+
+    def _bounded_number(self, spec: BehaviorField):
+        raw = str(self.fields[spec.key].get()).strip()
+        low = spec.low if spec.low is not None else 0
+        high = spec.high if spec.high is not None else 0
+        try:
+            if spec.kind == "int":
+                if not raw or any(ch in raw for ch in ".eE"):
+                    raise ValueError
+                value = int(raw)
+            else:
+                value = float(raw)
+        except ValueError as exc:
+            raise ValueError(f"{spec.label} must be a number from {low:g} to {high:g}.") from exc
+        if value < low or value > high:
+            raise ValueError(f"{spec.label} must be a number from {low:g} to {high:g}.")
+        return value
+
+    def _behavior_values(self) -> dict:
+        values: dict = {}
+        for spec in BEHAVIOR_FIELDS:
+            if spec.kind == "bool":
+                values[spec.key] = bool(self.fields[spec.key].get())
+            elif spec.kind in {"int", "float"}:
+                values[spec.key] = self._bounded_number(spec)
+            elif spec.key == "preferred_extensions":
+                parts = [part.strip().lower().lstrip(".") for part in str(self.fields[spec.key].get()).split(",")]
+                parts = [part for part in parts if part]
+                if not parts or any(not part.isalnum() for part in parts):
+                    raise ValueError("Formats must be a comma-separated list such as mp3, flac, wav.")
+                values[spec.key] = parts
+            elif spec.key == "ignored_users":
+                values[spec.key] = {
+                    part.strip().lower() for part in str(self.fields[spec.key].get()).split(",") if part.strip()
+                }
+            elif spec.key == "status_bind":
+                text = str(self.fields[spec.key].get()).strip()
+                if not text:
+                    raise ValueError("Enter the status page address.")
+                values[spec.key] = text
+            elif spec.key in {"state_db", "log_file"}:
+                text = str(self.fields[spec.key].get()).strip()
+                if not text:
+                    raise ValueError(f"Enter a {spec.label.lower()}.")
+                values[spec.key] = Path(text)
+            else:
+                values[spec.key] = str(self.fields[spec.key].get()).strip()
+        return values
 
     def build_config(self) -> Config:
         url = self.url_var.get().strip().rstrip("/")
@@ -318,7 +637,11 @@ class SettingsForm(ttk.Frame):
             listen = int(self.listen_var.get().strip())
             obfs = int(self.obfs_var.get().strip())
         except ValueError as exc:
-            raise ValueError("Listen port and obfuscated port must be numbers.") from exc
+            raise ValueError("Listen port and obfuscated port must be whole numbers from 1 to 65535.") from exc
+        if listen < 1 or listen > 65535 or obfs < 1 or obfs > 65535:
+            raise ValueError("Listen port and obfuscated port must be whole numbers from 1 to 65535.")
+        if listen == obfs:
+            raise ValueError("Listen port and obfuscated port must be different.")
         fields = dict(
             lidarr_url=url,
             lidarr_api_key=api_key,
@@ -331,7 +654,7 @@ class SettingsForm(ttk.Frame):
             download_dir=Path(download),
             complete_dir=Path(complete),
             start_on_launch=bool(self.launch_var.get()),
-            check_updates=bool(self.updates_var.get()),
+            **self._behavior_values(),
         )
         if self.base is None:
             return default_config(**fields)
@@ -373,6 +696,8 @@ class SettingsForm(ttk.Frame):
         except Exception as exc:
             self.message_var.set(str(exc))
             return False
+        if self.store is not None and self.history_var is not None:
+            self.store.set_meta("gui_recent_limit", str(normalize_recent_limit(self.history_var.get())))
         self.message_var.set("Saved.")
         if self.on_saved is not None:
             self.on_saved(loaded)
@@ -669,16 +994,28 @@ class DesktopApp(tk.Tk):
     def open_settings(self) -> None:
         window = tk.Toplevel(self)
         window.title("Lidarr Soulseek settings")
-        window.geometry("720x760")
+        window.geometry("980x820")
+        window.minsize(760, 640)
         window.transient(self)
         apply_theme(window)
+        previous = self.worker.cfg
 
         def on_saved(cfg: Config) -> None:
             self.worker.cfg = cfg
-            self.notice_var.set("Saved. Stop and start the worker to apply connection changes.")
+            saved_limit = self.worker.store.get_meta("gui_recent_limit")
+            if saved_limit:
+                self.limit_var.set(str(normalize_recent_limit(saved_limit)))
+            self.notice_var.set(settings_apply_message(previous, cfg))
             window.destroy()
 
-        form = SettingsForm(window, self.config_path, self.worker.cfg, on_saved, window.destroy)
+        form = SettingsForm(
+            window,
+            self.config_path,
+            self.worker.cfg,
+            on_saved,
+            window.destroy,
+            store=self.worker.store,
+        )
         form.pack(fill="both", expand=True)
 
     def on_start(self) -> None:
@@ -1111,7 +1448,7 @@ class DesktopApp(tk.Tk):
 def run_setup(config_path: Path) -> Config | None:
     root = tk.Tk()
     root.title("Lidarr Soulseek setup")
-    root.geometry("740x760")
+    root.geometry("980x820")
     apply_theme(root)
     saved: dict[str, Config] = {}
 
