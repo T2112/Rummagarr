@@ -8,7 +8,7 @@
 
 $ErrorActionPreference = "Stop"
 if ($env:OS -ne "Windows_NT") {
-    Write-Error "Build the installer on Windows. On Linux, push the branch and download the artifact from the Windows installer workflow."
+    Write-Error "Build the installer on Windows. On Linux, download it from the GitHub Release, or from the artifact on a pull request run of the Windows installer workflow."
 }
 
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)

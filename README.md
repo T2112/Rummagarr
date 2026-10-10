@@ -7,11 +7,23 @@ The worker reads Lidarr **Wanted → Missing**, searches Soulseek, downloads mat
 Custom Lidarr import list (MusicBrainz IDs):  
 https://raw.githubusercontent.com/T2112/lidarr-soulseek/main/lists/lidarr-custom-list.json
 
+## Download / Install
+
+The Windows installer is on the [latest release](https://github.com/T2112/lidarr-soulseek/releases/latest). No GitHub account is required.
+
+Run `LidarrSoulseek-Setup-<version>.exe`. It installs the app for your user and adds a Start Menu shortcut named Lidarr Soulseek. The first window asks for the Lidarr URL, API key, Soulseek username and password, and the folders.
+
+ffmpeg is separate if you want FLAC converted to MP3:
+
+```powershell
+winget install Gyan.FFmpeg
+```
+
 ## Desktop app
 
 Most people should install the desktop app instead of setting up Python.
 
-1. Download `LidarrSoulseek-Setup-1.3.0.exe` from the **Windows installer** workflow artifacts on GitHub (Actions → the latest successful run → Artifacts).
+1. Download `LidarrSoulseek-Setup-<version>.exe` from the [latest release](https://github.com/T2112/lidarr-soulseek/releases/latest).
 2. Run the installer. It copies the app into your user programs folder and adds a **Start Menu** shortcut named Lidarr Soulseek. An optional task can also start the app when you sign in.
 3. The first window asks for the Lidarr URL, the Lidarr API key, the Soulseek username and password, and the Incomplete / Complete folders. Use **Test Lidarr**, then **Save**. You do not edit `config.toml` by hand.
 4. Open **Status**. **Start** begins searching. **Pause** holds the current work and resumes it later. **Stop** ends the run and keeps your place. **Skip** drops the album or song it is on and moves to the next one.
@@ -37,7 +49,9 @@ That installs the Python dependencies and PyInstaller, freezes `desktop_app.py`,
 dist\LidarrSoulseek-Setup-1.3.0.exe
 ```
 
-The same steps run in GitHub Actions (`.github/workflows/windows-installer.yml`) on `windows-latest`, and the installer is uploaded as an artifact.
+The same steps run in GitHub Actions (`.github/workflows/windows-installer.yml`) on `windows-latest`. Pull requests and pushes to `main` upload the installer as a workflow artifact.
+
+To publish a public download, push a tag `v<version>` that matches the `VERSION` file (for example `v1.3.0`). That run creates a GitHub Release and attaches `LidarrSoulseek-Setup-<version>.exe`. You can also publish the version already in `VERSION` without making the tag yourself: **Actions → Windows installer → Run workflow**, and choose the `main` branch. If that release already exists, the workflow replaces the installer file.
 
 This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs on, and Inno Setup is a Windows program. Push the branch and let that workflow produce the `.exe`.
 
