@@ -3,7 +3,11 @@
 
 [lidarr]
 url = "http://127.0.0.1:8686"
+# Quotes are required. An unquoted hex API key will fail to parse.
 api_key = "CHANGEME"
+# Path Lidarr itself uses when it scans the completed folder.
+# If Lidarr runs as a Windows service on this same PC, this is the same
+# as [paths].complete_dir below.
 scan_path = "D:\\Media\\Incoming\\Soulseek"
 
 [soulseek]
@@ -14,8 +18,12 @@ obfuscated_port = 2235
 enable_upnp = true
 
 [paths]
+# Incomplete + raw Soulseek downloads land here first.
 download_dir = "D:\\Media\\Incoming\\Soulseek-raw"
+# Clean album folders Lidarr should import from.
 complete_dir = "D:\\Media\\Incoming\\Soulseek"
+# Optional: share part of your library so you are not only downloading.
+# Leave empty to share nothing. Sharing at least something is recommended.
 share_dir = ""
 state_db = "state.sqlite3"
 log_file = "lidarr-soulseek.log"
@@ -23,24 +31,37 @@ log_file = "lidarr-soulseek.log"
 [search]
 search_wait_seconds = 12
 max_albums_per_cycle = 1
+# Stay on one artist, then skip them for this many days.
 focus_one_artist = true
+artist_cooldown_days = 7
+# Wanted/missing pages pulled per cycle (page size 250). Next cycle continues.
+max_missing_pages = 20
+# After album grabs, search Soulseek for individual missing tracks on partial albums.
 fill_missing_tracks = true
 max_tracks_per_cycle = 5
 cycle_seconds = 300
 retry_hours = 12
 min_filename_ratio = 0.5
 track_count_tolerance = 2
+# Tried in order. MP3 folders win when both exist; FLAC/WAV are allowed as fallback.
 preferred_extensions = ["mp3", "flac", "wav"]
 min_mp3_bitrate = 320
+# Convert lossless downloads to MP3 before Lidarr import. Requires ffmpeg on PATH.
 convert_to_mp3 = true
 convert_bitrate = 320
+# Delete the original FLAC/WAV in Incomplete after Lidarr is asked to import the MP3.
 delete_sources_after_import = true
+# Delete leftover files in Incomplete when a download fails or is cancelled.
 clean_incomplete_on_fail = true
+# Also delete Incomplete files older than this many hours (0 disables the sweep).
 incomplete_max_age_hours = 12
 ignored_users = []
 
 [runtime]
+# How many albums to search/download at the same time.
+# 1 = one after another. 3–5 is faster. Higher can stall Soulseek.
 concurrent_albums = 3
 download_timeout_minutes = 90
+# Local status page. Open http://127.0.0.1:8787 while the worker runs.
 status_bind = "127.0.0.1"
 status_port = 8787
