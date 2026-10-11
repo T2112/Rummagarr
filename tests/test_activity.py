@@ -27,6 +27,37 @@ def test_status_phrases_cover_the_real_steps():
     assert paused.startswith("Paused · ")
 
 
+def test_zero_wait_starts_the_next_artist_without_the_five_minute_notice(tmp_path):
+    worker = make_worker(tmp_path)
+    try:
+        worker.control.start()
+        items = build_catalog([album(1, "Ella Langley", "Hungover", files=0, total=4)], [])
+        worker.catalog.replace(items)
+        worker.catalog.synced = True
+        worker.store._catalog_ready = False
+        worker.cfg.cycle_seconds = 0
+        assert worker._next_ready_artist() == "Ella Langley"
+        seconds, kind = worker.between_pass_wait()
+        assert seconds == 0
+        assert kind == "pass"
+        worker._note_between_passes()
+        text, _elapsed, _busy = worker.activity_view()
+        assert text == "Starting the next artist"
+        assert "Waiting for retry period" not in text
+        assert "5m" not in text
+
+        worker.store.set_artist_cooldown("Ella Langley", 2)
+        seconds, kind = worker.between_pass_wait()
+        assert kind == "artist"
+        assert 1 <= seconds <= 30
+        worker._note_between_passes()
+        text, _elapsed, _busy = worker.activity_view()
+        assert text.startswith("Waiting for artist retry period")
+        assert "5m" not in text
+    finally:
+        worker.close()
+
+
 def test_search_wait_is_not_reported_as_idle(tmp_path):
     worker = make_worker(tmp_path)
     try:
@@ -74,7 +105,7 @@ def test_nothing_selected_is_the_only_idle_state(tmp_path):
         worker.store.set_artist_cooldown("Ella Langley", 1)
         asyncio.run(worker.cycle())
         text, _elapsed, busy = worker.activity_view()
-        assert text.startswith("Waiting for retry period")
+        assert text.startswith("Waiting for artist retry period")
         assert "Idle" not in text
         assert busy
     finally:

@@ -281,8 +281,9 @@ def score_track_item(
     preferred_extensions: list[str], min_filename_ratio: float, min_mp3_bitrate: int,
 ) -> tuple[float, str]:
     filename = getattr(item, "filename", "") or ""
-    ext = extension(filename)
-    if ext not in AUDIO_EXT:
+    ext = extension(filename).lstrip(".")
+    audio = {item.lstrip(".") for item in AUDIO_EXT}
+    if ext not in audio:
         return 0.0, "not audio"
     if preferred_extensions and ext not in preferred_extensions:
         return 0.0, f"unwanted type {ext}"

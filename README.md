@@ -1,6 +1,6 @@
 # Lidarr Soulseek Worker
 
-**Version 1.8.0** — Windows desktop app. No Docker. No slskd.
+**Version 1.9.0** — Windows desktop app. No Docker. No slskd.
 
 The worker reads Lidarr **Wanted → Missing**, searches Soulseek, downloads matching albums or individual missing tracks, converts FLAC/WAV to MP3 when needed, asks Lidarr to import and rename, then cleans leftover files.
 
@@ -53,7 +53,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 That installs the Python dependencies and PyInstaller, freezes `desktop_app.py`, and compiles `packaging\LidarrSoulseek.iss` with Inno Setup 6. If Inno Setup is not already installed, the script downloads it. The setup program is written to:
 
 ```text
-dist\LidarrSoulseek-Setup-1.8.0.exe
+dist\LidarrSoulseek-Setup-1.9.0.exe
 ```
 
 The same steps run in GitHub Actions (`.github/workflows/windows-installer.yml`) on `windows-latest`. Pull requests and pushes to `main` upload the installer as a workflow artifact.
@@ -63,6 +63,15 @@ To publish a public download, push a tag `v<version>` that matches the `VERSION`
 This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs on, and Inno Setup is a Windows program. Push the branch and let that workflow produce the `.exe`.
 
 `python main.py` still runs the worker without the window, for the original script install below.
+
+## What's new in 1.9.0
+
+- Shared folders are scanned after login, so other Soulseek users can browse and download them while the worker is running. Pause keeps that up. Stop closes it. `open-firewall.ps1` opens the Windows firewall; the router still has to forward both listen ports if UPnP does not.
+- Behavior → Wait before next artist is the "Waiting for retry period" notice. Set it to 0 to start the next ready artist immediately. Artist retry period is still the multi-day skip after a visit.
+- The active tab is larger. Inactive tabs are smaller. That applies to the main tabs, Search tabs, and Settings tabs.
+- Shared lists uploads, history, and totals, with pause, cancel, and ban. Settings → Sharing enforces queue, speed, and peer-share limits.
+- Search can download every wanted file a user has, after a checklist grouped by album.
+- Full changelog: [CHANGELOG.md](CHANGELOG.md)
 
 ## What's new in 1.8.0
 
@@ -244,13 +253,14 @@ Peer `ConnectToPeer` / `failed connect on user request` lines are other clients 
 | `convert_to_mp3 = true` | Encode lossless to 320 kbps MP3 before Lidarr import |
 | `fill_missing_tracks = true` | After albums, search individual missing tracks |
 | `focus_one_artist = true` | One artist per visit, A–Z |
-| `artist_cooldown_days = 7` | Do not revisit an artist for this many days |
+| `artist_cooldown_days = 7` | After a visit, skip that artist for this many days. Separate from the short wait between artists |
+| `cycle_seconds = 300` | Wait before the next ready artist. `0` starts them immediately |
 | `max_missing_pages = 20` | Lidarr wanted/missing pages per cycle (250 albums each) |
 | `concurrent_albums = 3` | How many full albums to work at once |
 | `delete_sources_after_import = true` | Delete original FLAC/WAV after Lidarr is told to import |
 | `clean_incomplete_on_fail = true` | Delete leftovers when a download fails |
 | `incomplete_max_age_hours = 12` | Sweep old Incomplete files each cycle (`0` disables) |
-| `share_dir` | Optional folder to share back to Soulseek. Leave empty at first |
+| `share_dir` | Optional folder to share. Extra folders are `share_dirs` under `[sharing]`. Leave empty to share nothing. The worker scans after login |
 
 Lidarr does not need a download client for this. The album quality profile must allow MP3.
 

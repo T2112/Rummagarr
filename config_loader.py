@@ -52,6 +52,17 @@ class Config:
     status_port: int = 8787
     start_on_launch: bool = False
     check_updates: bool = True
+    upload_slots: int = 2
+    max_queued_files_per_user: int = 25
+    max_queued_mb_per_user: int = 2048
+    upload_speed_kbps: int = 0
+    per_user_speed_kbps: int = 0
+    auto_ban_over_queue: bool = True
+    require_peer_share: bool = False
+    min_peer_share_files: int = 1
+    priority_users: set[str] = field(default_factory=set)
+    share_dirs: list[str] = field(default_factory=list)
+    pause_uploads: bool = False
 
 
 def app_data_dir() -> Path:
@@ -142,6 +153,17 @@ def default_config(**overrides) -> Config:
         status_port=int(overrides.pop("status_port", 8787)),
         start_on_launch=bool(overrides.pop("start_on_launch", True)),
         check_updates=bool(overrides.pop("check_updates", True)),
+        upload_slots=int(overrides.pop("upload_slots", 2)),
+        max_queued_files_per_user=int(overrides.pop("max_queued_files_per_user", 25)),
+        max_queued_mb_per_user=int(overrides.pop("max_queued_mb_per_user", 2048)),
+        upload_speed_kbps=int(overrides.pop("upload_speed_kbps", 0)),
+        per_user_speed_kbps=int(overrides.pop("per_user_speed_kbps", 0)),
+        auto_ban_over_queue=bool(overrides.pop("auto_ban_over_queue", True)),
+        require_peer_share=bool(overrides.pop("require_peer_share", False)),
+        min_peer_share_files=int(overrides.pop("min_peer_share_files", 1)),
+        priority_users=set(overrides.pop("priority_users", set())),
+        share_dirs=list(overrides.pop("share_dirs", [])),
+        pause_uploads=bool(overrides.pop("pause_uploads", False)),
     )
     if overrides:
         cfg = replace(cfg, **overrides)
@@ -169,6 +191,8 @@ def save_config(path: Path, cfg: Config) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     extensions = ", ".join(_toml_str(item) for item in cfg.preferred_extensions)
     ignored = ", ".join(_toml_str(item) for item in sorted(cfg.ignored_users))
+    priority = ", ".join(_toml_str(item) for item in sorted(cfg.priority_users))
+    share_dirs = ", ".join(_toml_str(item) for item in cfg.share_dirs)
     text = "\n".join(
         [
             "# Written by Lidarr Soulseek. You can keep editing this file,",
@@ -223,6 +247,19 @@ def save_config(path: Path, cfg: Config) -> None:
             f"start_on_launch = {_toml_bool(cfg.start_on_launch)}",
             f"check_updates = {_toml_bool(cfg.check_updates)}",
             "",
+            "[sharing]",
+            f"upload_slots = {int(cfg.upload_slots)}",
+            f"max_queued_files_per_user = {int(cfg.max_queued_files_per_user)}",
+            f"max_queued_mb_per_user = {int(cfg.max_queued_mb_per_user)}",
+            f"upload_speed_kbps = {int(cfg.upload_speed_kbps)}",
+            f"per_user_speed_kbps = {int(cfg.per_user_speed_kbps)}",
+            f"auto_ban_over_queue = {_toml_bool(cfg.auto_ban_over_queue)}",
+            f"require_peer_share = {_toml_bool(cfg.require_peer_share)}",
+            f"min_peer_share_files = {int(cfg.min_peer_share_files)}",
+            f"priority_users = [{priority}]",
+            f"share_dirs = [{share_dirs}]",
+            f"pause_uploads = {_toml_bool(cfg.pause_uploads)}",
+            "",
         ]
     )
     path.write_text(text, encoding="utf-8")
@@ -259,6 +296,7 @@ def try_load_config(path: Path) -> Config:
     except KeyError as exc:
         raise ConfigError(f"config.toml is missing a required section or value: {exc}") from exc
     runtime = raw.get("runtime", {})
+    sharing = raw.get("sharing", {})
 
     base = path.parent
     download_dir = Path(paths["download_dir"])
@@ -322,4 +360,15 @@ def try_load_config(path: Path) -> Config:
         # Missing check_updates stays on, so an existing config starts checking.
         start_on_launch=bool(runtime.get("start_on_launch", False)),
         check_updates=bool(runtime.get("check_updates", True)),
+        upload_slots=int(sharing.get("upload_slots", 2)),
+        max_queued_files_per_user=int(sharing.get("max_queued_files_per_user", 25)),
+        max_queued_mb_per_user=int(sharing.get("max_queued_mb_per_user", 2048)),
+        upload_speed_kbps=int(sharing.get("upload_speed_kbps", 0)),
+        per_user_speed_kbps=int(sharing.get("per_user_speed_kbps", 0)),
+        auto_ban_over_queue=bool(sharing.get("auto_ban_over_queue", True)),
+        require_peer_share=bool(sharing.get("require_peer_share", False)),
+        min_peer_share_files=int(sharing.get("min_peer_share_files", 1)),
+        priority_users={u.lower() for u in sharing.get("priority_users", []) if u},
+        share_dirs=[str(item) for item in sharing.get("share_dirs", []) if str(item).strip()],
+        pause_uploads=bool(sharing.get("pause_uploads", False)),
     )
