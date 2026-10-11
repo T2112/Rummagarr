@@ -6,7 +6,7 @@ https://raw.githubusercontent.com/T2112/lidarr-soulseek/main/lists/lidarr-custom
 
 Curated popular / widely recorded artists across rock, pop, hip-hop, country, jazz, blues, metal, R&B/soul, electronic, folk, punk, indie, reggae, Latin, funk, classical, goth, emo, women artists, game soundtracks, electro-swing, and more.
 
-**Current status (2026-10-01):** **976** unique MusicBrainz artist IDs. This run looked up The Jackson 5; MusicBrainz returns that name as The Jacksons (already in the list, score 100, formerly “The Jackson 5”), so no new ID was added. 0 names still pending after accent-fold and alias matching (Céline Dion, Yasiin Bey, Charley Pride, Café Tacvba, Fryderyk Chopin, Пётр Ильич Чайковский, and similar).
+**Current status (2026-10-11):** **976** unique MusicBrainz artist IDs. Rechecked all 39 accent/spelling/alias variants still unmatched by exact string in artists.txt (including Celine Dion, Cafe Tacvba, Jose Jose, Hector Lavoe, Sinead O'Connor, Nick Cave and the Bad Seeds, and the prior 12). All 27 successful MusicBrainz lookups returned IDs already on the list; the remaining 12 map to existing aliases (Deborah Harry, Yasiin Bey, Charley Pride, Tedeschi Trucks Band, Four Tops, The Jacksons, Alison Krauss, Sex Pistols, Germs, Damian “Jr. Gong” Marley, Пётр Ильич Чайковский, Fryderyk Chopin). 0 names still pending. No list push this run.
 
 ## Festival list (Woodstock + Qlimax + Ozzfest)
 
