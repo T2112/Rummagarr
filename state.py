@@ -108,6 +108,19 @@ class JobStore:
             """
         )
         self._db.commit()
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS upload_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                finished_at TEXT NOT NULL
+            )
+            """
+        )
+        self._db.commit()
         self._ensure_catalog_schema()
         self._load_catalog_flag()
 
@@ -297,6 +310,102 @@ class JobStore:
             ).fetchall()
         keys = ("artist", "title", "filename", "username", "kind", "finished_at")
         return [dict(zip(keys, row)) for row in rows]
+
+    def add_upload(self, username: str, filename: str, size: int, status: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO upload_history(username, filename, size, status, finished_at)
+                VALUES(?, ?, ?, ?, ?)
+                """,
+                (username, filename, int(size or 0), status, now),
+            )
+            self._db.commit()
+
+    def recent_uploads(self, limit: int = 200) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT username, filename, size, status, finished_at
+                FROM upload_history
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        keys = ("username", "filename", "size", "status", "finished_at")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def upload_totals(self) -> dict:
+        """Successful uploads. Today is the local calendar day."""
+        start = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+        start_utc = start.astimezone(timezone.utc).isoformat()
+        with self._lock:
+            all_row = self._db.execute(
+                "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM upload_history WHERE status = 'done'"
+            ).fetchone()
+            today_row = self._db.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(size), 0) FROM upload_history
+                WHERE status = 'done' AND finished_at >= ?
+                """,
+                (start_utc,),
+            ).fetchone()
+        return {
+            "all_files": int(all_row[0] or 0),
+            "all_bytes": int(all_row[1] or 0),
+            "today_files": int(today_row[0] or 0),
+            "today_bytes": int(today_row[1] or 0),
+        }
+
+    def wanted_tracks_for(self, names: list[str], folds: list[str]) -> list[dict]:
+        """Enabled album and song rows for these artists only.
+
+        `names` match `artist_key` (casefold). `folds` match the accent-folded
+        artist stored on the row, so Motley Crue finds Mötley Crüe. Other
+        artists are not read.
+        """
+        tokens = sorted({("artist:" + (name or "").casefold().strip()) for name in names if (name or "").strip()})
+        fold_keys = sorted({(fold or "").strip() for fold in folds if (fold or "").strip()})
+        if not tokens and not fold_keys:
+            return []
+        found: list[dict] = []
+        with self._lock:
+            modes = self._stat_modes_locked()
+            clauses = []
+            params: list[str] = []
+            if tokens:
+                marks = ",".join("?" * len(tokens))
+                clauses.append(f"artist_key IN ({marks})")
+                params.extend(tokens)
+            if fold_keys:
+                marks = ",".join("?" * len(fold_keys))
+                clauses.append(f"fold IN ({marks})")
+                params.extend(fold_keys)
+            sql = f"""
+                SELECT key, kind, artist, album, song, album_id, track_id, artist_key,
+                       enabled, enabled_gen
+                FROM wanted_rows
+                WHERE kind IN ('album', 'song') AND ({' OR '.join(clauses)})
+            """
+            rows = self._db.execute(sql, params).fetchall()
+        for key, kind, artist, album, song, album_id, track_id, artist_key, enabled, enabled_gen in rows:
+            if not _effective(enabled, enabled_gen, kind, modes):
+                continue
+            found.append(
+                {
+                    "key": key,
+                    "kind": kind,
+                    "artist": artist,
+                    "album": album or "",
+                    "song": song or "",
+                    "album_id": album_id,
+                    "track_id": track_id,
+                    "artist_key": artist_key,
+                }
+            )
+        return found
 
     def wanted_enabled(self, key: str) -> bool:
         with self._lock:

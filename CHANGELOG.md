@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented here.
 
+## [1.9.0] — 2026-10-11
+
+### Added
+
+- Settings → Sharing sets upload slots, how many files and how many megabytes one user may queue, a global upload speed and an optional per-user speed, a priority list, and whether to share only with users who already share files. Soulseek reports that as a file count. The same limits are enforced when a peer asks for a file, not only in the window. A user who goes past the queue can be ignored. Shared folders can be added and removed, then rescanned, and the scan reports the file and folder counts.
+- The Shared tab lists uploads: user, file, size, progress, speed, status, and time. Finished uploads stay in the history. Totals count files and bytes for today and for all time. A row can be paused, resumed, or cancelled, and every upload from that user can be cancelled. Ban ignores the user. Pause all uploads holds every upload.
+- Search can download every current file from a user, or only the ones that match the Wanted list. Download all wanted opens a checklist grouped by album, checked by default. Queued files are linked to the Lidarr album or track. Matching uses the same accent folding and filename threshold as automatic search, and it only reads wanted rows for artists named in that user's paths.
+
+### Changed
+
+- Wait before next artist on the Behavior tab is the wait in "Waiting for retry period (next artist in 5m)". It can be 0, which starts the next ready artist immediately and does not show that notice. Artist retry period is unchanged: it is the number of days to skip an artist after a visit. Both apply on the next pass. A zero wait does not spin the loop while every artist is still on that longer skip.
+- The selected tab is larger, with more padding and a bold label. Inactive tabs are smaller. The selected-state expand no longer eats that padding. Main tabs, Search tabs, and Settings tabs use the same style.
+
+### Fixed
+
+- A shared folder was never indexed. The client listened on the configured ports, but it did not scan `share_dir`, so searches, browse requests, and uploads saw no files and the server was told the share was empty. The scan now runs after login, then reports the real counts. Listening still needs the firewall script and, when UPnP does not open the ports, a forward of both TCP ports. Pause leaves the session up. Stop closes it.
+- Individual track scoring treated `.flac` and `flac` as different, so a matching audio file could be rejected as not audio. The comparison now ignores the dot.
+
 ## [1.8.0] — 2026-10-11
 
 ### Added

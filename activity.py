@@ -24,6 +24,7 @@ class Step:
     file_total: int = 0
     username: str = ""
     retry_seconds: int = 0
+    retry_kind: str = "pass"
     detail: str = ""
     started: float = 0.0
 
@@ -37,6 +38,9 @@ def format_span(seconds: int) -> str:
     if minutes < 60:
         return f"{minutes}m"
     hours, minutes = divmod(minutes, 60)
+    if hours >= 48:
+        days = (seconds + 86399) // 86400
+        return f"{days}d"
     if minutes:
         return f"{hours}h {minutes}m"
     return f"{hours}h"
@@ -90,6 +94,12 @@ def describe_step(step: Step) -> str:
         head = f"Converting {name}" if name and name != step.album else "Converting"
         return f"{head} · {who}" if who else head
     if step.kind == "retry":
+        # "pass" is the short wait between ready artists (cycle_seconds).
+        # "artist" is the multi-day skip after a visit (artist_cooldown_days).
+        if step.retry_kind == "artist":
+            return f"Waiting for artist retry period (next artist in {format_span(step.retry_seconds)})"
+        if int(step.retry_seconds or 0) <= 0:
+            return "Starting the next artist"
         return f"Waiting for retry period (next artist in {format_span(step.retry_seconds)})"
     if step.kind == "preparing":
         return f"Choosing the next album · {who}" if who else "Choosing the next album"

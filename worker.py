@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from aioslsk.client import SoulSeekClient
+from aioslsk.exceptions import FileNotFoundError as SlskFileNotFoundError
+from aioslsk.exceptions import FileNotSharedError
 from aioslsk.settings import (
     CredentialsSettings,
     NetworkSettings,
@@ -18,11 +20,15 @@ from aioslsk.settings import (
     SharesSettings,
     SharedDirectorySettingEntry,
     ListeningSettings,
+    NetworkLimitSettings,
     UpnpSettings,
     ServerSettings,
     ReconnectSettings,
+    TransferLimitSettings,
+    TransfersSettings,
 )
 from aioslsk.shares.model import DirectoryShareMode
+from aioslsk.user.model import BlockingFlag
 
 from activity import Step, describe_step, format_elapsed, step_from_legacy
 from config_loader import Config
@@ -47,8 +53,22 @@ from match import (
     build_queries,
     build_track_queries,
     group_results,
+    normalize,
     score_folder,
     score_track_item,
+)
+from sharing import (
+    IDLE_FLOOR_SECONDS,
+    Decision,
+    LiveUpload,
+    QueuedUpload,
+    RemoteFile,
+    SharePolicy,
+    WantedTrack,
+    admit,
+    candidate_names,
+    match_files_to_wanted,
+    uploads_to_pause,
 )
 from state import JobStore
 
@@ -126,6 +146,27 @@ def transfer_percent(transfer) -> float | None:
     return min(100.0, done_i * 100.0 / size_i)
 
 
+def _upload_key(transfer) -> str:
+    return f"{transfer_username(transfer)}\n{getattr(transfer, 'remote_path', '') or ''}"
+
+
+def _upload_status(transfer) -> str:
+    name = state_name(transfer)
+    if name in {"QUEUED", "VIRGIN", "INITIALIZING"}:
+        return "queued"
+    if name in {"UPLOADING", "DOWNLOADING", "INCOMPLETE"}:
+        return "uploading"
+    if name == "PAUSED":
+        return "paused"
+    if name == "COMPLETE":
+        return "done"
+    if name == "FAILED":
+        return "failed"
+    if name == "ABORTED":
+        return "cancelled"
+    return "queued"
+
+
 async def abort_transfer(client: SoulSeekClient, transfer) -> None:
     manager = getattr(client, "transfers", None)
     if manager is None:
@@ -145,15 +186,39 @@ async def abort_transfer(client: SoulSeekClient, transfer) -> None:
             await result
 
 
+def effective_share_dirs(cfg: Config) -> list[str]:
+    """share_dir plus any extra folders, without duplicates or blanks."""
+    found: list[str] = []
+    for raw in [cfg.share_dir, *list(cfg.share_dirs or [])]:
+        text = str(raw or "").strip()
+        if text and text not in found:
+            found.append(text)
+    return found
+
+
+def policy_from_config(cfg: Config) -> SharePolicy:
+    mb = max(1, int(cfg.max_queued_mb_per_user or 1))
+    return SharePolicy(
+        upload_slots=max(1, int(cfg.upload_slots or 1)),
+        max_queued_files=max(1, int(cfg.max_queued_files_per_user or 1)),
+        max_queued_bytes=mb * 1024 * 1024,
+        upload_speed_kbps=max(0, int(cfg.upload_speed_kbps or 0)),
+        per_user_speed_kbps=max(0, int(cfg.per_user_speed_kbps or 0)),
+        auto_ban=bool(cfg.auto_ban_over_queue),
+        require_peer_share=bool(cfg.require_peer_share),
+        min_peer_share_files=max(1, int(cfg.min_peer_share_files or 1)),
+        banned={name.casefold() for name in cfg.ignored_users},
+        priority={name.casefold() for name in cfg.priority_users},
+        pause_all=bool(cfg.pause_uploads),
+    )
+
+
 def build_slsk_settings(cfg: Config) -> Settings:
-    directories = []
-    if cfg.share_dir:
-        directories.append(
-            SharedDirectorySettingEntry(
-                path=cfg.share_dir,
-                share_mode=DirectoryShareMode.EVERYONE,
-            )
-        )
+    directories = [
+        SharedDirectorySettingEntry(path=path, share_mode=DirectoryShareMode.EVERYONE)
+        for path in effective_share_dirs(cfg)
+    ]
+    speed = max(0, int(cfg.upload_speed_kbps or 0))
     return Settings(
         credentials=CredentialsSettings(username=cfg.slsk_username, password=cfg.slsk_password),
         network=NetworkSettings(
@@ -163,12 +228,16 @@ def build_slsk_settings(cfg: Config) -> Settings:
                 obfuscated_port=cfg.obfuscated_port,
             ),
             upnp=UpnpSettings(enabled=cfg.enable_upnp),
+            limits=NetworkLimitSettings(upload_speed_kbps=speed),
         ),
         shares=SharesSettings(
             download=str(cfg.download_dir),
             directories=directories,
-            # A long share scan can outlive the server socket. Scan later if needed.
+            # A long share scan can outlive the server socket. Scan after login.
             scan_on_start=False,
+        ),
+        transfers=TransfersSettings(
+            limits=TransferLimitSettings(upload_slots=max(1, int(cfg.upload_slots or 1)))
         ),
     )
 
@@ -350,6 +419,12 @@ class Worker:
         self._active_keys: set[str] = set()
         self._key_lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self.share_counts: tuple[int, int] = (0, 0)
+        self._share_task: asyncio.Task | None = None
+        self._housekeeping_task: asyncio.Task | None = None
+        self._recorded_uploads: set[tuple[str, str, str]] = set()
+        self._auto_paused: set[str] = set()
+        self._config_dirty = False
 
     def close(self) -> None:
         if self._ui:
@@ -425,8 +500,9 @@ class Worker:
             and previous.artist == step.artist
             and previous.album == step.album
             and previous.title == step.title
-            and previous.query_index == step.query_index
+            and             previous.query_index == step.query_index
             and previous.username == step.username
+            and previous.retry_kind == step.retry_kind
         )
         if same and previous.started:
             step.started = previous.started
@@ -619,6 +695,10 @@ class Worker:
         if not self.soulseek_logged_in():
             raise RuntimeError("Soulseek login returned but session is not active")
         log.info("Logged in to Soulseek as %s", self.cfg.slsk_username)
+        self._install_upload_guard()
+        self.apply_share_settings(scan=False)
+        self._schedule_share_scan()
+        self._schedule_housekeeping()
 
     async def ensure_soulseek(self) -> bool:
         if self.control.is_stopped():
@@ -639,6 +719,13 @@ class Worker:
         return self.soulseek_logged_in() and not self.control.is_stopped()
 
     async def stop_soulseek(self) -> None:
+        pending = [task for task in (self._share_task, self._housekeeping_task) if task is not None and not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._share_task = None
+        self._housekeeping_task = None
         if self.client:
             await self.client.stop()
             self.client = None
@@ -667,8 +754,8 @@ class Worker:
                 if self.control.is_stopped():
                     self.set_step(Step(kind="stopped"))
                     break
-                self._note_between_passes()
-                signal = await self.control.gate(sleep=self.cfg.cycle_seconds)
+                pause = self._note_between_passes()
+                signal = await self.control.gate(sleep=pause)
                 if signal == "stop":
                     break
         except Exception as exc:
@@ -849,32 +936,52 @@ class Worker:
                     return name
         return None
 
-    def _note_nothing_ready(self) -> None:
-        if self._has_enabled_wanted():
-            wait = self._soonest_cooldown_seconds() or int(self.cfg.cycle_seconds or 0)
-            self.set_step(Step(kind="retry", retry_seconds=wait))
-            return
-        if self.store.wanted_catalog_ready() or self.catalog.synced:
-            self.set_step(Step(kind="idle"))
-            return
+    def between_pass_wait(self) -> tuple[int, str]:
+        """Seconds to sleep, and which setting that wait comes from.
+
+        ``pass`` is Wait before next artist (cycle_seconds). 0 starts the next
+        ready artist immediately. ``artist`` is Artist retry period, the
+        multi-day skip after a visit. A zero pass wait still sleeps a short
+        floor when nobody is ready, so the loop does not spin.
+        """
+        cycle = max(0, int(self.cfg.cycle_seconds or 0))
+        catalog = self.store.wanted_catalog_ready() or self.catalog.synced
+        if catalog and not self._has_enabled_wanted():
+            return (cycle if cycle else IDLE_FLOOR_SECONDS), "idle"
+        if self._next_ready_artist():
+            return cycle, "pass"
         wait = self._soonest_cooldown_seconds()
         if wait:
-            self.set_step(Step(kind="retry", retry_seconds=wait))
-        else:
-            self.set_step(Step(kind="idle"))
+            if cycle == 0:
+                pause = min(wait, IDLE_FLOOR_SECONDS)
+            else:
+                pause = wait
+            return max(1, pause), "artist"
+        return (cycle if cycle else IDLE_FLOOR_SECONDS), "idle"
 
-    def _note_between_passes(self) -> None:
+    def _apply_wait(self, seconds: int, kind: str) -> None:
+        if kind == "artist":
+            self.set_step(Step(kind="retry", retry_seconds=seconds, retry_kind="artist"))
+            return
+        if kind == "pass" and seconds <= 0:
+            self.set_step(Step(kind="retry", retry_seconds=0, retry_kind="pass"))
+            return
+        if kind == "pass":
+            self.set_step(Step(kind="retry", retry_seconds=seconds, retry_kind="pass"))
+            return
+        self.set_step(Step(kind="idle"))
+
+    def _note_nothing_ready(self) -> None:
+        seconds, kind = self.between_pass_wait()
+        self._apply_wait(seconds, kind)
+
+    def _note_between_passes(self) -> int:
         if self.control.is_stopped():
             self.set_step(Step(kind="stopped"))
-            return
-        if (self.store.wanted_catalog_ready() or self.catalog.synced) and not self._has_enabled_wanted():
-            self.set_step(Step(kind="idle"))
-            return
-        wait = self._soonest_cooldown_seconds()
-        pause = int(self.cfg.cycle_seconds or 0)
-        if wait and not self._next_ready_artist():
-            pause = wait
-        self.set_step(Step(kind="retry", retry_seconds=max(0, pause)))
+            return 0
+        seconds, kind = self.between_pass_wait()
+        self._apply_wait(seconds, kind)
+        return seconds
 
     async def cycle(self) -> None:
         if self.control.is_stopped():
@@ -1453,6 +1560,432 @@ class Worker:
         log.info("Asked Lidarr to import %s", folder)
         return True
 
+    def take_config_dirty(self) -> bool:
+        dirty = self._config_dirty
+        self._config_dirty = False
+        return dirty
+
+    def decide_upload(self, username: str, filename: str, size: int) -> Decision:
+        policy = policy_from_config(self.cfg)
+        queued = self._queued_uploads()
+        return admit(policy, username, filename, size, queued, self._peer_share_files(username))
+
+    def _peer_share_files(self, username: str) -> int | None:
+        client = self.client
+        if client is None:
+            return None
+        users = getattr(client, "users", None)
+        if users is None:
+            return None
+        getter = getattr(users, "get_user_object", None)
+        if not callable(getter):
+            return None
+        try:
+            user = getter(username)
+        except Exception:
+            return None
+        count = getattr(user, "shared_file_count", None)
+        if count is None:
+            return 0 if policy_from_config(self.cfg).require_peer_share else None
+        try:
+            return int(count)
+        except (TypeError, ValueError):
+            return 0
+
+    def _queued_uploads(self) -> list[QueuedUpload]:
+        client = self.client
+        manager = getattr(client, "transfers", None) if client else None
+        if manager is None:
+            return []
+        rows = []
+        for transfer in list(manager.get_uploads()):
+            status = _upload_status(transfer)
+            if status not in {"queued", "uploading", "paused"}:
+                continue
+            rows.append(
+                QueuedUpload(
+                    username=transfer_username(transfer),
+                    filename=str(getattr(transfer, "remote_path", "") or getattr(transfer, "filename", "") or ""),
+                    size=int(getattr(transfer, "filesize", 0) or 0),
+                    status=status,
+                )
+            )
+        return rows
+
+    def ban_user(self, username: str) -> None:
+        name = (username or "").strip()
+        if not name:
+            return
+        self.cfg.ignored_users.add(name.casefold())
+        self._config_dirty = True
+        client = self.client
+        settings = getattr(client, "settings", None) if client is not None else None
+        if settings is None:
+            return
+        blocked = dict(settings.users.blocked)
+        blocked[name] = BlockingFlag.ALL
+        client.settings.users.blocked = blocked
+
+    def _install_upload_guard(self) -> None:
+        client = self.client
+        if client is None:
+            return
+        manager = client.transfers
+        if getattr(manager, "_lidarr_guard", False):
+            return
+        original = manager._add_upload
+        worker = self
+
+        async def guarded(username: str, remote_path: str):
+            try:
+                item = await manager._shares_manager.get_shared_item(remote_path, username)
+            except (SlskFileNotFoundError, FileNotFoundError, FileNotSharedError):
+                raise
+            try:
+                size = int(await manager._shares_manager.get_filesize(item))
+            except Exception:
+                size = 0
+            decision = worker.decide_upload(username, remote_path, size)
+            if not decision.allow:
+                if decision.ban:
+                    worker.ban_user(username)
+                log.info("Refused upload of %s to %s: %s", remote_path, username, decision.reason)
+                raise FileNotSharedError(decision.reason)
+            transfer = await original(username, remote_path)
+            if worker.cfg.pause_uploads:
+                try:
+                    await transfer.state.pause()
+                except Exception:
+                    log.exception("Could not pause upload %s", remote_path)
+                worker._auto_paused.add(_upload_key(transfer))
+            return transfer
+
+        manager._add_upload = guarded
+        manager._lidarr_guard = True
+
+    def apply_share_settings(self, *, scan: bool = False) -> None:
+        """Push slots, speed, bans, and folders into a running client."""
+        client = self.client
+        if client is None:
+            return
+        policy = policy_from_config(self.cfg)
+        client.settings.transfers.limits.upload_slots = policy.upload_slots
+        client.settings.network.limits.upload_speed_kbps = policy.upload_speed_kbps
+        network = getattr(client, "network", None)
+        if network is not None and hasattr(network, "set_upload_speed_limit"):
+            try:
+                network.set_upload_speed_limit(policy.upload_speed_kbps)
+            except Exception:
+                log.exception("Could not set the upload speed limit")
+        blocked = {
+            name: flag
+            for name, flag in dict(client.settings.users.blocked).items()
+            if name.casefold() in policy.banned or flag != BlockingFlag.ALL
+        }
+        for name in policy.banned:
+            blocked[name] = BlockingFlag.ALL
+        client.settings.users.blocked = blocked
+        client.settings.shares.directories = [
+            SharedDirectorySettingEntry(path=path, share_mode=DirectoryShareMode.EVERYONE)
+            for path in effective_share_dirs(self.cfg)
+        ]
+        try:
+            client.shares.load_from_settings()
+        except Exception:
+            log.exception("Could not refresh shared folders")
+        if scan:
+            self._schedule_share_scan()
+
+    def _schedule_share_scan(self) -> None:
+        if self.client is None or not effective_share_dirs(self.cfg):
+            self.share_counts = (0, 0)
+            return
+        loop = self._loop or asyncio.get_running_loop()
+        if self._share_task is not None and not self._share_task.done():
+            self._share_task.cancel()
+        self._share_task = loop.create_task(self._run_share_scan())
+
+    async def _run_share_scan(self) -> None:
+        client = self.client
+        if client is None:
+            return
+        try:
+            await client.shares.scan()
+            self.share_counts = tuple(client.shares.get_stats())
+            log.info("Share scan complete: %s folders, %s files", *self.share_counts)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Share scan failed")
+
+    async def rescan_shares(self, paths: list[str] | None = None) -> tuple[int, int]:
+        if paths is not None:
+            cleaned = [str(path).strip() for path in paths if str(path).strip()]
+            self.cfg.share_dir = cleaned[0] if cleaned else ""
+            self.cfg.share_dirs = cleaned[1:]
+            self._config_dirty = True
+        if not self.soulseek_logged_in():
+            raise RuntimeError("Start the worker before rescanning. Sharing uses that Soulseek login.")
+        self.apply_share_settings(scan=False)
+        await self._run_share_scan()
+        return self.share_counts
+
+    def _schedule_housekeeping(self) -> None:
+        loop = self._loop or asyncio.get_running_loop()
+        if self._housekeeping_task is not None and not self._housekeeping_task.done():
+            return
+        self._housekeeping_task = loop.create_task(self._share_housekeeping())
+
+    async def _share_housekeeping(self) -> None:
+        while self.client is not None and not self.control.is_stopped():
+            try:
+                await self._enforce_upload_policy()
+                self._remember_finished_uploads()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Upload housekeeping failed")
+            await asyncio.sleep(1)
+
+    async def _enforce_upload_policy(self) -> None:
+        client = self.client
+        if client is None:
+            return
+        policy = policy_from_config(self.cfg)
+        transfers = list(client.transfers.get_uploads())
+        live: list[LiveUpload] = []
+        by_key = {}
+        for transfer in transfers:
+            key = _upload_key(transfer)
+            status = _upload_status(transfer)
+            by_key[key] = transfer
+            try:
+                speed = float(transfer.get_speed() or 0)
+            except Exception:
+                speed = 0.0
+            live.append(
+                LiveUpload(
+                    key=key,
+                    username=transfer_username(transfer),
+                    speed=speed,
+                    status=status,
+                    priority=transfer_username(transfer).casefold() in policy.priority,
+                )
+            )
+        pause_keys = uploads_to_pause(policy, live)
+        for key, transfer in by_key.items():
+            status = _upload_status(transfer)
+            if key in pause_keys and status in {"queued", "uploading"}:
+                try:
+                    await client.transfers.pause(transfer)
+                    self._auto_paused.add(key)
+                except Exception:
+                    log.exception("Could not pause upload %s", key)
+            elif key not in pause_keys and key in self._auto_paused and status == "paused":
+                try:
+                    await client.transfers.queue(transfer)
+                except Exception:
+                    log.exception("Could not resume upload %s", key)
+                self._auto_paused.discard(key)
+
+    def _remember_finished_uploads(self) -> None:
+        client = self.client
+        if client is None:
+            return
+        for transfer in list(client.transfers.get_uploads()):
+            status = _upload_status(transfer)
+            if status not in {"done", "failed", "cancelled"}:
+                continue
+            username = transfer_username(transfer)
+            filename = str(getattr(transfer, "remote_path", "") or "")
+            marker = (username, filename, status)
+            if marker in self._recorded_uploads:
+                continue
+            self._recorded_uploads.add(marker)
+            self.store.add_upload(username, filename, int(getattr(transfer, "filesize", 0) or 0), status)
+
+    def upload_snapshot(self, history_limit: int = 200) -> dict:
+        rows = []
+        client = self.client
+        manager = getattr(client, "transfers", None) if client else None
+        if manager is not None:
+            for transfer in list(manager.get_uploads()):
+                status = _upload_status(transfer)
+                if status in {"done", "failed", "cancelled"}:
+                    continue
+                started = getattr(transfer, "start_time", None)
+                when = ""
+                if started:
+                    try:
+                        when = datetime.fromtimestamp(float(started)).strftime("%Y-%m-%d %H:%M")
+                    except (TypeError, ValueError, OSError):
+                        when = ""
+                try:
+                    speed = float(transfer.get_speed() or 0)
+                except Exception:
+                    speed = 0.0
+                rows.append(
+                    {
+                        "username": transfer_username(transfer),
+                        "filename": str(getattr(transfer, "remote_path", "") or ""),
+                        "size": int(getattr(transfer, "filesize", 0) or 0),
+                        "progress": transfer_percent(transfer),
+                        "speed": speed,
+                        "status": status,
+                        "when": when,
+                        "live": True,
+                    }
+                )
+        history = []
+        for item in self.store.recent_uploads(history_limit):
+            history.append(
+                {
+                    "username": item["username"],
+                    "filename": item["filename"],
+                    "size": int(item["size"] or 0),
+                    "progress": 100.0 if item["status"] == "done" else None,
+                    "speed": 0.0,
+                    "status": item["status"],
+                    "when": item["finished_at"],
+                    "live": False,
+                }
+            )
+        totals = self.store.upload_totals()
+        return {
+            "rows": rows,
+            "history": history,
+            "pause_all": bool(self.cfg.pause_uploads),
+            "share_folders": self.share_counts[0],
+            "share_files": self.share_counts[1],
+            **totals,
+        }
+
+    async def pause_upload(self, username: str, filename: str) -> None:
+        transfer = self._find_upload(username, filename)
+        if transfer is None or self.client is None:
+            return
+        self._auto_paused.discard(_upload_key(transfer))
+        await self.client.transfers.pause(transfer)
+
+    async def resume_upload(self, username: str, filename: str) -> None:
+        transfer = self._find_upload(username, filename)
+        if transfer is None or self.client is None:
+            return
+        self._auto_paused.discard(_upload_key(transfer))
+        await self.client.transfers.queue(transfer)
+
+    async def cancel_upload(self, username: str, filename: str) -> None:
+        transfer = self._find_upload(username, filename)
+        if transfer is None or self.client is None:
+            return
+        await abort_transfer(self.client, transfer)
+
+    async def cancel_user_uploads(self, username: str) -> None:
+        if self.client is None:
+            return
+        target = (username or "").casefold()
+        for transfer in list(self.client.transfers.get_uploads()):
+            if transfer_username(transfer).casefold() != target:
+                continue
+            if _upload_status(transfer) in {"done", "failed", "cancelled"}:
+                continue
+            await abort_transfer(self.client, transfer)
+
+    def set_pause_uploads(self, paused: bool) -> None:
+        self.cfg.pause_uploads = bool(paused)
+        self._config_dirty = True
+
+    def _find_upload(self, username: str, filename: str):
+        client = self.client
+        if client is None:
+            return None
+        target_user = (username or "").casefold()
+        target_file = filename or ""
+        for transfer in client.transfers.get_uploads():
+            if transfer_username(transfer).casefold() != target_user:
+                continue
+            remote = str(getattr(transfer, "remote_path", "") or "")
+            if remote == target_file:
+                return transfer
+        return None
+
+    def match_user_files(self, files: list) -> list:
+        remotes = [
+            RemoteFile(
+                username=str(getattr(item, "username", "") or ""),
+                filename=str(getattr(item, "filename", "") or ""),
+                size=int(getattr(item, "size", 0) or 0),
+                bitrate=int(getattr(item, "bitrate", 0) or 0),
+                extension=str(getattr(item, "extension", "") or ""),
+            )
+            for item in files
+            if getattr(item, "filename", None)
+        ]
+        names, folds = candidate_names(remotes)
+        if self.store.wanted_catalog_ready():
+            rows = self.store.wanted_tracks_for(names, folds)
+            tracks = [
+                WantedTrack(
+                    artist=row["artist"],
+                    album=row["album"],
+                    song=row["song"],
+                    key=row["key"],
+                    kind=row["kind"],
+                    artist_key=row["artist_key"],
+                    album_id=row["album_id"],
+                    track_id=row["track_id"],
+                )
+                for row in rows
+            ]
+        else:
+            tracks = self._tracks_from_memory(names, folds)
+        return match_files_to_wanted(
+            remotes,
+            tracks,
+            min_filename_ratio=float(self.cfg.min_filename_ratio),
+            preferred_extensions=list(self.cfg.preferred_extensions),
+            min_mp3_bitrate=int(self.cfg.min_mp3_bitrate),
+        )
+
+    def _tracks_from_memory(self, names: list[str], folds: list[str]) -> list[WantedTrack]:
+        from wanted import artist_key
+
+        tokens = {artist_key(name) for name in names}
+        fold_set = set(folds)
+        catalog = self.catalog
+        with catalog._lock:
+            labels = list(catalog._artist_labels)
+            grouped = {key: list(rows) for key, rows in catalog._grouped.items()}
+        chosen = set()
+        for label in labels:
+            token = artist_key(label)
+            if token in tokens or normalize(label) in fold_set:
+                chosen.add(token)
+        for token in tokens:
+            if token in grouped:
+                chosen.add(token)
+        tracks: list[WantedTrack] = []
+        choices = self.store.wanted_choices()
+        for token in chosen:
+            for item in grouped.get(token, []):
+                if item.kind not in {"album", "song"}:
+                    continue
+                if not is_enabled(item.key, choices):
+                    continue
+                tracks.append(
+                    WantedTrack(
+                        artist=item.artist,
+                        album=item.album,
+                        song=item.song,
+                        key=item.key,
+                        kind=item.kind,
+                        artist_key=token,
+                        album_id=item.album_id,
+                        track_id=item.track_id,
+                    )
+                )
+        return tracks
+
     async def download_manual(self, specs: list[dict], link: dict | None = None) -> str:
         """Queue files from a manual search through the same download and import path.
 
@@ -1475,12 +2008,13 @@ class Worker:
             self.set_step(
                 Step(kind="queued", artist=artist, album=folder_title, file_total=len(specs), username=username)
             )
-        paired: list[tuple[str, object]] = []
+        paired: list[tuple[str, object, dict]] = []
         for spec in specs:
             file_id = str(spec.get("id") or "")
+            spec_link = spec.get("link") if isinstance(spec.get("link"), dict) else link
             self._set_manual_state(file_id, "queued")
             transfer = await self.client.transfers.download(str(spec["username"]), str(spec["filename"]))
-            paired.append((file_id, transfer))
+            paired.append((file_id, transfer, spec_link or {}))
             self.manual_transfers.append(transfer)
             self._set_manual_state(file_id, "downloading")
         if announce:
@@ -1496,11 +2030,11 @@ class Worker:
             )
         deadline = time.monotonic() + max(30, int(self.cfg.download_timeout_minutes or 1) * 60)
         while time.monotonic() < deadline:
-            names = [state_name(item) for _, item in paired]
+            names = [state_name(item) for _, item, _link in paired]
             if names and all(name in {"COMPLETE", "FAILED", "ABORTED"} for name in names):
                 break
             if self.control.is_stopped():
-                for _, transfer in paired:
+                for _, transfer, _link in paired:
                     if state_name(transfer) not in {"COMPLETE", "FAILED", "ABORTED"}:
                         await abort_transfer(self.client, transfer)
                 break
@@ -1517,16 +2051,24 @@ class Worker:
                     )
                 )
             await asyncio.sleep(0.4)
-        transfers = [item for _, item in paired]
-        self.remember_completed(transfers, artist, title, "manual")
-        finished = {id(item) for item in transfers}
-        self.manual_transfers = [item for item in self.manual_transfers if id(item) not in finished or state_name(item) not in {"COMPLETE", "FAILED", "ABORTED"}]
-        dest = album_dest_folder(self.cfg, artist, folder_title, None)
-        for _, transfer in paired:
-            if state_name(transfer) == "COMPLETE":
+        transfers = [item for _, item, _link in paired]
+        groups: dict[tuple[str, str], list] = {}
+        for _file_id, transfer, spec_link in paired:
+            group_artist = str((spec_link or {}).get("artist") or artist)
+            group_album = str((spec_link or {}).get("album") or "")
+            group_title = str((spec_link or {}).get("title") or group_album or title)
+            folder = group_album or group_title or "Manual"
+            groups.setdefault((group_artist, folder), []).append(transfer)
+        last_dest = album_dest_folder(self.cfg, artist, folder_title, None)
+        for (group_artist, folder), group_transfers in groups.items():
+            self.remember_completed(group_transfers, group_artist, folder, "manual")
+            dest = album_dest_folder(self.cfg, group_artist, folder, None)
+            last_dest = dest
+            complete = [item for item in group_transfers if state_name(item) == "COMPLETE"]
+            for transfer in complete:
                 await asyncio.to_thread(stage_one_file, self.cfg, dest, transfer)
-        complete = [item for _, item in paired if state_name(item) == "COMPLETE"]
-        if complete:
+            if not complete:
+                continue
             scan_path = str(Path(self.cfg.lidarr_scan_path) / dest.name)
             try:
                 self.lidarr.scan_downloaded(scan_path)
@@ -1536,11 +2078,13 @@ class Worker:
                     self.lidarr.scan_downloaded(str(dest))
                 except Exception:
                     log.exception("Lidarr scan failed for manual download %s", dest)
-        for file_id, transfer in paired:
+        finished = {id(item) for item in transfers}
+        self.manual_transfers = [item for item in self.manual_transfers if id(item) not in finished or state_name(item) not in {"COMPLETE", "FAILED", "ABORTED"}]
+        for file_id, transfer, _link in paired:
             self._set_manual_state(file_id, "downloaded" if state_name(transfer) == "COMPLETE" else "failed")
         if announce and self.step.kind in {"queued", "downloading", "converting"} and not self.control.is_stopped():
             self._note_between_passes()
-        return str(dest)
+        return str(last_dest)
 
     async def browse_folder(self, username: str, directory: str) -> list[dict]:
         """List one folder on a peer. One request, no second Soulseek login."""

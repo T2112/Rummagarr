@@ -41,6 +41,7 @@ from updater import (
     wait_for_worker_stop,
 )
 from match import normalize
+from sharing import group_matches
 from search_model import (
     SearchFile,
     SearchFilters,
@@ -152,8 +153,18 @@ def apply_theme(root: tk.Misc) -> None:
     style.configure("TCheckbutton", background=bg, foreground=fg)
     style.configure("TRadiobutton", background=bg, foreground=fg)
     style.configure("TNotebook", background=bg, borderwidth=0)
-    style.configure("TNotebook.Tab", background="#1c1c1c", foreground=fg, padding=(16, 8))
-    style.map("TNotebook.Tab", background=[("selected", "#2c2c2c")], foreground=[("selected", "#ffffff")])
+    # Clam's selected-state expand eats padding, so the active tab looked smaller.
+    # Selected padding and font are larger. Unselected tabs stay compact.
+    # expand on the selected state is zero so Windows keeps that padding.
+    style.configure("TNotebook.Tab", background="#1a1a1a", foreground=muted, padding=(10, 4), font=(font, 9))
+    style.map(
+        "TNotebook.Tab",
+        background=[("selected", "#243044"), ("active", "#2a2a2a")],
+        foreground=[("selected", "#ffffff"), ("!selected", muted)],
+        padding=[("selected", (22, 12, 22, 10)), ("!selected", (10, 4))],
+        font=[("selected", (font, 12, "bold")), ("!selected", (font, 9))],
+        expand=[("selected", [0, 0, 0, 0]), ("!selected", [0, 0, 0, 2])],
+    )
     style.configure(
         "Treeview",
         background=panel,
@@ -258,11 +269,27 @@ BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
     BehaviorField("search_wait_seconds", "Search wait", "float", "seconds", "How long to wait for Soulseek results before scoring them.", 1, 90),
     BehaviorField("max_albums_per_cycle", "Albums per pass", "int", "", "Album searches started in one pass.", 1, 20),
     BehaviorField("focus_one_artist", "One artist at a time", "bool", "", "Stay on a single artist, then move on."),
-    BehaviorField("artist_cooldown_days", "Artist retry period", "float", "days", "After a visit, skip that artist for this many days. 0 retries every pass.", 0, 90),
+    BehaviorField(
+        "artist_cooldown_days",
+        "Artist retry period",
+        "float",
+        "days",
+        "After a visit, skip that artist for this many days. 0 lets the worker pick them again on a later pass. This is not the short wait between artists.",
+        0,
+        90,
+    ),
     BehaviorField("max_missing_pages", "Wanted pages per pass", "int", "pages", "Lidarr wanted/missing pages read each pass. Each page is 250 albums.", 1, 200),
     BehaviorField("fill_missing_tracks", "Fill missing songs", "bool", "", "Search Soulseek for individual songs on albums Lidarr already has in part."),
     BehaviorField("max_tracks_per_cycle", "Songs per pass", "int", "", "Individual song searches started in one pass. 0 turns song fill off for that pass.", 0, 50),
-    BehaviorField("cycle_seconds", "Pause between passes", "int", "seconds", "How long to wait after a pass before the next one.", 15, 7200),
+    BehaviorField(
+        "cycle_seconds",
+        "Wait before next artist",
+        "int",
+        "seconds",
+        "How long to wait after one artist before starting the next artist that is ready. 0 starts that artist immediately, with no 'Waiting for retry period' notice. This is separate from Artist retry period.",
+        0,
+        7200,
+    ),
     BehaviorField("retry_hours", "Retry a miss after", "int", "hours", "How long to wait before searching again for an album or song that did not match.", 0, 168),
     BehaviorField("min_filename_ratio", "Filename match", "float", "0–1", "How close a filename must be to the Lidarr title. Higher is stricter.", 0.2, 0.95),
     BehaviorField("track_count_tolerance", "Track count slack", "int", "tracks", "How many extra or missing files an album folder may have.", 0, 15),
@@ -278,7 +305,6 @@ BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
     BehaviorField("status_bind", "Status page address", "text", "", "Address the browser status page listens on. 127.0.0.1 is this PC only. Restart to apply.", restore=True),
     BehaviorField("status_port", "Status page port", "int", "", "Port for the browser status page. Restart to apply.", 1, 65535),
     BehaviorField("check_updates", "Check for updates on launch", "bool", "", "Look for a newer GitHub Release when the app opens."),
-    BehaviorField("share_dir", "Folder to share", "path", "", "Optional library folder Soulseek may share. Leave empty to share nothing. Restart to apply.", restore=False),
     BehaviorField("state_db", "Database file", "text", "", "SQLite file for progress and wanted checkboxes. Restart to apply.", restore=False),
     BehaviorField("log_file", "Log file", "text", "", "Where the worker writes its log. Restart to apply.", restore=False),
 )
@@ -295,7 +321,6 @@ _RESTART_FIELDS = frozenset(
         "enable_upnp",
         "download_dir",
         "complete_dir",
-        "share_dir",
         "state_db",
         "log_file",
         "status_bind",
@@ -303,6 +328,84 @@ _RESTART_FIELDS = frozenset(
     }
 )
 _LAUNCH_FIELDS = frozenset({"start_on_launch", "check_updates"})
+_SHARE_LIVE_FIELDS = frozenset(
+    {
+        "upload_slots",
+        "max_queued_files_per_user",
+        "max_queued_mb_per_user",
+        "upload_speed_kbps",
+        "per_user_speed_kbps",
+        "auto_ban_over_queue",
+        "require_peer_share",
+        "min_peer_share_files",
+        "priority_users",
+        "ignored_users",
+        "pause_uploads",
+    }
+)
+_SHARE_RESCAN_FIELDS = frozenset({"share_dir", "share_dirs"})
+
+SHARING_FIELDS: tuple[BehaviorField, ...] = (
+    BehaviorField("upload_slots", "Upload slots", "int", "", "How many files can upload at the same time.", 1, 20),
+    BehaviorField(
+        "max_queued_files_per_user",
+        "Queued files per user",
+        "int",
+        "files",
+        "Refuse a new file when this user already has this many queued or uploading. Priority users get four times this.",
+        1,
+        10000,
+    ),
+    BehaviorField(
+        "max_queued_mb_per_user",
+        "Queued size per user",
+        "int",
+        "MB",
+        "Refuse a new file when this user's queue would pass this size. 2048 MB is 2 GB. Priority users get four times this.",
+        1,
+        1048576,
+    ),
+    BehaviorField(
+        "upload_speed_kbps",
+        "Global upload speed",
+        "int",
+        "KB/s",
+        "Cap for every upload together. 0 is unlimited.",
+        0,
+        1000000,
+    ),
+    BehaviorField(
+        "per_user_speed_kbps",
+        "Per-user upload speed",
+        "int",
+        "KB/s",
+        "Cap for one user. 0 is unlimited. Extra uploads from that user pause until they are under the cap.",
+        0,
+        1000000,
+    ),
+    BehaviorField(
+        "auto_ban_over_queue",
+        "Ban users who exceed the queue",
+        "bool",
+        "",
+        "A file past the queue limit is always refused. This also adds the user to the ignore list.",
+    ),
+    BehaviorField(
+        "require_peer_share",
+        "Only share with users who share files",
+        "bool",
+        "",
+        "Refuse uploads to someone who reports fewer shared files than the minimum. Soulseek reports a file count, not a size in MB.",
+    ),
+    BehaviorField("min_peer_share_files", "Minimum files the peer shares", "int", "files", "Used when the option above is on.", 1, 10000000),
+    BehaviorField(
+        "priority_users",
+        "Priority users",
+        "csv",
+        "",
+        "These users are uploaded ahead of others and get a larger queue. They still have a limit.",
+    ),
+)
 
 
 def _display_number(value) -> str:
@@ -331,7 +434,11 @@ def settings_apply_message(old: Config, new: Config) -> str:
     parts = ["Saved."]
     if changed & _RESTART_FIELDS:
         parts.append("Stop and start the worker to apply connection, folder, and status-page changes.")
-    if changed - _RESTART_FIELDS - _LAUNCH_FIELDS:
+    if changed & _SHARE_LIVE_FIELDS:
+        parts.append("Upload limits apply immediately.")
+    if changed & _SHARE_RESCAN_FIELDS:
+        parts.append("Shared folders apply after Rescan, or the next time the worker logs in.")
+    if changed - _RESTART_FIELDS - _LAUNCH_FIELDS - _SHARE_LIVE_FIELDS - _SHARE_RESCAN_FIELDS:
         parts.append("Search and download settings apply on the next pass.")
     if changed & _LAUNCH_FIELDS:
         parts.append("The update check and start-on-launch apply the next time the app opens.")
@@ -349,6 +456,7 @@ class SettingsForm(ttk.Frame):
         on_saved,
         on_cancel,
         store=None,
+        worker=None,
     ) -> None:
         super().__init__(master, padding=16)
         self.config_path = config_path
@@ -356,6 +464,7 @@ class SettingsForm(ttk.Frame):
         self.on_saved = on_saved
         self.on_cancel = on_cancel
         self.store = store
+        self.worker = worker
         source = cfg if cfg is not None else default_config()
         download, complete = default_media_dirs()
         self.url_var = tk.StringVar(value=(cfg.lidarr_url if cfg else "http://127.0.0.1:8686"))
@@ -372,6 +481,8 @@ class SettingsForm(ttk.Frame):
         self.fields: dict[str, tk.Variable] = {}
         for spec in BEHAVIOR_FIELDS:
             self.fields[spec.key] = self._variable(spec, getattr(source, spec.key))
+        for spec in SHARING_FIELDS:
+            self.fields[spec.key] = self._variable(spec, getattr(source, spec.key))
         self.updates_var = self.fields["check_updates"]
         if store is not None:
             saved_limit = store.get_meta("gui_recent_limit")
@@ -382,13 +493,21 @@ class SettingsForm(ttk.Frame):
             self.history_var = None
         self.message_var = tk.StringVar(value="")
         self._behavior_canvas: tk.Canvas | None = None
+        paths = []
+        if source.share_dir:
+            paths.append(source.share_dir)
+        for extra in source.share_dirs:
+            if extra and extra not in paths:
+                paths.append(extra)
+        self.share_paths = paths
+        self.share_count_var = tk.StringVar(value=self._share_count_text())
         self._build()
 
     def _variable(self, spec: BehaviorField, value) -> tk.Variable:
         if spec.kind == "bool":
             return tk.BooleanVar(value=bool(value))
         if spec.kind == "csv":
-            if spec.key == "ignored_users":
+            if spec.key in {"ignored_users", "priority_users"}:
                 text = ", ".join(sorted(value))
             else:
                 text = ", ".join(value)
@@ -403,7 +522,7 @@ class SettingsForm(ttk.Frame):
             variable.set(bool(value))
             return
         if spec.kind == "csv":
-            if spec.key == "ignored_users":
+            if spec.key in {"ignored_users", "priority_users"}:
                 variable.set(", ".join(sorted(value)))
             else:
                 variable.set(", ".join(value))
@@ -417,7 +536,7 @@ class SettingsForm(ttk.Frame):
         ttk.Label(self, text="Lidarr Soulseek setup", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(
             self,
-            text="Connection holds the login and folders. Behavior holds the search, conversion, and update options.",
+            text="Connection holds the login and folders. Behavior holds search and conversion. Sharing holds what other users can download.",
             style="Muted.TLabel",
             wraplength=900,
         ).grid(row=1, column=0, sticky="w", pady=(4, 8))
@@ -425,10 +544,13 @@ class SettingsForm(ttk.Frame):
         self.notebook.grid(row=2, column=0, sticky="nsew")
         connection = ttk.Frame(self.notebook, padding=12)
         behavior = ttk.Frame(self.notebook, padding=(4, 8, 4, 4))
+        sharing = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(connection, text="Connection")
         self.notebook.add(behavior, text="Behavior")
+        self.notebook.add(sharing, text="Sharing")
         self._build_connection(connection)
         self._build_behavior(behavior)
+        self._build_sharing(sharing)
         ttk.Label(self, textvariable=self.message_var, wraplength=900).grid(row=3, column=0, sticky="w", pady=(8, 4))
         buttons = ttk.Frame(self)
         buttons.grid(row=4, column=0, sticky="w")
@@ -478,7 +600,7 @@ class SettingsForm(ttk.Frame):
         )
         ttk.Label(
             parent,
-            text="Search limits, conversion, the status page, and the update check are on the Behavior tab.",
+            text="Search limits, conversion, the status page, and the update check are on the Behavior tab. Uploads are on Sharing.",
             style="Muted.TLabel",
             wraplength=760,
         ).grid(row=13, column=0, columnspan=3, sticky="w", pady=(12, 0))
@@ -532,6 +654,166 @@ class SettingsForm(ttk.Frame):
             self._behavior_row(inner, row, spec)
             row += 2
         inner.columnconfigure(1, weight=1)
+
+    def _share_count_text(self) -> str:
+        worker = self.worker
+        if worker is None:
+            return "File counts appear after a rescan while the worker is running."
+        folders, files = getattr(worker, "share_counts", (0, 0))
+        return f"Indexed {folders} folders and {files} files. Rescan after changing the list."
+
+    def _build_sharing(self, parent: ttk.Frame) -> None:
+        ttk.Label(
+            parent,
+            text=(
+                "Enforced when a peer requests a file. Run open-firewall.ps1 and forward both listen ports if UPnP does not. "
+                "Pause keeps sharing up. Stop closes it. Rescan reports the real file and folder counts to the Soulseek server."
+            ),
+            style="Muted.TLabel",
+            wraplength=900,
+        ).pack(anchor="w", pady=(0, 8))
+        body = ttk.Frame(parent)
+        body.pack(fill="both", expand=True)
+        form = ttk.Frame(body)
+        form.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
+        side = ttk.Frame(body)
+        side.grid(row=0, column=1, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+        row = 0
+        for spec in SHARING_FIELDS:
+            if spec.kind == "bool":
+                ttk.Checkbutton(form, text=spec.label, variable=self.fields[spec.key]).grid(
+                    row=row, column=0, columnspan=3, sticky="w", pady=(4, 0)
+                )
+            else:
+                ttk.Label(form, text=spec.label).grid(row=row, column=0, sticky="w", pady=(4, 0), padx=(0, 8))
+                width = 28 if spec.kind == "csv" else 8
+                ttk.Entry(form, textvariable=self.fields[spec.key], width=width).grid(row=row, column=1, sticky="w", pady=(4, 0))
+                if spec.unit:
+                    ttk.Label(form, text=spec.unit, style="Muted.TLabel").grid(row=row, column=2, sticky="w", padx=(6, 0))
+            row += 1
+            ttk.Label(form, text=spec.help, style="Muted.TLabel", wraplength=460).grid(
+                row=row, column=0, columnspan=3, sticky="w"
+            )
+            row += 1
+        ttk.Label(side, text="Shared folders").pack(anchor="w")
+        folder_box = tk.Listbox(side, height=6, background="#1c1c1c", foreground="#eeeeee", selectmode="browse")
+        folder_box.pack(fill="x", pady=(4, 0))
+        self._folder_list = folder_box
+        folder_buttons = ttk.Frame(side)
+        folder_buttons.pack(anchor="w", pady=(4, 0))
+        ttk.Button(folder_buttons, text="Add folder", command=self._add_share_folder).pack(side="left")
+        ttk.Button(folder_buttons, text="Remove", command=self._remove_share_folder).pack(side="left", padx=(8, 0))
+        ttk.Button(folder_buttons, text="Rescan", command=self._rescan_shares).pack(side="left", padx=(8, 0))
+        ttk.Label(side, textvariable=self.share_count_var, style="Muted.TLabel", wraplength=420).pack(anchor="w", pady=(4, 8))
+        ttk.Label(side, text="Ignored users").pack(anchor="w")
+        ban_box = tk.Listbox(side, height=5, background="#1c1c1c", foreground="#eeeeee", selectmode="browse")
+        ban_box.pack(fill="x", pady=(4, 0))
+        self._ban_list = ban_box
+        ban_buttons = ttk.Frame(side)
+        ban_buttons.pack(anchor="w", pady=(4, 0))
+        self._ban_entry = tk.StringVar()
+        ttk.Entry(ban_buttons, textvariable=self._ban_entry, width=18).pack(side="left")
+        ttk.Button(ban_buttons, text="Ignore", command=self._add_ban).pack(side="left", padx=(8, 0))
+        ttk.Button(ban_buttons, text="Remove", command=self._remove_ban).pack(side="left", padx=(8, 0))
+        ttk.Label(
+            side,
+            text="Same list as Ignored Soulseek users. They cannot download from you, and you will not download from them.",
+            style="Muted.TLabel",
+            wraplength=420,
+        ).pack(anchor="w", pady=(4, 0))
+        self._refresh_ban_list()
+        self._refresh_folder_list()
+
+    def _refresh_ban_list(self) -> None:
+        box = getattr(self, "_ban_list", None)
+        if box is None:
+            return
+        box.delete(0, "end")
+        names = sorted(
+            part.strip().lower() for part in str(self.fields["ignored_users"].get()).split(",") if part.strip()
+        )
+        for name in names:
+            box.insert("end", name)
+
+    def _write_bans(self, names: list[str]) -> None:
+        self.fields["ignored_users"].set(", ".join(names))
+        self._refresh_ban_list()
+
+    def _add_ban(self) -> None:
+        name = self._ban_entry.get().strip().lower()
+        if not name:
+            return
+        names = sorted(
+            set(part.strip().lower() for part in str(self.fields["ignored_users"].get()).split(",") if part.strip())
+            | {name}
+        )
+        self._ban_entry.set("")
+        self._write_bans(names)
+
+    def _remove_ban(self) -> None:
+        box = self._ban_list
+        selected = box.curselection()
+        if not selected:
+            return
+        current = box.get(selected[0])
+        names = [
+            part.strip().lower()
+            for part in str(self.fields["ignored_users"].get()).split(",")
+            if part.strip() and part.strip().lower() != current
+        ]
+        self._write_bans(sorted(set(names)))
+
+    def _refresh_folder_list(self) -> None:
+        box = getattr(self, "_folder_list", None)
+        if box is None:
+            return
+        box.delete(0, "end")
+        for path in self.share_paths:
+            box.insert("end", path)
+
+    def _add_share_folder(self) -> None:
+        chosen = filedialog.askdirectory(initialdir=str(Path.home()))
+        if not chosen or chosen in self.share_paths:
+            return
+        self.share_paths.append(chosen)
+        self._refresh_folder_list()
+
+    def _remove_share_folder(self) -> None:
+        box = self._folder_list
+        selected = box.curselection()
+        if not selected:
+            return
+        del self.share_paths[selected[0]]
+        self._refresh_folder_list()
+
+    def _rescan_shares(self) -> None:
+        worker = self.worker
+        loop = getattr(worker, "_loop", None) if worker is not None else None
+        if worker is None or loop is None or not loop.is_running():
+            self.message_var.set("Start the worker, then rescan. Sharing uses that Soulseek login.")
+            return
+        paths = list(self.share_paths)
+        self.message_var.set("Scanning shared folders…")
+
+        def work() -> None:
+            try:
+                counts = asyncio.run_coroutine_threadsafe(worker.rescan_shares(paths), loop).result(timeout=3600)
+                text = f"Rescan finished: {counts[0]} folders, {counts[1]} files."
+            except Exception as exc:
+                text = f"Rescan failed: {exc}"
+
+            def show() -> None:
+                self.share_count_var.set(text)
+                self.message_var.set(text)
+
+            try:
+                self.after(0, show)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=work, name="share-rescan", daemon=True).start()
 
     def _behavior_row(self, parent: ttk.Frame, row: int, spec: BehaviorField) -> None:
         if spec.kind == "bool":
@@ -594,10 +876,13 @@ class SettingsForm(ttk.Frame):
 
     def restore_defaults(self) -> None:
         fresh = default_config()
-        for spec in BEHAVIOR_FIELDS:
+        for spec in (*BEHAVIOR_FIELDS, *SHARING_FIELDS):
             if not spec.restore:
                 continue
             self._set_field(spec, getattr(fresh, spec.key))
+        self.share_paths = []
+        self._refresh_folder_list()
+        self._refresh_ban_list()
         if self.history_var is not None:
             self.history_var.set(str(DEFAULT_RECENT_LIMIT))
         self.message_var.set(
@@ -634,7 +919,7 @@ class SettingsForm(ttk.Frame):
                 if not parts or any(not part.isalnum() for part in parts):
                     raise ValueError("Formats must be a comma-separated list such as mp3, flac, wav.")
                 values[spec.key] = parts
-            elif spec.key == "ignored_users":
+            elif spec.key in {"ignored_users", "priority_users"}:
                 values[spec.key] = {
                     part.strip().lower() for part in str(self.fields[spec.key].get()).split(",") if part.strip()
                 }
@@ -650,6 +935,21 @@ class SettingsForm(ttk.Frame):
                 values[spec.key] = Path(text)
             else:
                 values[spec.key] = str(self.fields[spec.key].get()).strip()
+        return values
+
+    def _sharing_values(self) -> dict:
+        values: dict = {}
+        for spec in SHARING_FIELDS:
+            if spec.kind == "bool":
+                values[spec.key] = bool(self.fields[spec.key].get())
+            elif spec.kind in {"int", "float"}:
+                values[spec.key] = self._bounded_number(spec)
+            elif spec.key == "priority_users":
+                values[spec.key] = {
+                    part.strip().lower() for part in str(self.fields[spec.key].get()).split(",") if part.strip()
+                }
+        values["share_dir"] = self.share_paths[0] if self.share_paths else ""
+        values["share_dirs"] = list(self.share_paths[1:])
         return values
 
     def build_config(self) -> Config:
@@ -692,6 +992,7 @@ class SettingsForm(ttk.Frame):
             complete_dir=Path(complete),
             start_on_launch=bool(self.launch_var.get()),
             **self._behavior_values(),
+            **self._sharing_values(),
         )
         if self.base is None:
             return default_config(**fields)
@@ -838,6 +1139,99 @@ class SearchBoard:
     row_users: dict[str, str] = field(default_factory=dict)
 
 
+class WantedPreview(tk.Toplevel):
+    """Albums this user has that are still on the Wanted list. All start checked."""
+
+    def __init__(self, master: tk.Misc, matches, on_queue) -> None:
+        super().__init__(master)
+        self.title("Download wanted files")
+        self.transient(master)
+        self.geometry("760x520")
+        self.minsize(640, 400)
+        apply_theme(self)
+        self.on_queue = on_queue
+        self.matches = list(matches)
+        self._checked = {index: True for index in range(len(self.matches))}
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame,
+            text="These files match the Wanted list. Uncheck any you do not want, then queue them.",
+            style="Muted.TLabel",
+            wraplength=700,
+        ).pack(anchor="w", pady=(0, 8))
+        tree_frame = ttk.Frame(frame)
+        tree_frame.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(tree_frame, columns=("size",), show="tree headings", selectmode="browse")
+        self.tree.heading("#0", text="Album and file")
+        self.tree.heading("size", text="Size")
+        self.tree.column("#0", width=520, stretch=True)
+        self.tree.column("size", width=100, stretch=False)
+        scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+        self._images = {
+            "on": self._box("on"),
+            "off": self._box("off"),
+        }
+        self._rows: dict[str, int | None] = {}
+        index_of = {id(match): index for index, match in enumerate(self.matches)}
+        for label, group in group_matches(self.matches):
+            parent = self.tree.insert("", "end", text=label, open=True, image=self._images["on"])
+            self._rows[parent] = None
+            for match in group:
+                index = index_of[id(match)]
+                child = self.tree.insert(
+                    parent,
+                    "end",
+                    text=f"{match.song or match.filename}",
+                    image=self._images["on"],
+                    values=(format_bytes(match.size),),
+                )
+                self._rows[child] = index
+        self.tree.bind("<Button-1>", self._click)
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(8, 0))
+        ttk.Button(buttons, text="Queue checked", style="Start.TButton", command=self._queue).pack(side="left")
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left", padx=(8, 0))
+
+    def _box(self, state: str) -> tk.PhotoImage:
+        size = 16
+        image = tk.PhotoImage(master=self, width=size, height=size)
+        image.put("#d5d5d5", to=(0, 0, size, size))
+        image.put("#3d8bfd" if state == "on" else "#2a2a2a", to=(2, 2, size - 2, size - 2))
+        if state == "on":
+            image.put("#ffffff", to=(4, 8, 12, 10))
+        return image
+
+    def _click(self, event) -> None:
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        index = self._rows.get(row)
+        if index is None:
+            children = self.tree.get_children(row)
+            indexes = [self._rows[child] for child in children if self._rows.get(child) is not None]
+            turn_on = not all(self._checked.get(item, False) for item in indexes)
+            for item in indexes:
+                self._checked[item] = turn_on
+            self.tree.item(row, image=self._images["on" if turn_on else "off"])
+            for child in children:
+                self.tree.item(child, image=self._images["on" if turn_on else "off"])
+            return
+        self._checked[index] = not self._checked.get(index, False)
+        self.tree.item(row, image=self._images["on" if self._checked[index] else "off"])
+
+    def _queue(self) -> None:
+        picked = [match for index, match in enumerate(self.matches) if self._checked.get(index, False)]
+        self.destroy()
+        if picked:
+            self.on_queue(picked)
+
+
 class DesktopApp(tk.Tk):
     def __init__(
         self,
@@ -914,14 +1308,18 @@ class DesktopApp(tk.Tk):
         self.status_tab = ttk.Frame(self.notebook, padding=12)
         self.wanted_tab = ttk.Frame(self.notebook, padding=12)
         self.search_tab = ttk.Frame(self.notebook, padding=12)
+        self.shared_tab = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(self.status_tab, text="Status")
         self.notebook.add(self.wanted_tab, text="Wanted")
         self.notebook.add(self.search_tab, text="Search")
+        self.notebook.add(self.shared_tab, text="Shared")
         self._boards: list[SearchBoard] = []
         self._search_menu: tk.Menu | None = None
+        self._shared_rows: list[dict] = []
         self._build_status(self.status_tab)
         self._build_wanted(self.wanted_tab)
         self._build_search(self.search_tab)
+        self._build_shared(self.shared_tab)
 
     def _build_menu(self) -> None:
         menu = tk.Menu(self, tearoff=0)
@@ -1090,6 +1488,9 @@ class DesktopApp(tk.Tk):
             if not self.winfo_exists():
                 return
             self.refresh_status()
+            self.refresh_shared()
+            if self.worker.take_config_dirty():
+                save_config(self.config_path, self.worker.cfg)
         except tk.TclError:
             return
         self.after(self.poll_ms, self._tick)
@@ -1117,6 +1518,7 @@ class DesktopApp(tk.Tk):
 
         def on_saved(cfg: Config) -> None:
             self.worker.cfg = cfg
+            self.worker.apply_share_settings(scan=False)
             saved_limit = self.worker.store.get_meta("gui_recent_limit")
             if saved_limit:
                 self.limit_var.set(str(normalize_recent_limit(saved_limit)))
@@ -1130,6 +1532,7 @@ class DesktopApp(tk.Tk):
             on_saved,
             window.destroy,
             store=self.worker.store,
+            worker=self.worker,
         )
         form.pack(fill="both", expand=True)
 
@@ -1730,6 +2133,8 @@ class DesktopApp(tk.Tk):
         self._search_menu = tk.Menu(self, tearoff=0)
         self._search_menu.add_command(label="Download file(s)", command=self.download_selected_files)
         self._search_menu.add_command(label="Download folder", command=self.download_selected_folder)
+        self._search_menu.add_command(label="Download all from this user", command=self.download_all_from_user)
+        self._search_menu.add_command(label="Download all wanted from this user", command=self.download_all_wanted)
         self._search_menu.add_command(label="Browse folder", command=self.browse_selected_folder)
 
     def submit_search(self) -> None:
@@ -1789,6 +2194,8 @@ class DesktopApp(tk.Tk):
         actions.pack(fill="x", pady=(0, 4))
         ttk.Button(actions, text="Download file(s)", command=self.download_selected_files).pack(side="left")
         ttk.Button(actions, text="Download folder", command=self.download_selected_folder).pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="Download all from this user", command=self.download_all_from_user).pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="Download all wanted", command=self.download_all_wanted).pack(side="left", padx=(8, 0))
         ttk.Button(actions, text="Browse folder", command=self.browse_selected_folder).pack(side="left", padx=(8, 0))
         board.status = tk.StringVar(value="")
         ttk.Label(actions, textvariable=board.status, style="Muted.TLabel").pack(side="left", padx=(12, 0))
@@ -2028,6 +2435,187 @@ class DesktopApp(tk.Tk):
         users = {board.row_users[iid] for iid in tree.selection() if iid in board.row_users}
         return file_ids, users
 
+    def _build_shared(self, parent: ttk.Frame) -> None:
+        top = ttk.Frame(parent)
+        top.pack(fill="x")
+        self.share_totals = tk.StringVar(value="")
+        ttk.Label(top, textvariable=self.share_totals).pack(side="left")
+        self.pause_uploads_var = tk.BooleanVar(value=bool(self.worker.cfg.pause_uploads))
+        ttk.Checkbutton(
+            top,
+            text="Pause all uploads",
+            variable=self.pause_uploads_var,
+            command=self._toggle_pause_uploads,
+        ).pack(side="right")
+        actions = ttk.Frame(parent)
+        actions.pack(fill="x", pady=(8, 8))
+        ttk.Button(actions, text="Pause", command=lambda: self._upload_action("pause")).pack(side="left")
+        ttk.Button(actions, text="Resume", command=lambda: self._upload_action("resume")).pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="Cancel", command=lambda: self._upload_action("cancel")).pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="Cancel all from this user", command=lambda: self._upload_action("cancel-user")).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Button(actions, text="Ban user", command=lambda: self._upload_action("ban")).pack(side="left", padx=(8, 0))
+        frame, tree = scrolled_tree(
+            parent,
+            (
+                ("user", "User", 140, False),
+                ("file", "File", 360, True),
+                ("size", "Size", 90, False),
+                ("progress", "Progress", 140, False),
+                ("speed", "Speed", 90, False),
+                ("status", "Status", 90, False),
+                ("when", "Time", 140, False),
+            ),
+        )
+        frame.pack(fill="both", expand=True)
+        self.shared_tree = tree
+        tree.configure(selectmode="extended")
+        self.refresh_shared()
+
+    def refresh_shared(self) -> None:
+        tree = getattr(self, "shared_tree", None)
+        if tree is None:
+            return
+        snapshot = self.worker.upload_snapshot()
+        if hasattr(self, "pause_uploads_var") and bool(self.pause_uploads_var.get()) != bool(snapshot["pause_all"]):
+            self.pause_uploads_var.set(bool(snapshot["pause_all"]))
+        self.share_totals.set(
+            "Today {today_files} files, {today_bytes} · All time {all_files} files, {all_bytes} · Sharing {share_files} files in {share_folders} folders".format(
+                today_files=snapshot["today_files"],
+                today_bytes=format_bytes(int(snapshot["today_bytes"])),
+                all_files=snapshot["all_files"],
+                all_bytes=format_bytes(int(snapshot["all_bytes"])),
+                share_files=snapshot["share_files"],
+                share_folders=snapshot["share_folders"],
+            )
+        )
+        selected = {tree.set(iid, "file") + "\n" + tree.set(iid, "user") for iid in tree.selection()}
+        children = tree.get_children()
+        if children:
+            tree.delete(*children)
+        self._shared_rows = list(snapshot["rows"]) + list(snapshot["history"])
+        for row in self._shared_rows:
+            status = str(row["status"])
+            iid = tree.insert(
+                "",
+                "end",
+                values=(
+                    row["username"],
+                    row["filename"],
+                    format_bytes(int(row["size"] or 0)),
+                    format_progress(row.get("progress")),
+                    format_speed(int(row.get("speed") or 0)),
+                    status,
+                    format_when(row.get("when")) if not row.get("live") else (row.get("when") or ""),
+                ),
+            )
+            if f"{row['filename']}\n{row['username']}" in selected:
+                tree.selection_add(iid)
+
+    def _selected_shared(self) -> list[dict]:
+        tree = self.shared_tree
+        chosen = []
+        for iid in tree.selection():
+            index = tree.index(iid)
+            if 0 <= index < len(self._shared_rows):
+                chosen.append(self._shared_rows[index])
+        return chosen
+
+    def _toggle_pause_uploads(self) -> None:
+        self.worker.set_pause_uploads(bool(self.pause_uploads_var.get()))
+        loop = getattr(self.worker, "_loop", None)
+        if loop is not None and loop.is_running():
+            asyncio.run_coroutine_threadsafe(self.worker._enforce_upload_policy(), loop)
+
+    def _upload_action(self, action: str) -> None:
+        rows = self._selected_shared()
+        if not rows:
+            return
+        loop = getattr(self.worker, "_loop", None)
+        if action == "ban":
+            for row in rows:
+                self.worker.ban_user(str(row["username"]))
+            if loop is not None and loop.is_running():
+                for row in rows:
+                    asyncio.run_coroutine_threadsafe(self.worker.cancel_user_uploads(str(row["username"])), loop)
+            self.refresh_shared()
+            return
+        if loop is None or not loop.is_running():
+            self.notice_var.set("Start the worker to manage uploads.")
+            return
+        for row in rows:
+            username = str(row["username"])
+            filename = str(row["filename"])
+            if action == "pause":
+                asyncio.run_coroutine_threadsafe(self.worker.pause_upload(username, filename), loop)
+            elif action == "resume":
+                asyncio.run_coroutine_threadsafe(self.worker.resume_upload(username, filename), loop)
+            elif action == "cancel":
+                asyncio.run_coroutine_threadsafe(self.worker.cancel_upload(username, filename), loop)
+            elif action == "cancel-user":
+                asyncio.run_coroutine_threadsafe(self.worker.cancel_user_uploads(username), loop)
+
+    def _selected_username(self, board: SearchBoard) -> str:
+        if board.tree is None:
+            return ""
+        file_ids, users = self._selected_search_targets(board)
+        if users:
+            return next(iter(users))
+        for item in board.files:
+            if item.id in file_ids:
+                return item.username
+        return ""
+
+    def download_all_from_user(self) -> None:
+        board = self._current_board()
+        if board is None:
+            return
+        username = self._selected_username(board)
+        if not username:
+            if board.status is not None:
+                board.status.set("Select a user or one of their files.")
+            return
+        chosen = [item for item in board.filters.apply(board.files) if item.username == username]
+        if not chosen:
+            if board.status is not None:
+                board.status.set("That user has no files in the current results.")
+            return
+        self.queue_search_files(board, chosen)
+
+    def download_all_wanted(self) -> None:
+        board = self._current_board()
+        if board is None:
+            return
+        username = self._selected_username(board)
+        if not username:
+            if board.status is not None:
+                board.status.set("Select a user or one of their files.")
+            return
+        files = [item for item in board.files if item.username == username]
+        matches = self.worker.match_user_files(files)
+        if not matches:
+            if board.status is not None:
+                board.status.set(f"No wanted matches in {username}'s results.")
+            return
+        WantedPreview(self, matches, lambda picked, board=board: self._queue_matches(board, picked))
+
+    def _queue_matches(self, board: SearchBoard, matches) -> None:
+        by_id = {item.id: item for item in board.files}
+        files = []
+        specs = []
+        for match in matches:
+            file_id = f"{match.username}\n{match.filename}"
+            item = by_id.get(file_id)
+            if item is None:
+                item = SearchFile(username=match.username, filename=match.filename, size=match.size)
+                board.files.append(item)
+            files.append(item)
+            spec = file_spec(item)
+            spec["link"] = match.link()
+            specs.append(spec)
+        self.queue_search_files(board, files, specs=specs)
+
     def download_selected_files(self) -> None:
         self._queue_current(folder=False)
 
@@ -2048,7 +2636,7 @@ class DesktopApp(tk.Tk):
             return
         self.queue_search_files(board, chosen)
 
-    def queue_search_files(self, board: SearchBoard, files: list[SearchFile]) -> None:
+    def queue_search_files(self, board: SearchBoard, files: list[SearchFile], specs: list[dict] | None = None) -> None:
         loop = getattr(self.worker, "_loop", None)
         if loop is None or not loop.is_running():
             if board.status is not None:
@@ -2070,7 +2658,11 @@ class DesktopApp(tk.Tk):
                 "album_id": board.link.album_id,
                 "track_id": board.link.track_id,
             }
-        specs = [file_spec(item) for item in files]
+        if specs is None:
+            specs = [file_spec(item) for item in files]
+            if link is not None:
+                for spec in specs:
+                    spec["link"] = link
         future = asyncio.run_coroutine_threadsafe(self.worker.download_manual(specs, link), loop)
 
         def done() -> None:
