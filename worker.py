@@ -593,6 +593,15 @@ class Worker:
             return current
         if current:
             log.info("Artist %s is on cooldown; picking the next one", current)
+        if self.store.wanted_catalog_ready():
+            skip = {token for token in cooldowns if self._cooled(token, cooldowns, now)}
+            chosen = self.store.next_wanted_artist(skip)
+            if not chosen:
+                self.store.set_focus_artist(None)
+                return None
+            self.store.set_focus_artist(chosen)
+            log.info("Focusing on artist: %s", chosen)
+            return chosen
         if self.catalog.synced:
             choices = self.store.wanted_choices()
             for chosen in self.catalog.artist_labels():
@@ -682,9 +691,28 @@ class Worker:
     async def cycle(self) -> None:
         if self.control.is_stopped():
             return
-        # A Sync in the desktop app keeps the wanted list in memory. Until that
-        # happens, keep reading Lidarr 20 pages at a time and resume next cycle.
-        if self.catalog.synced:
+        # A Sync stores the wanted list in SQLite. Until that happens, keep
+        # reading Lidarr 20 pages at a time and resume next cycle.
+        if self.store.wanted_catalog_ready():
+            log.info("Using saved wanted list (%s albums)", self.store.wanted_kind_count("album"))
+            focus = self.choose_focus_artist([], [])
+            if not focus:
+                log.info("No artist ready (all cooled off or nothing missing)")
+                self.sweep_incomplete_folder()
+                return
+            artist_albums, artist_holes = self.store.artist_work(focus)
+            truly_missing = self._empty_albums(artist_albums)
+            checked_missing = truly_missing
+            covered = {int(album["id"]) for album in checked_missing if album.get("id") is not None}
+            holes = []
+            for hole in artist_holes:
+                album = hole.get("album") or {}
+                album_id = album.get("id") if isinstance(album, dict) else None
+                if album_id is not None and int(album_id) in covered:
+                    continue
+                holes.append(hole)
+            choices = {}
+        elif self.catalog.synced:
             cached = self.catalog.album_payloads() or []
             log.info("Using synced wanted list (%s albums)", len(cached))
             focus = self.choose_focus_artist([], [])
@@ -789,7 +817,8 @@ class Worker:
                 log.exception("Could not list missing tracks")
                 return
         log.info("Lidarr missing tracks on partial albums: %s", len(holes))
-        choices = self.store.wanted_choices()
+        use_rows = self.store.wanted_catalog_ready() or len(holes) <= 2000
+        choices = {} if use_rows else self.store.wanted_choices()
         processed = 0
         for hole in holes:
             if self.control.is_stopped():
@@ -817,7 +846,10 @@ class Worker:
                     continue
                 artist = hole.get("artist_name") or "Unknown Artist"
                 album_title = hole.get("album_title") or album.get("title") or "Unknown Album"
-                if not is_enabled(song_key(track_id), choices):
+                if use_rows:
+                    if not self.store.wanted_enabled(song_key(track_id)):
+                        continue
+                elif not is_enabled(song_key(track_id), choices):
                     continue
                 if self.store.should_skip_track(track_id, self.cfg.retry_hours):
                     continue

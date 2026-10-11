@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [1.7.0] — 2026-10-11
+
+### Changed
+
+- The Wanted list is stored in `state.sqlite3` and opens from that file. Launch does not call Lidarr. Sync walks Lidarr page by page and writes each page as it arrives, so the list can be searched and checked while the rest is still loading. A later Sync updates rows that changed and removes rows Lidarr no longer returns. Lidarr's wanted/missing API has no changed-since filter, so a resync still reads the list; unchanged rows are not rewritten.
+- The Wanted tab asks the database for the rows on screen. Filters, sorting, the artist search box, and the selected counts are SQL queries. Select all for the current view is one update, and scrolling asks for the next page by key instead of skipping millions of rows. The worker picks the next checked artist from an index instead of loading the list into memory.
+
 ## [1.6.0] — 2026-10-10
 
 ### Fixed

@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 
 from desktop_app import DesktopApp, SettingsForm, apply_theme  # noqa: E402
 from tests.conftest import album, hole, make_worker  # noqa: E402
-from wanted import build_catalog  # noqa: E402
+from wanted import build_catalog, items_to_rows  # noqa: E402
 
 
 class Transfer:
@@ -58,8 +58,9 @@ def main() -> None:
             hole(41, 4, "Tyler Childers", "Purgatory", "Feathered Indians", number=2),
         ],
     )
-    worker.catalog.replace(items)
-    worker.store.remember_wanted_keys([item.key for item in items])
+    worker.store.begin_wanted_sync()
+    worker.store.write_wanted_page(items_to_rows(items))
+    worker.store.finish_wanted_sync(complete=True)
     worker.store.set_wanted_choices({"album:3": False})
     for index, name in enumerate(
         ["01 Blue.mp3", "02 Hungover.mp3", "03 Out of Love.flac", "04 Cowboy.mp3", "05 Still.mp3"],
