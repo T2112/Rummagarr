@@ -38,14 +38,16 @@ class PageLibrary:
         self.id_base = id_base
         self.artist_prefix = artist_prefix
         self.calls = 0
+        self.page_fetches = 0
         self.renamed: dict[int, str] = {}
         self.track_titles: dict[int, str] = {}
+        self.file_overrides: dict[int, int] = {}
 
     def album(self, index: int) -> dict:
         album_id = self.id_base + index + 1
         artist_index = index // self.per_artist
         partial = index % 2 == 1
-        files = 2 if partial else 0
+        files = self.file_overrides.get(album_id, 2 if partial else 0)
         title = self.renamed.get(album_id, f"{self.title} {album_id}")
         return {
             "id": album_id,
@@ -58,6 +60,7 @@ class PageLibrary:
         }
 
     def wanted_missing(self, page_size=250, start_page=1, max_pages=1, on_page=None, should_cancel=None):
+        self.page_fetches += 1
         page = max(1, int(start_page or 1))
         if should_cancel is not None and should_cancel():
             return [], page, False
@@ -75,7 +78,7 @@ class PageLibrary:
         self.calls += 1
         index = int(album_id) - self.id_base - 1
         partial = index % 2 == 1
-        files = 2 if partial else 0
+        files = self.file_overrides.get(int(album_id), 2 if partial else 0)
         base = (self.id_base + index) * self.per_album
         rows = []
         for number in range(self.per_album):
@@ -142,10 +145,18 @@ def test_sync_is_incremental_and_cancel_keeps_saved_rows(tmp_path):
             kinds=("album",), search="Artist 00000", order="album", reverse=False, limit=10, offset=0
         )
         assert any(row[3] == "Renamed" for row in renamed)
+        calls_before = again.calls
         again.track_titles[1] = "Renamed Track"
         sync_wanted_catalog(again, store, max_pages=5)
+        assert again.calls == calls_before
         songs, _total = store.wanted_page(
             kinds=("song",), search="Artist 00000", order="song", reverse=False, limit=20, offset=0
+        )
+        assert all(row[4] != "Renamed Track" for row in songs)
+        again.file_overrides[1] = 1
+        sync_wanted_catalog(again, store, max_pages=5)
+        songs, _total = store.wanted_page(
+            kinds=("song",), search="Artist 00000", order="song", reverse=False, limit=30, offset=0
         )
         assert any(row[4] == "Renamed Track" for row in songs)
         assert store.wanted_enabled("album:1") is False
@@ -264,7 +275,7 @@ def test_keyset_pages_match_offset_and_removed_albums_drop(tmp_path):
         assert exhausted and not cancelled
         assert again == span_count
         assert store._needs_delete is False
-        assert quiet.calls == 300
+        assert quiet.calls == 0
 
         shrunk, exhausted, cancelled = sync_wanted_catalog(PageLibrary(2), store, max_pages=20)
         assert exhausted and not cancelled
@@ -421,3 +432,168 @@ def test_gui_reads_the_saved_catalog_and_can_search(tmp_path):
     finally:
         app.destroy()
         worker.close()
+
+
+def test_cancelled_sync_resumes_pages_then_tracks(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    try:
+        library = PageLibrary(600)
+        seen = {"pages": 0}
+
+        def on_progress(_rows, _albums):
+            seen["pages"] += 1
+
+        def should_cancel():
+            return seen["pages"] >= 1
+
+        _count, exhausted, cancelled = sync_wanted_catalog(
+            library, store, max_pages=20, on_progress=on_progress, should_cancel=should_cancel
+        )
+        assert cancelled is True
+        assert exhausted is False
+        assert library.calls == 0
+        assert library.page_fetches == 1
+        assert store.wanted_kind_count("album") == 250
+
+        again = PageLibrary(600)
+        count, exhausted, cancelled = sync_wanted_catalog(again, store, max_pages=20)
+        assert exhausted is True
+        assert cancelled is False
+        assert again.page_fetches == 2
+        assert again.calls == 600
+        assert store.wanted_kind_count("album") == 600
+        assert count > 600
+        assert store.track_queue_pending() is False
+    finally:
+        store.close()
+
+
+def test_cancelled_track_fetch_resumes_without_another_page_walk(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    try:
+        library = PageLibrary(40)
+
+        def tracks_for_album(album_id: int):
+            rows = PageLibrary.tracks_for_album(library, album_id)
+            if library.calls >= 3:
+                library.stop = True
+            return rows
+
+        library.stop = False
+        library.tracks_for_album = tracks_for_album
+        _count, exhausted, cancelled = sync_wanted_catalog(
+            library, store, max_pages=5, should_cancel=lambda: library.stop
+        )
+        assert cancelled is True
+        assert exhausted is False
+        assert library.calls == 3
+        assert library.page_fetches == 1
+        assert store.wanted_kind_count("album") == 40
+        songs_before = store.wanted_kind_count("song")
+        assert 0 < songs_before < 40 * 10
+
+        again = PageLibrary(40)
+        count, exhausted, cancelled = sync_wanted_catalog(again, store, max_pages=5)
+        assert exhausted is True
+        assert cancelled is False
+        assert again.page_fetches == 0
+        assert again.calls == 37
+        assert store.wanted_kind_count("song") > songs_before
+        assert count > 40
+    finally:
+        store.close()
+
+
+def test_failed_track_lookup_stays_queued_for_the_next_sync(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    try:
+        library = PageLibrary(4)
+        failed = {"album": 1}
+
+        def tracks_for_album(album_id: int):
+            if int(album_id) == failed["album"]:
+                library.calls += 1
+                raise RuntimeError("lidarr track lookup failed")
+            return PageLibrary.tracks_for_album(library, album_id)
+
+        library.tracks_for_album = tracks_for_album
+        _count, exhausted, cancelled = sync_wanted_catalog(library, store, max_pages=5)
+        assert cancelled is False
+        assert exhausted is False
+        assert store.track_queue_pending() is True
+        assert store.wanted_kind_count("song") == 26
+
+        failed["album"] = 0
+        pages_before = library.page_fetches
+        calls_before = library.calls
+        _count, exhausted, cancelled = sync_wanted_catalog(library, store, max_pages=5)
+        assert exhausted is True
+        assert cancelled is False
+        assert library.page_fetches == pages_before
+        assert library.calls == calls_before + 1
+        assert store.track_queue_pending() is False
+        assert store.wanted_kind_count("song") == 36
+    finally:
+        store.close()
+
+
+def test_artist_track_route_batches_albums_and_a_single_album_does_not(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    try:
+        class ArtistBatch(PageLibrary):
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__(*args, **kwargs)
+                self.artist_calls = 0
+
+            def tracks_for_artist(self, artist_id: int):
+                self.artist_calls += 1
+                rows = []
+                for index in range(self.n_albums):
+                    album = self.album(index)
+                    if int(album["artistId"]) != int(artist_id):
+                        continue
+                    for track in PageLibrary.tracks_for_album(self, album["id"]):
+                        copied = dict(track)
+                        copied["albumId"] = album["id"]
+                        rows.append(copied)
+                self.calls -= self.per_artist
+                return rows
+
+        library = ArtistBatch(8)
+        _count, exhausted, cancelled = sync_wanted_catalog(library, store, max_pages=5)
+        assert exhausted and not cancelled
+        assert library.artist_calls == 2
+        assert library.calls == 0
+        assert store.wanted_kind_count("song") > 0
+
+        library.artist_calls = 0
+        sync_wanted_catalog(library, store, max_pages=5)
+        assert library.artist_calls == 0
+        assert library.calls == 0
+
+        lone = JobStore(tmp_path / "one.sqlite3")
+        try:
+            single = ArtistBatch(1, per_artist=1)
+            sync_wanted_catalog(single, lone, max_pages=5)
+            assert single.artist_calls == 0
+            assert single.calls == 1
+        finally:
+            lone.close()
+
+        class Unsplit(PageLibrary):
+            def tracks_for_artist(self, _artist_id: int):
+                return [{"id": 1, "title": "Orphan", "monitored": True, "hasFile": False}]
+
+        fresh = JobStore(tmp_path / "unsplit.sqlite3")
+        try:
+            unsplittable = Unsplit(8)
+            _count, exhausted, cancelled = sync_wanted_catalog(unsplittable, fresh, max_pages=5)
+            assert cancelled is False
+            assert exhausted is False
+            assert unsplittable.calls == 0
+            assert fresh.wanted_kind_count("song") == 0
+            assert fresh.track_queue_pending() is True
+        finally:
+            fresh.close()
+    finally:
+        store.close()

@@ -67,6 +67,7 @@ This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs 
 
 - The Wanted list is saved in the local database and opens without another Sync
 - Sync writes each Lidarr page as it arrives, and the list stays searchable while that runs
+- A later Sync asks Lidarr for track titles only when that album's wanted/missing fields changed
 - An artist search box filters the saved list
 - Full changelog: [CHANGELOG.md](CHANGELOG.md)
 

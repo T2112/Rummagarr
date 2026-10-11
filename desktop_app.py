@@ -233,6 +233,15 @@ class BehaviorField:
 
 BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
     BehaviorField("concurrent_albums", "Albums at once", "int", "", "How many albums to search or download together. 1 is one after another.", 1, 8),
+    BehaviorField(
+        "lidarr_track_concurrency",
+        "Lidarr requests at once",
+        "int",
+        "",
+        "How many Lidarr track lookups to run together during Sync. 1 waits for each request.",
+        1,
+        8,
+    ),
     BehaviorField("search_wait_seconds", "Search wait", "float", "seconds", "How long to wait for Soulseek results before scoring them.", 1, 90),
     BehaviorField("max_albums_per_cycle", "Albums per pass", "int", "", "Album searches started in one pass.", 1, 20),
     BehaviorField("focus_one_artist", "One artist at a time", "bool", "", "Stay on a single artist, then move on."),
@@ -1250,7 +1259,11 @@ class DesktopApp(tk.Tk):
             self._post(lambda text=text: self._on_sync_progress(text))
 
         def work() -> None:
-            client = LidarrClient(cfg.lidarr_url, cfg.lidarr_api_key)
+            client = LidarrClient(
+                cfg.lidarr_url,
+                cfg.lidarr_api_key,
+                track_concurrency=cfg.lidarr_track_concurrency,
+            )
             try:
                 count, exhausted, cancelled = sync_wanted_catalog(
                     client,
@@ -1299,7 +1312,7 @@ class DesktopApp(tk.Tk):
         if error is not None:
             self.wanted_status.set(f"Sync failed: {error}")
             return
-        more = "" if exhausted else " Lidarr still has more pages; Sync again to continue."
+        more = "" if exhausted else " Sync again to continue."
         self.wanted_status.set(f"Synced {count:,} rows from Lidarr.{more}")
 
     def on_select_all(self) -> None:

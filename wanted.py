@@ -733,6 +733,238 @@ def album_sync_digest(album: dict, holes: list[dict]) -> str:
     return hashlib.sha1(raw.encode()).hexdigest()
 
 
+def album_page_fingerprint(album: dict) -> str:
+    """Fingerprint of the album fields Lidarr puts on a wanted/missing page.
+
+    Track titles are not in that payload. A resync uses this to decide whether
+    a track request is needed.
+    """
+    stats = album.get("statistics") if isinstance(album.get("statistics"), dict) else {}
+    artist = album.get("artist") if isinstance(album.get("artist"), dict) else {}
+    releases = []
+    raw_releases = album.get("releases")
+    if isinstance(raw_releases, list):
+        for release in raw_releases:
+            if not isinstance(release, dict):
+                continue
+            releases.append(
+                (
+                    str(release.get("foreignReleaseId") or release.get("id") or ""),
+                    str(release.get("title") or ""),
+                    release.get("trackCount"),
+                    bool(release.get("monitored", True)),
+                )
+            )
+    releases.sort()
+    payload = {
+        "id": album.get("id"),
+        "title": album.get("title") or "",
+        "artistId": album.get("artistId") or artist.get("id"),
+        "artistName": artist.get("artistName") or album.get("artistName") or "",
+        "monitored": bool(album.get("monitored", True)),
+        "releaseDate": album.get("releaseDate") or "",
+        "lastSearchTime": album.get("lastSearchTime") or "",
+        "anyReleaseOk": album.get("anyReleaseOk", True),
+        "foreignAlbumId": album.get("foreignAlbumId") or "",
+        "trackCount": stats.get("trackCount"),
+        "trackFileCount": stats.get("trackFileCount"),
+        "totalTrackCount": stats.get("totalTrackCount"),
+        "sizeOnDisk": stats.get("sizeOnDisk"),
+        "percentOfTracks": stats.get("percentOfTracks"),
+        "releases": releases,
+    }
+    return hashlib.sha1(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+
+
+def _artist_id_of(album: dict) -> int | None:
+    artist = album.get("artist") if isinstance(album.get("artist"), dict) else {}
+    return optional_id(album.get("artistId") or artist.get("id"))
+
+
+def _track_workers(client) -> int:
+    raw = getattr(client, "track_concurrency", 1)
+    try:
+        workers = int(raw or 1)
+    except (TypeError, ValueError):
+        workers = 1
+    return max(1, min(8, workers))
+
+
+def _fetch_tracks_for_albums(client, albums: list[dict], should_cancel) -> dict[int, list | None]:
+    """Track lists for albums that need a refresh.
+
+    ``None`` means the request failed and the album should stay queued.
+    Several albums by one artist use ``GET /api/v1/track?artistId=`` when the
+    client provides it. Lidarr's track list does not accept a repeated albumId.
+    """
+    use_artist = hasattr(client, "tracks_for_artist")
+    groups: dict[int | None, list[dict]] = {}
+    for album in albums:
+        artist_id = _artist_id_of(album) if use_artist else None
+        groups.setdefault(artist_id, []).append(album)
+    jobs = []
+    for artist_id, group in groups.items():
+        if use_artist and artist_id is not None and len(group) > 1:
+            jobs.append(("artist", artist_id, group))
+        else:
+            for album in group:
+                jobs.append(("album", optional_id(album.get("id")), [album]))
+
+    def run(job) -> dict[int, list | None]:
+        kind, ident, group = job
+        album_ids = [optional_id(album.get("id")) for album in group]
+        if should_cancel is not None and should_cancel():
+            return {album_id: None for album_id in album_ids if album_id is not None}
+        try:
+            if kind == "artist":
+                tracks = client.tracks_for_artist(ident) or []
+                by_album: dict[int, list] = {}
+                if not isinstance(tracks, list):
+                    tracks = []
+                for track in tracks:
+                    if not isinstance(track, dict):
+                        continue
+                    aid = optional_id(track.get("albumId"))
+                    if aid is None and isinstance(track.get("album"), dict):
+                        aid = optional_id(track["album"].get("id"))
+                    if aid is not None:
+                        by_album.setdefault(aid, []).append(track)
+                if tracks and not by_album:
+                    # Tracks came back without an album id, so they cannot be
+                    # split. Leave the albums queued instead of wiping songs.
+                    return {album_id: None for album_id in album_ids if album_id is not None}
+                return {
+                    album_id: by_album.get(album_id, [])
+                    for album_id in album_ids
+                    if album_id is not None
+                }
+            if ident is None:
+                return {}
+            return {int(ident): client.tracks_for_album(ident) or []}
+        except Exception:
+            log.exception("Could not read Lidarr tracks")
+            return {album_id: None for album_id in album_ids if album_id is not None}
+
+    results: dict[int, list | None] = {}
+    workers = _track_workers(client)
+    if workers == 1 or len(jobs) <= 1:
+        for job in jobs:
+            results.update(run(job))
+        return results
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(jobs))) as pool:
+        futures = [pool.submit(run, job) for job in jobs]
+        for future in as_completed(futures):
+            results.update(future.result())
+    return results
+
+
+def _accept_album_page(store, albums: list[dict]) -> int:
+    """Save album rows and queue track lookups only for new or changed albums."""
+    usable = []
+    fingerprints: dict[str, str] = {}
+    for album in albums:
+        album_id = optional_id(album.get("id"))
+        if album_id is None:
+            continue
+        usable.append(album)
+        fingerprints[album_key(album_id)] = album_page_fingerprint(album)
+    matched = store.matching_page_fingerprints(fingerprints) if fingerprints else {}
+    needs = []
+    seen_ids = []
+    unchanged_artists = []
+    unchanged_songs = 0
+    for album in usable:
+        album_id = optional_id(album.get("id"))
+        key = album_key(album_id)
+        seen_ids.append(album_id)
+        if key in matched:
+            unchanged_artists.append(artist_key(artist_name(album)))
+            unchanged_songs += matched[key]
+        else:
+            needs.append(album)
+    if unchanged_artists:
+        store.note_unchanged_keys(unchanged_artists, len(unchanged_artists), unchanged_songs)
+    store.note_sync_albums(seen_ids)
+    if needs:
+        store.write_wanted_page(items_to_rows(build_catalog(needs, [])))
+        store.queue_albums_for_tracks(
+            [
+                (optional_id(album.get("id")), _artist_id_of(album), album_page_fingerprint(album))
+                for album in needs
+            ]
+        )
+    return len(usable)
+
+
+def _album_for_tracks(item: dict) -> dict:
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    album = dict(payload)
+    album["id"] = item["album_id"]
+    album.setdefault("title", item.get("title") or "Unknown Album")
+    artist = album.get("artist") if isinstance(album.get("artist"), dict) else {}
+    if not artist.get("artistName"):
+        artist = dict(artist)
+        artist["artistName"] = item.get("artist") or "Unknown Artist"
+        album["artist"] = artist
+    if item.get("artist_id") is not None:
+        album["artistId"] = item["artist_id"]
+    return album
+
+
+def _store_tracks(store, item: dict, tracks: list) -> None:
+    album = _album_for_tracks(item)
+    holes = missing_holes(album, tracks)
+    songs = []
+    for hole in holes:
+        song = _song_item(item.get("artist") or artist_name(album), hole)
+        if song is not None:
+            songs.append(song)
+    rows = items_to_rows(songs) if songs else []
+    store.replace_album_songs(item["album_id"], rows, item["fingerprint"])
+
+
+def _drain_track_queue(client, store, should_cancel, on_progress, albums_seen: int) -> bool:
+    """Fetch queued tracks. A failed album stays queued for the next Sync.
+
+    Artists that fail are skipped for the rest of this pass so a downed Lidarr
+    does not retry the same request until the pass ends.
+    """
+    cancelled = False
+    failed_artists: set[int] = set()
+    skip_unassigned = False
+    while True:
+        if should_cancel is not None and should_cancel():
+            cancelled = True
+            break
+        queued = store.next_queued_albums(
+            skip_artists=failed_artists,
+            include_unassigned=not skip_unassigned,
+        )
+        if not queued:
+            break
+        albums = [_album_for_tracks(item) for item in queued]
+        fetched = _fetch_tracks_for_albums(client, albums, should_cancel)
+        for item in queued:
+            tracks = fetched.get(item["album_id"])
+            if tracks is None:
+                if item.get("artist_id") is None:
+                    skip_unassigned = True
+                else:
+                    failed_artists.add(int(item["artist_id"]))
+                continue
+            _store_tracks(store, item, tracks)
+        if on_progress is not None:
+            on_progress(store.wanted_row_count(), albums_seen)
+        if should_cancel is not None and should_cancel():
+            cancelled = True
+            break
+    return cancelled
+
+
 def _load_page(client, batch, should_cancel):
     cancelled = False
     albums: list[dict] = []
@@ -894,65 +1126,75 @@ def sync_wanted_catalog(
 ) -> tuple[int, bool, bool]:
     """Stream Lidarr wanted/missing into the job store, one page at a time.
 
-    Lidarr's wanted/missing API has no changed-since filter, so a resync still
-    walks the list. Unchanged rows are not rewritten. Rows already saved stay
-    visible while later pages are read. Cancel keeps those pages and does not
-    drop anything that was not seen yet. Rows Lidarr no longer returns are
-    removed only after a finished walk proves the key sets differ, which takes
-    a second pass. Returns ``(row_count, exhausted, cancelled)``.
+    Album rows are written as each page arrives. Track requests run in the same
+    sync, after the pages, and only for albums whose wanted/missing fields
+    changed. Titles are not loaded on expand: the song filter and the worker
+    need the missing titles, and album statistics do not name them. A track
+    title edit that does not change those album fields waits until an album
+    field changes. A cancelled or crashed sync continues at the next page, or
+    at the remaining track queue, instead of starting over. A failed track
+    request stays queued. Returns ``(row_count, exhausted, cancelled)``.
     """
-    store.begin_wanted_sync()
+    phase, page = store.prepare_catalog_sync()
     cancelled = False
-    exhausted = False
-    albums_seen = 0
-    pages = 0
-    page = 1
+    exhausted = phase == "tracks"
+    albums_seen = store.wanted_kind_count("album") if phase == "tracks" else 0
     limit = max(1, int(max_pages or 1))
     try:
-        while pages < limit:
-            if should_cancel is not None and should_cancel():
-                cancelled = True
-                break
-            batch, next_page, exhausted = client.wanted_missing(
-                start_page=page,
-                max_pages=1,
-                page_size=page_size,
-                should_cancel=should_cancel,
-            )
-            pages += 1
-            if should_cancel is not None and should_cancel():
-                cancelled = True
-                break
-            if not batch:
-                if not exhausted and should_cancel is not None and should_cancel():
+        if phase != "tracks":
+            pages = 0
+            while pages < limit:
+                if should_cancel is not None and should_cancel():
                     cancelled = True
-                else:
-                    exhausted = True
-                break
-            albums, holes, batch_cancelled = _load_page(client, batch, should_cancel)
-            if batch_cancelled:
-                cancelled = True
-            if albums:
-                albums_seen += _write_loaded_page(store, albums, holes)
+                    break
+                batch, next_page, exhausted = client.wanted_missing(
+                    start_page=page,
+                    max_pages=1,
+                    page_size=page_size,
+                    should_cancel=should_cancel,
+                )
+                pages += 1
+                if should_cancel is not None and should_cancel():
+                    cancelled = True
+                    if batch:
+                        albums_seen += _accept_album_page(store, batch)
+                        if on_progress is not None:
+                            on_progress(store.wanted_row_count(), albums_seen)
+                        if not exhausted:
+                            store.checkpoint_sync_page(next_page if next_page else page + 1)
+                    break
+                if not batch:
+                    if not exhausted and should_cancel is not None and should_cancel():
+                        cancelled = True
+                    else:
+                        exhausted = True
+                    break
+                albums_seen += _accept_album_page(store, batch)
                 if on_progress is not None:
                     on_progress(store.wanted_row_count(), albums_seen)
-            if cancelled or exhausted:
-                break
-            page = next_page if next_page else page + 1
-        count = store.finish_wanted_sync(complete=bool(exhausted) and not cancelled)
-        if getattr(store, "_needs_delete", False) and exhausted and not cancelled:
-            replaced = _delete_unseen(
-                client,
-                store,
-                max_pages=limit,
-                page_size=page_size,
-                should_cancel=should_cancel,
-            )
-            if replaced is None:
-                cancelled_now = should_cancel is not None and should_cancel()
-                return count, not cancelled_now, cancelled_now
-            count = replaced
-        return count, bool(exhausted) and not cancelled, cancelled
+                if exhausted:
+                    break
+                store.checkpoint_sync_page(next_page if next_page else page + 1)
+                page = next_page if next_page else page + 1
+                if should_cancel is not None and should_cancel():
+                    cancelled = True
+                    break
+            if cancelled or not exhausted:
+                count = store.finish_wanted_sync(complete=False)
+                return count, False, cancelled
+            if store.sync_walk_is_full():
+                store.delete_albums_not_seen()
+            store.mark_track_phase()
+        cancelled = _drain_track_queue(client, store, should_cancel, on_progress, albums_seen)
+        if cancelled:
+            count = store.finish_wanted_sync(complete=False)
+            return count, False, True
+        if store.track_queue_pending():
+            count = store.finish_wanted_sync(complete=False)
+            return count, False, False
+        store.mark_sync_done()
+        count = store.finish_wanted_sync(complete=True)
+        return count, True, False
     except Exception:
         try:
             store.finish_wanted_sync(complete=False)

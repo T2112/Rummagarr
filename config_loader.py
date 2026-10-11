@@ -46,6 +46,7 @@ class Config:
     incomplete_max_age_hours: float = 12.0
     ignored_users: set[str] = field(default_factory=set)
     concurrent_albums: int = 1
+    lidarr_track_concurrency: int = 6
     download_timeout_minutes: int = 90
     status_bind: str = "127.0.0.1"
     status_port: int = 8787
@@ -135,6 +136,7 @@ def default_config(**overrides) -> Config:
         incomplete_max_age_hours=float(overrides.pop("incomplete_max_age_hours", 12)),
         ignored_users=set(overrides.pop("ignored_users", set())),
         concurrent_albums=int(overrides.pop("concurrent_albums", 3)),
+        lidarr_track_concurrency=int(overrides.pop("lidarr_track_concurrency", 6)),
         download_timeout_minutes=int(overrides.pop("download_timeout_minutes", 90)),
         status_bind=str(overrides.pop("status_bind", "127.0.0.1")),
         status_port=int(overrides.pop("status_port", 8787)),
@@ -214,6 +216,7 @@ def save_config(path: Path, cfg: Config) -> None:
             "",
             "[runtime]",
             f"concurrent_albums = {int(cfg.concurrent_albums)}",
+            f"lidarr_track_concurrency = {int(cfg.lidarr_track_concurrency)}",
             f"download_timeout_minutes = {int(cfg.download_timeout_minutes)}",
             f"status_bind = {_toml_str(cfg.status_bind)}",
             f"status_port = {int(cfg.status_port)}",
@@ -312,6 +315,7 @@ def try_load_config(path: Path) -> Config:
         incomplete_max_age_hours=float(search.get("incomplete_max_age_hours", 12)),
         ignored_users={u.lower() for u in search.get("ignored_users", []) if u},
         concurrent_albums=int(runtime.get("concurrent_albums", 1)),
+        lidarr_track_concurrency=max(1, min(8, int(runtime.get("lidarr_track_concurrency", 6)))),
         download_timeout_minutes=int(runtime.get("download_timeout_minutes", 90)),
         status_bind=str(runtime.get("status_bind", "127.0.0.1")),
         status_port=int(runtime.get("status_port", 8787)),

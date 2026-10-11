@@ -33,7 +33,6 @@ class JobStore:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = Path(path)
-        self._lock = threading.Lock()
         self._catalog_ready = False
         self._import_choices = False
         self._sync_start = 0
@@ -43,6 +42,7 @@ class JobStore:
         self._sync_artists: set[str] = set()
         self._needs_delete = False
         self._syncing = False
+        self._lock = threading.RLock()
         self._db = sqlite3.connect(self.path, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
@@ -401,7 +401,10 @@ class JobStore:
             changed = [row for row in rows if row["key"] in existing and existing[row["key"]] != row["content_hash"]]
             modes = self._stat_modes_locked()
             for row in fresh:
+                keep = row.pop("keep_choice", None)
                 row["enabled_gen"] = modes.get(row["kind"], (0, 1))[0]
+                if keep is not None:
+                    row["enabled"], row["enabled_gen"] = keep
             if fresh and self._import_choices:
                 self._apply_saved_choices_locked(fresh)
             if fresh:
@@ -435,12 +438,10 @@ class JobStore:
 
     def finish_wanted_sync(self, *, complete: bool) -> int:
         with self._lock:
-            # |seen| == |stored| + |inserted| means every stored key was seen.
-            # inserted counts only new keys, so equality means nothing was removed.
-            # A no-op resync then skips the seen-key table entirely.
-            self._needs_delete = bool(
-                complete and self._sync_streamed != self._sync_start + self._sync_inserted
-            )
+            # Album removal is decided from wanted_sync_seen after a full page
+            # walk. This flag stays clear so a resync does not start a second
+            # Lidarr pass.
+            self._needs_delete = False
             self._sync_artists = set()
             count = self._row_count_locked()
             self._set_meta_locked("wanted_row_count", str(count))
@@ -495,6 +496,345 @@ class JobStore:
             self._db.execute("DROP TABLE IF EXISTS sync_seen")
             self._needs_delete = False
             self._db.commit()
+
+    def prepare_catalog_sync(self) -> tuple[str, int]:
+        """Choose a fresh walk, a resumed page walk, or a resumed track fetch.
+
+        A finished sync starts again at page 1. A cancelled or crashed sync
+        keeps the albums already stored and continues at the next page, or at
+        the track queue when every page was already saved.
+        """
+        with self._lock:
+            phase = self._meta_locked("wanted_sync_phase") or "done"
+            raw_page = self._meta_locked("wanted_sync_next_page") or "1"
+            try:
+                page = max(1, int(raw_page))
+            except ValueError:
+                page = 1
+            if phase == "tracks":
+                self._begin_sync_counters_locked()
+                self._db.commit()
+                return "tracks", page
+            if phase == "pages":
+                self._begin_sync_counters_locked()
+                self._db.commit()
+                return "pages", page
+            self._db.execute("DELETE FROM wanted_sync_seen")
+            self._db.execute("DELETE FROM wanted_track_queue")
+            self._set_meta_locked("wanted_sync_phase", "pages")
+            self._set_meta_locked("wanted_sync_next_page", "1")
+            self._set_meta_locked("wanted_sync_full", "1")
+            self._begin_sync_counters_locked()
+            self._db.commit()
+            return "pages", 1
+
+    def checkpoint_sync_page(self, next_page: int) -> None:
+        with self._lock:
+            self._set_meta_locked("wanted_sync_phase", "pages")
+            self._set_meta_locked("wanted_sync_next_page", str(max(1, int(next_page))))
+            self._db.commit()
+
+    def mark_track_phase(self) -> None:
+        with self._lock:
+            self._set_meta_locked("wanted_sync_phase", "tracks")
+            self._db.commit()
+
+    def mark_sync_done(self) -> None:
+        with self._lock:
+            self._set_meta_locked("wanted_sync_phase", "done")
+            self._set_meta_locked("wanted_sync_next_page", "1")
+            self._db.execute("DELETE FROM wanted_sync_seen")
+            self._db.execute("DELETE FROM wanted_track_queue")
+            self._db.commit()
+
+    def sync_walk_is_full(self) -> bool:
+        with self._lock:
+            return self._meta_locked("wanted_sync_full") == "1"
+
+    def note_sync_albums(self, album_ids: list[int]) -> None:
+        ids = [(int(album_id),) for album_id in album_ids if album_id is not None]
+        if not ids:
+            return
+        with self._lock:
+            self._db.executemany(
+                "INSERT INTO wanted_sync_seen(album_id) VALUES (?) ON CONFLICT(album_id) DO NOTHING",
+                ids,
+            )
+            self._db.commit()
+
+    def queue_albums_for_tracks(self, rows: list[tuple[int, int | None, str]]) -> None:
+        if not rows:
+            return
+        with self._lock:
+            self._db.executemany(
+                """
+                INSERT INTO wanted_track_queue(album_id, artist_id, page_fingerprint)
+                VALUES (?, ?, ?)
+                ON CONFLICT(album_id) DO UPDATE SET
+                    artist_id = excluded.artist_id,
+                    page_fingerprint = excluded.page_fingerprint
+                """,
+                [(int(album_id), artist_id, fingerprint) for album_id, artist_id, fingerprint in rows],
+            )
+            self._db.commit()
+
+    def matching_page_fingerprints(self, fingerprints: dict[str, str]) -> dict[str, int]:
+        """Album keys whose stored wanted/missing fingerprint still matches.
+
+        The value is the number of song rows already stored for that album.
+        """
+        if not fingerprints:
+            return {}
+        found: dict[str, int] = {}
+        with self._lock:
+            for chunk in _chunks(list(fingerprints), 400):
+                marks = ",".join("?" * len(chunk))
+                for key, stored, track_rows in self._db.execute(
+                    f"""
+                    SELECT key, page_fingerprint, track_rows
+                    FROM wanted_rows
+                    WHERE kind = 'album' AND key IN ({marks})
+                    """,
+                    chunk,
+                ):
+                    if stored and stored == fingerprints.get(key):
+                        found[key] = int(track_rows or 0)
+        return found
+
+    def track_queue_pending(self) -> bool:
+        with self._lock:
+            row = self._db.execute("SELECT 1 FROM wanted_track_queue LIMIT 1").fetchone()
+        return row is not None
+
+    def next_queued_albums(
+        self,
+        artist_limit: int = 200,
+        skip_artists: set[int] | None = None,
+        include_unassigned: bool = True,
+    ) -> list[dict]:
+        """Albums waiting for a track lookup, grouped so one artist stays together."""
+        with self._lock:
+            if skip_artists:
+                self._db.execute("CREATE TEMP TABLE IF NOT EXISTS track_skip (artist_id INTEGER PRIMARY KEY)")
+                self._db.execute("DELETE FROM track_skip")
+                self._db.executemany(
+                    "INSERT INTO track_skip(artist_id) VALUES (?)",
+                    [(int(artist_id),) for artist_id in skip_artists],
+                )
+                artist_rows = self._db.execute(
+                    """
+                    SELECT DISTINCT queue.artist_id
+                    FROM wanted_track_queue AS queue
+                    WHERE queue.artist_id IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM track_skip AS skip
+                          WHERE skip.artist_id = queue.artist_id
+                      )
+                    LIMIT ?
+                    """,
+                    (max(1, int(artist_limit)),),
+                ).fetchall()
+            else:
+                artist_rows = self._db.execute(
+                    """
+                    SELECT DISTINCT artist_id FROM wanted_track_queue
+                    WHERE artist_id IS NOT NULL
+                    LIMIT ?
+                    """,
+                    (max(1, int(artist_limit)),),
+                ).fetchall()
+            artist_ids = [row[0] for row in artist_rows]
+            queued: list[tuple] = []
+            if artist_ids:
+                marks = ",".join("?" * len(artist_ids))
+                queued.extend(
+                    self._db.execute(
+                        f"""
+                        SELECT album_id, artist_id, page_fingerprint
+                        FROM wanted_track_queue
+                        WHERE artist_id IN ({marks})
+                        """,
+                        artist_ids,
+                    ).fetchall()
+                )
+            elif include_unassigned:
+                queued.extend(
+                    self._db.execute(
+                        """
+                        SELECT album_id, artist_id, page_fingerprint
+                        FROM wanted_track_queue
+                        WHERE artist_id IS NULL
+                        LIMIT ?
+                        """,
+                        (max(1, int(artist_limit)),),
+                    ).fetchall()
+                )
+            if not queued:
+                return []
+            album_ids = [row[0] for row in queued]
+            stored: dict[int, tuple] = {}
+            for chunk in _chunks(album_ids, 400):
+                marks = ",".join("?" * len(chunk))
+                for album_id, artist, title, payload in self._db.execute(
+                    f"""
+                    SELECT album_id, artist, album, payload
+                    FROM wanted_rows
+                    WHERE kind = 'album' AND album_id IN ({marks})
+                    """,
+                    chunk,
+                ):
+                    stored[int(album_id)] = (artist, title, payload)
+        albums = []
+        for album_id, artist_id, fingerprint in queued:
+            artist, title, payload = stored.get(int(album_id), ("", "", None))
+            albums.append(
+                {
+                    "album_id": int(album_id),
+                    "artist_id": None if artist_id is None else int(artist_id),
+                    "fingerprint": fingerprint,
+                    "artist": artist or "",
+                    "title": title or "",
+                    "payload": _loads(payload),
+                }
+            )
+        return albums
+
+    def replace_album_songs(self, album_id: int, rows: list[dict], fingerprint: str) -> None:
+        """Replace one album's song rows and remember the wanted/missing fingerprint."""
+        with self._lock:
+            modes = self._stat_modes_locked()
+            existing = self._db.execute(
+                """
+                SELECT key, artist_key, enabled, enabled_gen
+                FROM wanted_rows
+                WHERE kind = 'song' AND album_id = ?
+                """,
+                (int(album_id),),
+            ).fetchall()
+            saved = {
+                key: (int(enabled), int(enabled_gen or 0))
+                for key, _token, enabled, enabled_gen in existing
+            }
+            per_artist: dict[str, list[int]] = {}
+            removed_on = 0
+            for _key, token, enabled, enabled_gen in existing:
+                on = _effective(enabled, enabled_gen, "song", modes)
+                slot = per_artist.setdefault(token, [0, 0])
+                slot[0] += 1
+                if on:
+                    removed_on += 1
+                else:
+                    slot[1] += 1
+            if existing:
+                self._db.execute(
+                    "DELETE FROM wanted_rows WHERE kind = 'song' AND album_id = ?",
+                    (int(album_id),),
+                )
+                # These songs were already in the sync's starting total. Drop them
+                # from that base so the inserted replacements are not counted twice.
+                self._sync_start = max(0, int(self._sync_start) - len(existing))
+                self._mark_catalog_locked()
+                self._db.execute(
+                    """
+                    UPDATE wanted_stats
+                    SET total = MAX(0, total - ?), enabled = MAX(0, enabled - ?)
+                    WHERE kind = 'song'
+                    """,
+                    (len(existing), removed_on),
+                )
+                for token, (songs, disabled) in per_artist.items():
+                    self._db.execute(
+                        """
+                        UPDATE wanted_artists SET
+                            songs = MAX(0, songs - ?),
+                            disabled_songs = MAX(0, disabled_songs - ?),
+                            disabled_children = MAX(0, disabled_children - ?)
+                        WHERE artist_key = ?
+                        """,
+                        (songs, disabled, disabled, token),
+                    )
+            for row in rows:
+                previous = saved.get(row["key"])
+                if previous is not None:
+                    row["keep_choice"] = previous
+            if rows:
+                self.write_wanted_page(rows)
+            self._db.execute(
+                """
+                UPDATE wanted_rows
+                SET page_fingerprint = ?, track_rows = ?
+                WHERE kind = 'album' AND album_id = ?
+                """,
+                (fingerprint, len(rows), int(album_id)),
+            )
+            self._db.execute("DELETE FROM wanted_track_queue WHERE album_id = ?", (int(album_id),))
+            token_row = self._db.execute(
+                "SELECT artist_key FROM wanted_rows WHERE kind = 'album' AND album_id = ?",
+                (int(album_id),),
+            ).fetchone()
+            if token_row is not None:
+                self._refresh_artist_details_locked([token_row[0]])
+            self._db.commit()
+
+    def delete_albums_not_seen(self) -> int:
+        """Drop albums missing from a finished page walk. No Lidarr requests."""
+        with self._lock:
+            missing = self._db.execute(
+                """
+                SELECT COUNT(*) FROM wanted_rows AS album
+                WHERE album.kind = 'album'
+                  AND album.album_id IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM wanted_sync_seen AS seen
+                      WHERE seen.album_id = album.album_id
+                  )
+                """
+            ).fetchone()
+            if not missing or int(missing[0]) <= 0:
+                self._db.commit()
+                return 0
+            self._db.execute(
+                """
+                DELETE FROM wanted_rows
+                WHERE kind = 'song' AND album_id IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM wanted_sync_seen AS seen
+                      WHERE seen.album_id = wanted_rows.album_id
+                  )
+                """
+            )
+            self._db.execute(
+                """
+                DELETE FROM wanted_rows
+                WHERE kind = 'album' AND album_id IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM wanted_sync_seen AS seen
+                      WHERE seen.album_id = wanted_rows.album_id
+                  )
+                """
+            )
+            self._db.execute(
+                """
+                DELETE FROM wanted_rows
+                WHERE kind = 'artist'
+                  AND artist_key NOT IN (
+                      SELECT artist_key FROM wanted_rows WHERE kind IN ('album', 'song')
+                  )
+                """
+            )
+            self._rebuild_derived_locked()
+            self._db.commit()
+            return int(missing[0])
+
+    def _begin_sync_counters_locked(self) -> None:
+        self._sync_start = self._row_count_locked()
+        self._sync_inserted = 0
+        self._sync_seen = 0
+        self._sync_streamed = 0
+        self._sync_artists = set()
+        self._needs_delete = False
+        self._import_choices = self._sync_start == 0
+        self._syncing = True
 
     def unchanged_album_keys(self, digests: dict[str, str]) -> set[str]:
         if not digests:
@@ -848,7 +1188,9 @@ class JobStore:
                 track_json TEXT,
                 fold TEXT NOT NULL DEFAULT '',
                 enabled_gen INTEGER NOT NULL DEFAULT 0,
-                sync_digest TEXT
+                sync_digest TEXT,
+                page_fingerprint TEXT,
+                track_rows INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS wanted_artists (
                 artist_key TEXT PRIMARY KEY,
@@ -892,11 +1234,23 @@ class JobStore:
                 ON wanted_artists(sort_artist);
             CREATE INDEX IF NOT EXISTS idx_wanted_artist_fold
                 ON wanted_rows(fold, artist_key) WHERE kind = 'artist';
+            CREATE INDEX IF NOT EXISTS idx_wanted_album_id
+                ON wanted_rows(album_id, kind);
+            CREATE TABLE IF NOT EXISTS wanted_sync_seen (
+                album_id INTEGER PRIMARY KEY
+            );
+            CREATE TABLE IF NOT EXISTS wanted_track_queue (
+                album_id INTEGER PRIMARY KEY,
+                artist_id INTEGER,
+                page_fingerprint TEXT NOT NULL
+            );
             """
         )
         self._add_column("wanted_rows", "enabled_gen", "INTEGER NOT NULL DEFAULT 0")
         self._add_column("wanted_rows", "fold", "TEXT NOT NULL DEFAULT ''")
         self._add_column("wanted_rows", "sync_digest", "TEXT")
+        self._add_column("wanted_rows", "page_fingerprint", "TEXT")
+        self._add_column("wanted_rows", "track_rows", "INTEGER NOT NULL DEFAULT 0")
         self._add_column("wanted_artists", "disabled_albums", "INTEGER NOT NULL DEFAULT 0")
         self._add_column("wanted_artists", "disabled_songs", "INTEGER NOT NULL DEFAULT 0")
         self._add_column("wanted_stats", "generation", "INTEGER NOT NULL DEFAULT 0")

@@ -326,7 +326,11 @@ def stage_album_folder(cfg: Config, artist: str, title: str, year: str | None, t
 class Worker:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self.lidarr = LidarrClient(cfg.lidarr_url, cfg.lidarr_api_key)
+        self.lidarr = LidarrClient(
+            cfg.lidarr_url,
+            cfg.lidarr_api_key,
+            track_concurrency=cfg.lidarr_track_concurrency,
+        )
         self.store = JobStore(cfg.state_db)
         self.client: SoulSeekClient | None = None
         self.active_transfers: list = []
