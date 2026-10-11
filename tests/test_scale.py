@@ -39,6 +39,7 @@ class PageLibrary:
         self.artist_prefix = artist_prefix
         self.calls = 0
         self.renamed: dict[int, str] = {}
+        self.track_titles: dict[int, str] = {}
 
     def album(self, index: int) -> dict:
         album_id = self.id_base + index + 1
@@ -81,7 +82,7 @@ class PageLibrary:
             rows.append(
                 {
                     "id": base + number + 1,
-                    "title": f"Track {number + 1}",
+                    "title": self.track_titles.get(base + number + 1, f"Track {number + 1}"),
                     "monitored": True,
                     "hasFile": partial and number < files,
                     "trackNumber": "A1" if number == 0 else number + 1,
@@ -141,6 +142,13 @@ def test_sync_is_incremental_and_cancel_keeps_saved_rows(tmp_path):
             kinds=("album",), search="Artist 00000", order="album", reverse=False, limit=10, offset=0
         )
         assert any(row[3] == "Renamed" for row in renamed)
+        again.track_titles[1] = "Renamed Track"
+        sync_wanted_catalog(again, store, max_pages=5)
+        songs, _total = store.wanted_page(
+            kinds=("song",), search="Artist 00000", order="song", reverse=False, limit=20, offset=0
+        )
+        assert any(row[4] == "Renamed Track" for row in songs)
+        assert store.wanted_enabled("album:1") is False
 
         seen = {"pages": 0}
 
@@ -251,10 +259,12 @@ def test_keyset_pages_match_offset_and_removed_albums_drop(tmp_path):
         span_count, exhausted, cancelled = sync_wanted_catalog(spanning, store, max_pages=20)
         assert exhausted and not cancelled
         assert store._needs_delete is False
-        again, exhausted, cancelled = sync_wanted_catalog(PageLibrary(300), store, max_pages=20)
+        quiet = PageLibrary(300)
+        again, exhausted, cancelled = sync_wanted_catalog(quiet, store, max_pages=20)
         assert exhausted and not cancelled
         assert again == span_count
         assert store._needs_delete is False
+        assert quiet.calls == 300
 
         shrunk, exhausted, cancelled = sync_wanted_catalog(PageLibrary(2), store, max_pages=20)
         assert exhausted and not cancelled

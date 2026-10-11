@@ -630,6 +630,7 @@ def items_to_rows(items: list[WantedItem]) -> list[dict]:
     from match import normalize
 
     rows = []
+    folds: dict[str, str] = {}
     for item in items:
         token = artist_token(item.artist)
         rank = _KIND_RANK.get(item.kind, 9)
@@ -653,7 +654,10 @@ def items_to_rows(items: list[WantedItem]) -> list[dict]:
             )
         else:
             sort_song = (item.song or "").casefold()
-        fold = normalize(item.artist)
+        fold = folds.get(item.artist)
+        if fold is None:
+            fold = normalize(item.artist)
+            folds[item.artist] = fold
         digest = hashlib.sha1(
             "\n".join(
                 [
@@ -698,10 +702,41 @@ def items_to_rows(items: list[WantedItem]) -> list[dict]:
     return rows
 
 
-def _catalog_rows_for_batch(client, batch, should_cancel) -> tuple[list[dict], bool]:
+def album_sync_digest(album: dict, holes: list[dict]) -> str:
+    """Cheap fingerprint of one album and its missing tracks.
+
+    A resync compares this to the stored value and skips rebuilding rows when
+    nothing that would land in the catalog has changed.
+    """
+    bits = []
+    for hole in holes:
+        track = hole.get("track") or {}
+        bits.append(
+            (
+                optional_id(track.get("id")),
+                track.get("title") or "",
+                "" if track.get("trackNumber") is None else str(track.get("trackNumber")),
+                "" if track.get("mediumNumber") is None else str(track.get("mediumNumber")),
+                1 if track.get("monitored", True) else 0,
+                1 if track.get("hasFile") else 0,
+                hole.get("album_title") or "",
+            )
+        )
+    bits.sort()
+    raw = "\n".join(
+        [
+            _dump(slim_album(album)) or "",
+            artist_name(album),
+            json.dumps(bits, separators=(",", ":"), ensure_ascii=False),
+        ]
+    )
+    return hashlib.sha1(raw.encode()).hexdigest()
+
+
+def _load_page(client, batch, should_cancel):
     cancelled = False
-    page_albums: list[dict] = []
-    page_holes: list[dict] = []
+    albums: list[dict] = []
+    holes: list[dict] = []
     for album in batch:
         if should_cancel is not None and should_cancel():
             cancelled = True
@@ -713,16 +748,89 @@ def _catalog_rows_for_batch(client, batch, should_cancel) -> tuple[list[dict], b
         if album_id is None:
             log.warning("Skipping album %s: no usable id", album.get("title") or "?")
             continue
-        page_albums.append(album)
+        albums.append(album)
         try:
             tracks = client.tracks_for_album(album_id) or []
         except Exception:
             log.exception("Could not read tracks for %s", album.get("title") or album_id)
             tracks = []
-        page_holes.extend(missing_holes(album, tracks))
-    if not page_albums:
-        return [], cancelled
-    return items_to_rows(build_catalog(page_albums, page_holes)), cancelled
+        holes.extend(missing_holes(album, tracks))
+    return albums, holes, cancelled
+
+
+def _page_plan(albums: list[dict], holes: list[dict]):
+    by_album: dict[int, list[dict]] = {}
+    for hole in holes:
+        album_id = optional_id((hole.get("album") or {}).get("id"))
+        if album_id is not None:
+            by_album.setdefault(album_id, []).append(hole)
+    digests: dict[str, str] = {}
+    song_counts: dict[str, int] = {}
+    artists: dict[str, str] = {}
+    for album in albums:
+        album_id = optional_id(album.get("id"))
+        if album_id is None:
+            continue
+        key = album_key(album_id)
+        own = by_album.get(album_id, [])
+        digests[key] = album_sync_digest(album, own)
+        song_counts[key] = len(own)
+        artists[key] = artist_key(artist_name(album))
+    return digests, song_counts, artists
+
+
+def _rows_for_changed(
+    albums: list[dict],
+    holes: list[dict],
+    unchanged: set[str],
+    digests: dict[str, str],
+) -> list[dict]:
+    changed_albums = []
+    changed_ids: set[int] = set()
+    for album in albums:
+        album_id = optional_id(album.get("id"))
+        if album_id is None or album_key(album_id) in unchanged:
+            continue
+        changed_albums.append(album)
+        changed_ids.add(album_id)
+    if not changed_albums:
+        return []
+    changed_holes = [
+        hole for hole in holes if optional_id((hole.get("album") or {}).get("id")) in changed_ids
+    ]
+    rows = items_to_rows(build_catalog(changed_albums, changed_holes))
+    for row in rows:
+        if row["kind"] == "album":
+            row["sync_digest"] = digests.get(row["key"])
+    return rows
+
+
+def _write_loaded_page(store, albums: list[dict], holes: list[dict]) -> int:
+    digests, song_counts, artists = _page_plan(albums, holes)
+    unchanged = store.unchanged_album_keys(digests) if digests else set()
+    if unchanged:
+        store.note_unchanged_keys(
+            [artists[key] for key in unchanged],
+            len(unchanged),
+            sum(song_counts.get(key, 0) for key in unchanged),
+        )
+    rows = _rows_for_changed(albums, holes, unchanged, digests)
+    if rows:
+        store.write_wanted_page(rows)
+    return len(unchanged) + sum(1 for row in rows if row["kind"] == "album")
+
+
+def _note_loaded_page(store, albums: list[dict], holes: list[dict]) -> None:
+    digests, _song_counts, artists = _page_plan(albums, holes)
+    unchanged = store.unchanged_album_keys(digests) if digests else set()
+    if unchanged:
+        store.note_seen_unchanged(
+            [int(key.split(":", 1)[1]) for key in unchanged],
+            [artists[key] for key in unchanged],
+        )
+    rows = _rows_for_changed(albums, holes, unchanged, digests)
+    if rows:
+        store.note_seen_keys([row["key"] for row in rows])
 
 
 def _delete_unseen(client, store, *, max_pages: int, page_size: int, should_cancel) -> int | None:
@@ -754,9 +862,9 @@ def _delete_unseen(client, store, *, max_pages: int, page_size: int, should_canc
             if not batch:
                 exhausted = True
                 break
-            rows, cancelled = _catalog_rows_for_batch(client, batch, should_cancel)
-            if rows:
-                store.note_seen_keys([row["key"] for row in rows])
+            albums, holes, cancelled = _load_page(client, batch, should_cancel)
+            if albums:
+                _note_loaded_page(store, albums, holes)
             if cancelled:
                 store.abort_delete_pass()
                 return None
@@ -821,12 +929,11 @@ def sync_wanted_catalog(
                 else:
                     exhausted = True
                 break
-            rows, batch_cancelled = _catalog_rows_for_batch(client, batch, should_cancel)
+            albums, holes, batch_cancelled = _load_page(client, batch, should_cancel)
             if batch_cancelled:
                 cancelled = True
-            if rows:
-                store.write_wanted_page(rows)
-                albums_seen += sum(1 for row in rows if row["kind"] == "album")
+            if albums:
+                albums_seen += _write_loaded_page(store, albums, holes)
                 if on_progress is not None:
                     on_progress(store.wanted_row_count(), albums_seen)
             if cancelled or exhausted:

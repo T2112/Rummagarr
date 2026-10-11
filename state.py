@@ -410,6 +410,16 @@ class JobStore:
                 self._sync_inserted += len(fresh)
             if changed:
                 self._db.executemany(_UPDATE_WANTED, [_update_tuple(row) for row in changed])
+            digest_rows = [
+                (row.get("sync_digest"), row["key"])
+                for row in rows
+                if row["kind"] == "album" and row.get("sync_digest") and row["key"] in existing
+            ]
+            if digest_rows:
+                self._db.executemany(
+                    "UPDATE wanted_rows SET sync_digest = ? WHERE key = ?",
+                    digest_rows,
+                )
             # Album and song keys are unique. An artist row repeats when that
             # artist spans two Lidarr pages, so count each artist key once.
             streamed = 0
@@ -484,6 +494,60 @@ class JobStore:
         with self._lock:
             self._db.execute("DROP TABLE IF EXISTS sync_seen")
             self._needs_delete = False
+            self._db.commit()
+
+    def unchanged_album_keys(self, digests: dict[str, str]) -> set[str]:
+        if not digests:
+            return set()
+        found: set[str] = set()
+        with self._lock:
+            for chunk in _chunks(list(digests), 400):
+                marks = ",".join("?" * len(chunk))
+                for key, digest in self._db.execute(
+                    f"SELECT key, sync_digest FROM wanted_rows WHERE key IN ({marks})",
+                    chunk,
+                ):
+                    if digest and digest == digests.get(key):
+                        found.add(key)
+        return found
+
+    def note_unchanged_keys(self, artist_keys: list[str], album_count: int, song_count: int) -> None:
+        with self._lock:
+            extra = 0
+            for key in artist_keys:
+                if not key or key in self._sync_artists:
+                    continue
+                self._sync_artists.add(key)
+                extra += 1
+            self._sync_streamed += int(album_count) + int(song_count) + extra
+
+    def note_seen_unchanged(self, album_ids: list[int], artist_keys: list[str]) -> None:
+        if not album_ids and not artist_keys:
+            return
+        with self._lock:
+            for chunk in _chunks(list(album_ids), 400):
+                marks = ",".join("?" * len(chunk))
+                self._db.execute(
+                    f"""
+                    INSERT INTO sync_seen(key)
+                    SELECT key FROM wanted_rows
+                    WHERE album_id IN ({marks}) AND kind IN ('album', 'song')
+                    ON CONFLICT(key) DO NOTHING
+                    """,
+                    chunk,
+                )
+            unique_artists = [key for key in dict.fromkeys(artist_keys) if key]
+            for chunk in _chunks(unique_artists, 400):
+                marks = ",".join("?" * len(chunk))
+                self._db.execute(
+                    f"""
+                    INSERT INTO sync_seen(key)
+                    SELECT key FROM wanted_rows
+                    WHERE key IN ({marks}) AND kind = 'artist'
+                    ON CONFLICT(key) DO NOTHING
+                    """,
+                    chunk,
+                )
             self._db.commit()
 
     def wanted_page(
@@ -783,7 +847,8 @@ class JobStore:
                 payload TEXT,
                 track_json TEXT,
                 fold TEXT NOT NULL DEFAULT '',
-                enabled_gen INTEGER NOT NULL DEFAULT 0
+                enabled_gen INTEGER NOT NULL DEFAULT 0,
+                sync_digest TEXT
             );
             CREATE TABLE IF NOT EXISTS wanted_artists (
                 artist_key TEXT PRIMARY KEY,
@@ -825,10 +890,13 @@ class JobStore:
                 ON wanted_rows(kind, artist_key);
             CREATE INDEX IF NOT EXISTS idx_wanted_artists_sort
                 ON wanted_artists(sort_artist);
+            CREATE INDEX IF NOT EXISTS idx_wanted_artist_fold
+                ON wanted_rows(fold, artist_key) WHERE kind = 'artist';
             """
         )
         self._add_column("wanted_rows", "enabled_gen", "INTEGER NOT NULL DEFAULT 0")
         self._add_column("wanted_rows", "fold", "TEXT NOT NULL DEFAULT ''")
+        self._add_column("wanted_rows", "sync_digest", "TEXT")
         self._add_column("wanted_artists", "disabled_albums", "INTEGER NOT NULL DEFAULT 0")
         self._add_column("wanted_artists", "disabled_songs", "INTEGER NOT NULL DEFAULT 0")
         self._add_column("wanted_stats", "generation", "INTEGER NOT NULL DEFAULT 0")
@@ -1071,7 +1139,10 @@ class JobStore:
         if not term:
             return "", []
         return (
-            "artist_key IN (SELECT artist_key FROM wanted_rows WHERE kind = 'artist' AND instr(fold, ?) > 0)",
+            "artist_key IN ("
+            "SELECT artist_key FROM wanted_rows INDEXED BY idx_wanted_artist_fold "
+            "WHERE kind = 'artist' AND instr(fold, ?) > 0"
+            ")",
             [term],
         )
 
@@ -1367,9 +1438,9 @@ _ALLOWED_COLUMNS = {name for columns in _ORDER_COLUMNS.values() for name in colu
 _INSERT_WANTED = """
 INSERT INTO wanted_rows(
     key, kind, artist, artist_key, album, song, album_id, track_id, detail, enabled,
-    sort_artist, sort_album, sort_song, kind_rank, content_hash, payload, track_json, fold,
-    enabled_gen
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    sort_artist, sort_album, sort_song, kind_rank,     content_hash, payload, track_json, fold,
+    enabled_gen, sync_digest
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _UPDATE_WANTED = """
@@ -1402,6 +1473,7 @@ def _row_tuple(row: dict) -> tuple:
         row.get("track_json"),
         row.get("fold") or "",
         int(row.get("enabled_gen") or 0),
+        row.get("sync_digest"),
     )
 
 
