@@ -24,9 +24,11 @@ from aioslsk.settings import (
 )
 from aioslsk.shares.model import DirectoryShareMode
 
+from activity import Step, describe_step, format_elapsed, step_from_legacy
 from config_loader import Config
 from control import WorkerControl
 from lidarr_client import LidarrClient
+from search_model import file_from_share, result_count
 from status_ui import normalize_recent_limit, start_status_ui
 from wanted import (
     WantedCatalog,
@@ -334,7 +336,12 @@ class Worker:
         self.store = JobStore(cfg.state_db)
         self.client: SoulSeekClient | None = None
         self.active_transfers: list = []
+        self.manual_transfers: list = []
+        self.manual_states: dict[str, str] = {}
+        self._manual_lock = threading.Lock()
+        self._search_lock: asyncio.Lock | None = None
         self.job_info: dict = {"phase": "idle", "artist": "", "title": ""}
+        self.step = Step(kind="idle", started=time.monotonic())
         self.cancel_requested = False
         self._ui = None
         self.control = WorkerControl()
@@ -409,11 +416,107 @@ class Worker:
 
     def set_job(self, phase: str, artist: str = "", title: str = "") -> None:
         self.job_info = {"phase": phase, "artist": artist, "title": title}
+        self.step = step_from_legacy(phase, artist, title)
+
+    def set_step(self, step: Step) -> None:
+        previous = self.step
+        same = (
+            previous.kind == step.kind
+            and previous.artist == step.artist
+            and previous.album == step.album
+            and previous.title == step.title
+            and previous.query_index == step.query_index
+            and previous.username == step.username
+        )
+        if same and previous.started:
+            step.started = previous.started
+        elif not step.started:
+            step.started = time.monotonic()
+        self.step = step
+        title = step.detail if step.kind == "error" else (step.album or step.title)
+        self.job_info = {"phase": step.kind, "artist": step.artist, "title": title}
+
+    def activity_view(self) -> tuple[str, int, bool]:
+        step = self.step
+        elapsed = int(max(0.0, time.monotonic() - step.started)) if step.started else 0
+        if self.control.is_stopped():
+            if step.kind == "error":
+                return describe_step(step), 0, False
+            return "Stopped", 0, False
+        text = describe_step(step)
+        active = step.kind not in {"idle", "stopped", "error"}
+        busy = active and not self.control.is_paused()
+        show_elapsed = active and step.kind not in {"waiting", "retry"}
+        return text, elapsed if show_elapsed else 0, busy
+
+    def manual_state(self, file_id: str) -> str:
+        with self._manual_lock:
+            return self.manual_states.get(file_id, "")
+
+    def _set_manual_state(self, file_id: str, state: str) -> None:
+        with self._manual_lock:
+            self.manual_states[file_id] = state
+
+    def _search_slot(self) -> asyncio.Lock:
+        if self._search_lock is None:
+            self._search_lock = asyncio.Lock()
+        return self._search_lock
+
+    async def _send_search(self, query: str):
+        """One search on the shared Soulseek session.
+
+        The lock only covers sending the request. Waiting for results, and
+        downloads, keep going so a manual search does not freeze the worker.
+        """
+        assert self.client is not None
+        async with self._search_slot():
+            return await self.client.searches.search(query)
+
+    async def begin_manual_search(self, query: str):
+        if not await self.ensure_soulseek():
+            raise RuntimeError("Start the worker to search. Search uses that Soulseek login.")
+        return await self._send_search(query)
+
+    async def _await_results(
+        self,
+        request,
+        key: str | None,
+        seconds: float,
+        artist: str,
+        album: str,
+        query_index: int,
+        query_total: int,
+    ) -> str:
+        started = time.monotonic()
+        while True:
+            waited = int(time.monotonic() - started)
+            self.set_step(
+                Step(
+                    kind="waiting",
+                    artist=artist,
+                    album=album,
+                    query_index=query_index,
+                    query_total=query_total,
+                    result_count=result_count(request),
+                    waited_seconds=waited,
+                )
+            )
+            remaining = float(seconds) - (time.monotonic() - started)
+            if remaining <= 0:
+                return "ok"
+            signal = await self.control.gate(key, sleep=min(1.0, remaining))
+            if signal != "ok":
+                return signal
 
     def ui_snapshot(self, recent_limit: int = 10) -> dict:
         limit = normalize_recent_limit(recent_limit)
         transfers = []
-        for item in list(self.active_transfers):
+        seen: set[int] = set()
+        for item in list(self.active_transfers) + list(self.manual_transfers):
+            marker = id(item)
+            if marker in seen:
+                continue
+            seen.add(marker)
             transfers.append(
                 {
                     "filename": transfer_filename(item),
@@ -422,9 +525,14 @@ class Worker:
                     "percent": transfer_percent(item),
                 }
             )
+        activity, elapsed, busy = self.activity_view()
         return {
             "logged_in": self.soulseek_logged_in(),
             "job": dict(self.job_info),
+            "activity": activity,
+            "elapsed": elapsed,
+            "elapsed_text": format_elapsed(elapsed) if elapsed else "",
+            "busy": busy,
             "transfers": transfers,
             "recent": self.store.recent_completed_downloads(limit),
             "cancel_requested": self.cancel_requested,
@@ -541,6 +649,7 @@ class Worker:
         if self.control.is_stopped():
             return
         self._loop = asyncio.get_running_loop()
+        self.set_step(Step(kind="connecting"))
         try:
             status = self.lidarr.ping()
             log.info("Lidarr OK: %s", status.get("version") or status.get("appName") or "connected")
@@ -556,7 +665,9 @@ class Worker:
                 except Exception:
                     log.exception("Cycle failed")
                 if self.control.is_stopped():
+                    self.set_step(Step(kind="stopped"))
                     break
+                self._note_between_passes()
                 signal = await self.control.gate(sleep=self.cfg.cycle_seconds)
                 if signal == "stop":
                     break
@@ -692,9 +803,83 @@ class Worker:
             truly_missing.append(album)
         return truly_missing
 
+    def _soonest_cooldown_seconds(self) -> int | None:
+        now = datetime.now(timezone.utc)
+        best: int | None = None
+        for until in self.store.artist_cooldowns().values():
+            try:
+                stamp = datetime.fromisoformat(str(until))
+            except ValueError:
+                continue
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            delta = int((stamp - now).total_seconds())
+            if delta > 0:
+                best = delta if best is None else min(best, delta)
+        return best
+
+    def _cooled_artist_keys(self) -> set[str]:
+        now = datetime.now(timezone.utc)
+        cooldowns = self.store.artist_cooldowns()
+        return {
+            "artist:" + name
+            for name in cooldowns
+            if self._cooled(name, cooldowns, now)
+        }
+
+    def _has_enabled_wanted(self) -> bool:
+        if self.store.wanted_catalog_ready():
+            return self.store.next_wanted_artist(set()) is not None
+        if self.catalog.synced:
+            choices = self.store.wanted_choices()
+            return any(self.catalog.has_enabled_work(name, choices) for name in self.catalog.artist_labels())
+        return False
+
+    def _next_ready_artist(self) -> str | None:
+        if self.store.wanted_catalog_ready():
+            return self.store.next_wanted_artist(self._cooled_artist_keys())
+        if self.catalog.synced:
+            choices = self.store.wanted_choices()
+            cooldowns = self.store.artist_cooldowns()
+            now = datetime.now(timezone.utc)
+            for name in self.catalog.artist_labels():
+                if self._cooled(name, cooldowns, now):
+                    continue
+                if self.catalog.has_enabled_work(name, choices):
+                    return name
+        return None
+
+    def _note_nothing_ready(self) -> None:
+        if self._has_enabled_wanted():
+            wait = self._soonest_cooldown_seconds() or int(self.cfg.cycle_seconds or 0)
+            self.set_step(Step(kind="retry", retry_seconds=wait))
+            return
+        if self.store.wanted_catalog_ready() or self.catalog.synced:
+            self.set_step(Step(kind="idle"))
+            return
+        wait = self._soonest_cooldown_seconds()
+        if wait:
+            self.set_step(Step(kind="retry", retry_seconds=wait))
+        else:
+            self.set_step(Step(kind="idle"))
+
+    def _note_between_passes(self) -> None:
+        if self.control.is_stopped():
+            self.set_step(Step(kind="stopped"))
+            return
+        if (self.store.wanted_catalog_ready() or self.catalog.synced) and not self._has_enabled_wanted():
+            self.set_step(Step(kind="idle"))
+            return
+        wait = self._soonest_cooldown_seconds()
+        pause = int(self.cfg.cycle_seconds or 0)
+        if wait and not self._next_ready_artist():
+            pause = wait
+        self.set_step(Step(kind="retry", retry_seconds=max(0, pause)))
+
     async def cycle(self) -> None:
         if self.control.is_stopped():
             return
+        self.set_step(Step(kind="preparing"))
         # A Sync stores the wanted list in SQLite. Until that happens, keep
         # reading Lidarr 20 pages at a time and resume next cycle.
         if self.store.wanted_catalog_ready():
@@ -702,6 +887,7 @@ class Worker:
             focus = self.choose_focus_artist([], [])
             if not focus:
                 log.info("No artist ready (all cooled off or nothing missing)")
+                self._note_nothing_ready()
                 self.sweep_incomplete_folder()
                 return
             artist_albums, artist_holes = self.store.artist_work(focus)
@@ -722,6 +908,7 @@ class Worker:
             focus = self.choose_focus_artist([], [])
             if not focus:
                 log.info("No artist ready (all cooled off or nothing missing)")
+                self._note_nothing_ready()
                 self.sweep_incomplete_folder()
                 return
             choices = self.store.wanted_choices()
@@ -755,6 +942,7 @@ class Worker:
             focus = self.choose_focus_artist(catalog, [])
             if not focus:
                 log.info("No artist ready (all cooled off or nothing missing)")
+                self._note_nothing_ready()
                 self.sweep_incomplete_folder()
                 return
             missing, api_holes = self._work_for_artist(focus, catalog, include_tracks=True)
@@ -769,6 +957,7 @@ class Worker:
         if not missing and not holes:
             log.info("Artist %s has no checked items; moving on without a cooldown", focus)
             self.store.set_focus_artist(None)
+            self._note_between_passes()
             self.sweep_incomplete_folder()
             return
         log.info("Artist %s: %s empty albums, %s partial tracks", focus, len(missing), len(holes))
@@ -794,24 +983,24 @@ class Worker:
                 if self.control.is_stopped():
                     return
                 self.store.upsert(album_id, artist, title, "searching")
-                self.set_job("searching album", artist, title)
+                self.set_step(Step(kind="searching", artist=artist, album=title))
                 ok = await self.process_album(album)
                 if not ok:
                     log.info("No usable result yet for %s - %s", artist, title)
 
         if batch:
             await asyncio.gather(*(run_one(album) for album in batch), return_exceptions=True)
-        self.set_job("idle")
         if self.control.is_stopped():
-            self.set_job("stopped")
+            self.set_step(Step(kind="stopped"))
             return
         if self.cfg.fill_missing_tracks and holes:
             await self.cycle_tracks(holes)
         if self.control.is_stopped():
-            self.set_job("stopped")
+            self.set_step(Step(kind="stopped"))
             return
         self._finish_artist_visit(focus)
         self.sweep_incomplete_folder()
+        self._note_between_passes()
 
     async def cycle_tracks(self, holes: list[dict] | None = None) -> None:
         if holes is None:
@@ -858,9 +1047,8 @@ class Worker:
                 if self.store.should_skip_track(track_id, self.cfg.retry_hours):
                     continue
                 self.store.upsert_track(track_id, album_id, artist, title, "searching")
-                self.set_job("searching track", artist, title)
+                self.set_step(Step(kind="searching", artist=artist, title=title, album=album_title))
                 ok = await self.process_track(hole)
-                self.set_job("idle")
                 processed += 1
                 if not ok:
                     log.info("No usable track yet for %s - %s - %s", artist, album_title, title)
@@ -896,13 +1084,25 @@ class Worker:
         best_item = None
         best_user = ""
         best_score = 0.0
-        for query in queries:
+        for index, query in enumerate(queries, start=1):
             signal = await self.control.gate(key)
             if signal != "ok":
                 self._mark_track(hole, signal)
                 return False
-            request = await self.client.searches.search(query)
-            signal = await self.control.gate(key, sleep=self.cfg.search_wait_seconds)
+            self.set_step(
+                Step(
+                    kind="searching",
+                    artist=artist,
+                    album=album_title,
+                    title=title,
+                    query_index=index,
+                    query_total=len(queries),
+                )
+            )
+            request = await self._send_search(query)
+            signal = await self._await_results(
+                request, key, self.cfg.search_wait_seconds, artist, album_title, index, len(queries)
+            )
             if signal != "ok":
                 try:
                     self.client.searches.remove_request(request)
@@ -910,6 +1110,17 @@ class Worker:
                     pass
                 self._mark_track(hole, signal)
                 return False
+            self.set_step(
+                Step(
+                    kind="matching",
+                    artist=artist,
+                    album=album_title,
+                    title=title,
+                    query_index=index,
+                    query_total=len(queries),
+                    result_count=result_count(request),
+                )
+            )
             for result in request.results:
                 username = getattr(result, "username", "") or ""
                 if username.lower() in self.cfg.ignored_users:
@@ -951,7 +1162,7 @@ class Worker:
         )
         self.store.upsert_track(track_id, album_id, artist, title, "downloading", best_user)
         self.cancel_requested = False
-        self.set_job("downloading track", artist, title)
+        self.set_step(Step(kind="queued", artist=artist, album=album_title, title=title, file_total=1, username=best_user))
         signal = await self.control.gate(key)
         if signal != "ok":
             self._mark_track(hole, signal)
@@ -966,6 +1177,17 @@ class Worker:
             if self.cancel_requested:
                 await abort_transfer(self.client, transfer)
                 break
+            self.set_step(
+                Step(
+                    kind="downloading",
+                    artist=artist,
+                    album=album_title,
+                    title=title,
+                    file_index=1,
+                    file_total=1,
+                    username=best_user,
+                )
+            )
             log.info("Track download %s: %s", title, name or "waiting")
             self.remember_completed([transfer], artist, title, "track")
             signal = await self.control.gate(key, sleep=2, deadline=deadline)
@@ -1044,13 +1266,18 @@ class Worker:
         log.info("Searching: %s", " | ".join(queries))
 
         best = None
-        for query in queries:
+        for index, query in enumerate(queries, start=1):
             signal = await self.control.gate(key)
             if signal != "ok":
                 self._mark_album(album_id, artist, title, signal)
                 return False
-            request = await self.client.searches.search(query)
-            signal = await self.control.gate(key, sleep=self.cfg.search_wait_seconds)
+            self.set_step(
+                Step(kind="searching", artist=artist, album=title, query_index=index, query_total=len(queries))
+            )
+            request = await self._send_search(query)
+            signal = await self._await_results(
+                request, key, self.cfg.search_wait_seconds, artist, title, index, len(queries)
+            )
             if signal != "ok":
                 try:
                     self.client.searches.remove_request(request)
@@ -1058,6 +1285,16 @@ class Worker:
                     pass
                 self._mark_album(album_id, artist, title, signal)
                 return False
+            self.set_step(
+                Step(
+                    kind="matching",
+                    artist=artist,
+                    album=title,
+                    query_index=index,
+                    query_total=len(queries),
+                    result_count=result_count(request),
+                )
+            )
             folders = group_results(request.results, self.cfg.ignored_users)
             for folder in folders:
                 scored = score_folder(
@@ -1094,7 +1331,9 @@ class Worker:
         )
         self.store.upsert(album_id, artist, title, "downloading", best.username)
         self.cancel_requested = False
-        self.set_job("downloading album", artist, title)
+        self.set_step(
+            Step(kind="queued", artist=artist, album=title, file_total=len(best.files), username=best.username)
+        )
         transfers = []
         for item in best.files:
             signal = await self.control.gate(key)
@@ -1104,6 +1343,16 @@ class Worker:
                 return False
             transfer = await self.client.transfers.download(best.username, item.filename)
             transfers.append(transfer)
+            self.set_step(
+                Step(
+                    kind="queued",
+                    artist=artist,
+                    album=title,
+                    file_index=len(transfers),
+                    file_total=len(best.files),
+                    username=best.username,
+                )
+            )
             if self.cancel_requested:
                 break
         self.active_transfers = transfers
@@ -1118,7 +1367,14 @@ class Worker:
                 if state_name(transfer) != "COMPLETE":
                     continue
                 staged.add(id(transfer))
-                self.set_job("converting", artist, Path(getattr(transfer, "local_path", "") or "").name)
+                self.set_step(
+                    Step(
+                        kind="converting",
+                        artist=artist,
+                        album=title,
+                        detail=Path(getattr(transfer, "local_path", "") or "").name,
+                    )
+                )
                 src = await asyncio.to_thread(stage_one_file, self.cfg, dest, transfer)
                 if src is not None:
                     sources.append(src)
@@ -1136,6 +1392,16 @@ class Worker:
                         await abort_transfer(self.client, t)
                 break
             complete = sum(1 for n in names if n == "COMPLETE")
+            self.set_step(
+                Step(
+                    kind="downloading",
+                    artist=artist,
+                    album=title,
+                    file_index=min(len(transfers), complete + (0 if complete == len(transfers) else 1)),
+                    file_total=len(transfers),
+                    username=best.username,
+                )
+            )
             log.info("Download progress %s/%s complete", complete, len(transfers))
             self.remember_completed(transfers, artist, title, "album")
             signal = await self.control.gate(key, sleep=2, deadline=deadline)
@@ -1186,3 +1452,125 @@ class Worker:
         self.store.upsert(album_id, artist, title, "imported", str(folder))
         log.info("Asked Lidarr to import %s", folder)
         return True
+
+    async def download_manual(self, specs: list[dict], link: dict | None = None) -> str:
+        """Queue files from a manual search through the same download and import path.
+
+        Manual searches share the worker's Soulseek login. This does not pause
+        the worker's own searches; it only adds transfers on that connection.
+        """
+        if not specs:
+            return ""
+        if not await self.ensure_soulseek():
+            raise RuntimeError("Start the worker to download. Downloads use that Soulseek connection.")
+        assert self.client is not None
+        link = link or {}
+        artist = str(link.get("artist") or "Manual")
+        album = str(link.get("album") or "")
+        title = str(link.get("title") or album or "Manual")
+        folder_title = album or title or "Manual"
+        username = str(specs[0].get("username") or "")
+        announce = self.step.kind not in {"searching", "waiting", "matching", "downloading", "converting", "queued"}
+        if announce:
+            self.set_step(
+                Step(kind="queued", artist=artist, album=folder_title, file_total=len(specs), username=username)
+            )
+        paired: list[tuple[str, object]] = []
+        for spec in specs:
+            file_id = str(spec.get("id") or "")
+            self._set_manual_state(file_id, "queued")
+            transfer = await self.client.transfers.download(str(spec["username"]), str(spec["filename"]))
+            paired.append((file_id, transfer))
+            self.manual_transfers.append(transfer)
+            self._set_manual_state(file_id, "downloading")
+        if announce:
+            self.set_step(
+                Step(
+                    kind="downloading",
+                    artist=artist,
+                    album=folder_title,
+                    file_index=1,
+                    file_total=len(paired),
+                    username=username,
+                )
+            )
+        deadline = time.monotonic() + max(30, int(self.cfg.download_timeout_minutes or 1) * 60)
+        while time.monotonic() < deadline:
+            names = [state_name(item) for _, item in paired]
+            if names and all(name in {"COMPLETE", "FAILED", "ABORTED"} for name in names):
+                break
+            if self.control.is_stopped():
+                for _, transfer in paired:
+                    if state_name(transfer) not in {"COMPLETE", "FAILED", "ABORTED"}:
+                        await abort_transfer(self.client, transfer)
+                break
+            done = sum(1 for name in names if name == "COMPLETE")
+            if announce and self.step.kind in {"queued", "downloading"}:
+                self.set_step(
+                    Step(
+                        kind="downloading",
+                        artist=artist,
+                        album=folder_title,
+                        file_index=min(len(paired), done + (0 if done == len(paired) else 1)),
+                        file_total=len(paired),
+                        username=username,
+                    )
+                )
+            await asyncio.sleep(0.4)
+        transfers = [item for _, item in paired]
+        self.remember_completed(transfers, artist, title, "manual")
+        finished = {id(item) for item in transfers}
+        self.manual_transfers = [item for item in self.manual_transfers if id(item) not in finished or state_name(item) not in {"COMPLETE", "FAILED", "ABORTED"}]
+        dest = album_dest_folder(self.cfg, artist, folder_title, None)
+        for _, transfer in paired:
+            if state_name(transfer) == "COMPLETE":
+                await asyncio.to_thread(stage_one_file, self.cfg, dest, transfer)
+        complete = [item for _, item in paired if state_name(item) == "COMPLETE"]
+        if complete:
+            scan_path = str(Path(self.cfg.lidarr_scan_path) / dest.name)
+            try:
+                self.lidarr.scan_downloaded(scan_path)
+            except Exception:
+                log.exception("Lidarr scan failed for %s; trying the staged folder", scan_path)
+                try:
+                    self.lidarr.scan_downloaded(str(dest))
+                except Exception:
+                    log.exception("Lidarr scan failed for manual download %s", dest)
+        for file_id, transfer in paired:
+            self._set_manual_state(file_id, "downloaded" if state_name(transfer) == "COMPLETE" else "failed")
+        if announce and self.step.kind in {"queued", "downloading", "converting"} and not self.control.is_stopped():
+            self._note_between_passes()
+        return str(dest)
+
+    async def browse_folder(self, username: str, directory: str) -> list[dict]:
+        """List one folder on a peer. One request, no second Soulseek login."""
+        from aioslsk.commands import PeerGetDirectoryContentCommand
+
+        if not self.soulseek_logged_in():
+            raise RuntimeError("Soulseek is not connected")
+        assert self.client is not None
+        directories = await self.client.execute(
+            PeerGetDirectoryContentCommand(username, directory),
+            response=True,
+            timeout=15,
+        )
+        records = []
+        for entry in directories or []:
+            folder = str(getattr(entry, "name", "") or directory)
+            for item in list(getattr(entry, "files", None) or []):
+                record = file_from_share(username, item, folder=folder)
+                records.append(
+                    {
+                        "username": record.username,
+                        "filename": record.filename,
+                        "folder": record.folder or folder,
+                        "size": record.size,
+                        "bitrate": record.bitrate,
+                        "duration": record.duration,
+                        "extension": record.extension,
+                        "free_slot": record.free_slot,
+                        "speed": record.speed,
+                        "queue": record.queue,
+                    }
+                )
+        return records

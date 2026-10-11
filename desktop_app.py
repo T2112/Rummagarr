@@ -10,11 +10,12 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
-from dataclasses import dataclass, fields as dataclass_fields, replace
+from dataclasses import dataclass, field, fields as dataclass_fields, replace
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from activity import format_status_line
 from config_loader import (
     Config,
     ConfigError,
@@ -40,6 +41,23 @@ from updater import (
     wait_for_worker_stop,
 )
 from match import normalize
+from search_model import (
+    SearchFile,
+    SearchFilters,
+    SearchLink,
+    choose_downloads,
+    display_name,
+    display_rows,
+    file_spec,
+    files_from_results,
+    format_duration,
+    format_size,
+    format_slot,
+    format_speed,
+    link_from_wanted,
+    manual_query,
+    state_label,
+)
 from wanted import (
     VIEW_ALBUMS,
     VIEW_ARTISTS,
@@ -155,19 +173,15 @@ def apply_theme(root: tk.Misc) -> None:
     root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
 
 
-def format_status_line(snapshot: dict) -> str:
-    labels = {"running": "Running", "paused": "Paused", "stopped": "Stopped"}
-    state = labels.get(snapshot.get("run_state") or "stopped", "Stopped")
-    job = snapshot.get("job") or {}
-    parts = [
-        state,
-        "Soulseek connected" if snapshot.get("logged_in") else "Soulseek offline",
-        job.get("phase") or "idle",
-    ]
-    who = " — ".join(part for part in ((job.get("artist") or ""), (job.get("title") or "")) if part)
-    if who:
-        parts.append(who)
-    return " · ".join(parts)
+def _merge_files(existing: list[SearchFile], extra: list[SearchFile]) -> list[SearchFile]:
+    seen = {item.id for item in existing}
+    merged = list(existing)
+    for item in extra:
+        if item.id in seen or not item.filename:
+            continue
+        seen.add(item.id)
+        merged.append(item)
+    return merged
 
 
 def format_progress(percent) -> str:
@@ -802,6 +816,28 @@ class DownloadProgress(tk.Toplevel):
         self.label_var.set(f"Downloaded {format_bytes(done)}")
 
 
+@dataclass
+class SearchBoard:
+    query: str
+    link: SearchLink | None = None
+    files: list[SearchFile] = field(default_factory=list)
+    filters: SearchFilters = field(default_factory=SearchFilters)
+    sort_column: str = ""
+    sort_reverse: bool = False
+    closed: bool = False
+    running: bool = False
+    frame: ttk.Frame | None = None
+    tree: ttk.Treeview | None = None
+    status: tk.StringVar | None = None
+    filter_var: tk.StringVar | None = None
+    flac_var: tk.IntVar | None = None
+    mp3_var: tk.IntVar | None = None
+    bitrate_var: tk.StringVar | None = None
+    free_var: tk.IntVar | None = None
+    row_files: dict[str, SearchFile] = field(default_factory=dict)
+    row_users: dict[str, str] = field(default_factory=dict)
+
+
 class DesktopApp(tk.Tk):
     def __init__(
         self,
@@ -877,10 +913,15 @@ class DesktopApp(tk.Tk):
         self.notebook.pack(fill="both", expand=True, padx=12, pady=12)
         self.status_tab = ttk.Frame(self.notebook, padding=12)
         self.wanted_tab = ttk.Frame(self.notebook, padding=12)
+        self.search_tab = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(self.status_tab, text="Status")
         self.notebook.add(self.wanted_tab, text="Wanted")
+        self.notebook.add(self.search_tab, text="Search")
+        self._boards: list[SearchBoard] = []
+        self._search_menu: tk.Menu | None = None
         self._build_status(self.status_tab)
         self._build_wanted(self.wanted_tab)
+        self._build_search(self.search_tab)
 
     def _build_menu(self) -> None:
         menu = tk.Menu(self, tearoff=0)
@@ -914,8 +955,13 @@ class DesktopApp(tk.Tk):
         self.cancel_all_btn.pack(side="right")
         self.refresh_btn.pack(side="right", padx=(0, 8))
 
-        self.status_line = ttk.Label(parent, text="Stopped · Soulseek offline · idle", style="Muted.TLabel")
-        self.status_line.pack(fill="x", pady=(10, 0))
+        status_row = ttk.Frame(parent)
+        status_row.pack(fill="x", pady=(10, 0))
+        self.activity_dot = tk.Canvas(status_row, width=14, height=14, highlightthickness=0, bg="#111111")
+        self.activity_dot.pack(side="left", padx=(0, 8))
+        self._pulse_on = False
+        self.status_line = ttk.Label(status_row, text="Stopped · Soulseek offline · Stopped", style="Muted.TLabel")
+        self.status_line.pack(side="left", fill="x", expand=True)
         self.notice_line = ttk.Label(parent, textvariable=self.notice_var, style="Muted.TLabel")
         self.notice_line.pack(fill="x", pady=(2, 0))
 
@@ -1005,9 +1051,12 @@ class DesktopApp(tk.Tk):
             ("album", "Album", 220, True),
             ("song", "Song", 200, True),
             ("detail", "Detail", 180, True),
+            ("find", "", 36, False),
         )
         names = [column[0] for column in columns]
         self._check_images = {state: self._checkbox_image(state) for state in ("on", "off", "mixed")}
+        self._finder_image = self._magnifier_image()
+        self._finder_labels: list[tk.Label] = []
         self.wanted = ttk.Treeview(frame, columns=names, show="tree headings", selectmode="browse")
         self.wanted_scroll = ttk.Scrollbar(frame, orient="vertical", command=self._wanted_scroll)
         self.wanted.grid(row=0, column=0, sticky="nsew")
@@ -1017,6 +1066,10 @@ class DesktopApp(tk.Tk):
         self.wanted.column("#0", width=44, minwidth=44, stretch=False, anchor="center")
         self.wanted.heading("#0", text="")
         for name, heading, width, stretch in columns:
+            if name == "find":
+                self.wanted.heading(name, text="")
+                self.wanted.column(name, width=width, minwidth=width, stretch=False, anchor="center")
+                continue
             self.wanted.heading(name, text=heading, command=lambda column=name: self.on_wanted_sort(column))
             self.wanted.column(name, width=width, minwidth=40, anchor="w", stretch=stretch)
         frame.pack(fill="both", expand=True)
@@ -1028,6 +1081,7 @@ class DesktopApp(tk.Tk):
         self.wanted.bind("<Up>", self._wanted_key)
         self.wanted.bind("<Down>", self._wanted_key)
         self.wanted.bind("<Configure>", self._wanted_resized)
+        self.wanted.bind("<Configure>", lambda _event: self._place_finders(), add="+")
 
     def _tick(self) -> None:
         if self._shutting_down:
@@ -1157,6 +1211,8 @@ class DesktopApp(tk.Tk):
         limit = normalize_recent_limit(self.limit_var.get())
         snapshot = self.worker.ui_snapshot(recent_limit=limit)
         self.status_line.configure(text=format_status_line(snapshot))
+        self._paint_activity_dot(bool(snapshot.get("busy")))
+        self._refresh_open_search_states()
         state = snapshot.get("run_state") or "stopped"
         self._set_button(self.start_btn, state == "stopped")
         self._set_button(self.pause_btn, state in {"running", "paused"})
@@ -1340,6 +1396,11 @@ class DesktopApp(tk.Tk):
         if not row or row not in self._row_items:
             return
         column = str(self.wanted.identify_column(event.x))
+        if column and self.wanted.column(column, "id") == "find":
+            self.wanted.selection_set(row)
+            self.wanted.focus(row)
+            self.search_wanted_row(row)
+            return "break"
         if region != "tree" and column != "#0":
             return
         self.wanted.selection_set(row)
@@ -1578,6 +1639,523 @@ class DesktopApp(tk.Tk):
         if not str(self.wanted_status.get()).startswith("Saving "):
             self.wanted_status.set(f"{checked:,} of {view_total:,} selected in this view.")
 
+    def _paint_activity_dot(self, busy: bool) -> None:
+        if not getattr(self, "activity_dot", None):
+            return
+        self.activity_dot.delete("all")
+        if busy:
+            self._pulse_on = not self._pulse_on
+            color = "#3d8bfd" if self._pulse_on else "#8cbcff"
+        else:
+            self._pulse_on = False
+            color = "#555555"
+        self.activity_dot.create_oval(2, 2, 12, 12, fill=color, outline=color)
+
+    def _magnifier_image(self) -> tk.PhotoImage:
+        """A drawn glass, so the Wanted column does not depend on a Unicode font."""
+        size = 16
+        image = tk.PhotoImage(master=self, width=size, height=size)
+        image.put("#1c1c1c", to=(0, 0, size, size))
+        glass = "#d5d5d5"
+        for y in range(size):
+            for x in range(size):
+                distance = (x - 6) ** 2 + (y - 6) ** 2
+                if 10 <= distance <= 18:
+                    image.put(glass, to=(x, y, x + 1, y + 1))
+        for offset in range(5):
+            image.put(glass, to=(9 + offset, 9 + offset, 11 + offset, 11 + offset))
+        return image
+
+    def _place_finders(self) -> None:
+        """One magnifier per visible row. The catalog itself is not walked."""
+        if not getattr(self, "wanted", None):
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        rows = [iid for iid in self.wanted.get_children() if iid in self._row_items]
+        while len(self._finder_labels) < len(rows):
+            label = tk.Label(
+                self.wanted,
+                image=self._finder_image,
+                bg="#1c1c1c",
+                bd=0,
+                cursor="hand2",
+                takefocus=0,
+            )
+            self._finder_labels.append(label)
+        for label in self._finder_labels[len(rows) :]:
+            label.place_forget()
+        for label, iid in zip(self._finder_labels, rows):
+            box = self.wanted.bbox(iid, "find")
+            if not box:
+                label.place_forget()
+                continue
+            x, y, width, height = box
+            label.place(x=x + max(0, (width - 16) // 2), y=y + max(0, (height - 16) // 2), width=16, height=16)
+            label.bind("<Button-1>", lambda _event, row=iid: self._finder_clicked(row))
+
+    def _finder_clicked(self, iid: str) -> None:
+        self.wanted.selection_set(iid)
+        self.wanted.focus(iid)
+        self.search_wanted_row(iid)
+
+    def search_wanted_row(self, iid: str) -> None:
+        item = self._row_items.get(iid)
+        if item is None or not item.key:
+            return
+        query = manual_query(item.kind, item.artist, item.album, item.song)
+        self.open_manual_search(query, link_from_wanted(item))
+
+    def _build_search(self, parent: ttk.Frame) -> None:
+        row = ttk.Frame(parent)
+        row.pack(fill="x")
+        self.query_var = tk.StringVar()
+        self.query_entry = ttk.Entry(row, textvariable=self.query_var)
+        self.query_entry.pack(side="left", fill="x", expand=True)
+        self.query_entry.bind("<Return>", lambda _event: self.submit_search())
+        self.search_button = ttk.Button(row, text="Search", command=self.submit_search)
+        self.search_button.pack(side="left", padx=(8, 0))
+        hint = ttk.Label(
+            parent,
+            text="Uses the worker's Soulseek login. Pause stops the worker's own searches and leaves this tab running.",
+            style="Muted.TLabel",
+        )
+        hint.pack(anchor="w", pady=(6, 6))
+        self.searches = ttk.Notebook(parent)
+        self.searches.pack(fill="both", expand=True)
+        self.searches.bind("<Button-1>", self._on_search_tab_press)
+        self._search_menu = tk.Menu(self, tearoff=0)
+        self._search_menu.add_command(label="Download file(s)", command=self.download_selected_files)
+        self._search_menu.add_command(label="Download folder", command=self.download_selected_folder)
+        self._search_menu.add_command(label="Browse folder", command=self.browse_selected_folder)
+
+    def submit_search(self) -> None:
+        query = (self.query_var.get() or "").strip()
+        if not query:
+            return
+        self.open_manual_search(query, link=None)
+
+    def open_manual_search(self, query: str, link: SearchLink | None = None) -> SearchBoard:
+        query = (query or "").strip()
+        board = self._add_search_board(query, link)
+        self.query_var.set(query)
+        self.notebook.select(self.search_tab)
+        if board.frame is not None:
+            self.searches.select(board.frame)
+        self._start_board_search(board)
+        return board
+
+    def _search_tab_title(self, board: SearchBoard) -> str:
+        text = board.query or "Search"
+        if len(text) > 22:
+            text = text[:21] + "…"
+        count = len(board.files)
+        return f"{text} ({count})  ×"
+
+    def _retitle(self, board: SearchBoard) -> None:
+        if board.frame is None or board.closed:
+            return
+        try:
+            self.searches.tab(board.frame, text=self._search_tab_title(board))
+        except tk.TclError:
+            pass
+
+    def _add_search_board(self, query: str, link: SearchLink | None) -> SearchBoard:
+        board = SearchBoard(query=query, link=link)
+        frame = ttk.Frame(self.searches, padding=4)
+        board.frame = frame
+        filters = ttk.Frame(frame)
+        filters.pack(fill="x", pady=(0, 4))
+        board.filter_var = tk.StringVar()
+        board.flac_var = tk.IntVar(value=0)
+        board.mp3_var = tk.IntVar(value=0)
+        board.bitrate_var = tk.StringVar()
+        board.free_var = tk.IntVar(value=0)
+        ttk.Label(filters, text="Filter").pack(side="left")
+        filter_entry = ttk.Entry(filters, textvariable=board.filter_var, width=28)
+        filter_entry.pack(side="left", padx=(6, 8))
+        filter_entry.bind("<KeyRelease>", lambda _event, current=board: self._read_filters(current))
+        ttk.Checkbutton(filters, text="FLAC", variable=board.flac_var, command=lambda current=board: self._read_filters(current)).pack(side="left")
+        ttk.Checkbutton(filters, text="MP3", variable=board.mp3_var, command=lambda current=board: self._read_filters(current)).pack(side="left", padx=(6, 0))
+        ttk.Label(filters, text="Min bitrate").pack(side="left", padx=(10, 4))
+        bitrate = ttk.Entry(filters, textvariable=board.bitrate_var, width=6)
+        bitrate.pack(side="left")
+        bitrate.bind("<KeyRelease>", lambda _event, current=board: self._read_filters(current))
+        ttk.Checkbutton(filters, text="Free slot", variable=board.free_var, command=lambda current=board: self._read_filters(current)).pack(side="left", padx=(8, 0))
+        actions = ttk.Frame(frame)
+        actions.pack(fill="x", pady=(0, 4))
+        ttk.Button(actions, text="Download file(s)", command=self.download_selected_files).pack(side="left")
+        ttk.Button(actions, text="Download folder", command=self.download_selected_folder).pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="Browse folder", command=self.browse_selected_folder).pack(side="left", padx=(8, 0))
+        board.status = tk.StringVar(value="")
+        ttk.Label(actions, textvariable=board.status, style="Muted.TLabel").pack(side="left", padx=(12, 0))
+        tree_frame = ttk.Frame(frame)
+        tree_frame.pack(fill="both", expand=True)
+        columns = ("size", "bitrate", "length", "format", "speed", "slot", "state")
+        board.tree = ttk.Treeview(tree_frame, columns=columns, show="tree headings", selectmode="extended")
+        scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=board.tree.yview)
+        board.tree.configure(yscrollcommand=scroll.set)
+        board.tree.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+        headings = (
+            ("#0", "User / file", 360),
+            ("size", "Size", 80),
+            ("bitrate", "Bitrate", 70),
+            ("length", "Length", 70),
+            ("format", "Format", 70),
+            ("speed", "Speed", 90),
+            ("slot", "Slot", 90),
+            ("state", "State", 110),
+        )
+        for name, heading, width in headings:
+            column_id = "name" if name == "#0" else name
+            board.tree.heading(name, text=heading, command=lambda column=column_id, current=board: self._sort_search(current, column))
+            board.tree.column(name, width=width, minwidth=40, stretch=name == "#0", anchor="w")
+        board.tree.tag_configure("user", font=(ui_font(), 10, "bold"))
+        board.tree.tag_configure("downloaded", foreground="#7dce7d")
+        board.tree.tag_configure("failed", foreground="#e07a7a")
+        board.tree.bind("<Button-3>", self._search_right_click)
+        board.tree.bind("<Double-Button-1>", lambda _event: self.download_selected_files())
+        self.searches.add(frame, text=self._search_tab_title(board))
+        self._boards.append(board)
+        return board
+
+    def _on_search_tab_press(self, event) -> str | None:
+        try:
+            index = self.searches.index(f"@{event.x},{event.y}")
+        except tk.TclError:
+            return None
+        box = self.searches.bbox(index)
+        if not box:
+            return None
+        x, _y, width, _height = box
+        if event.x < x + width - 18:
+            return None
+        self._close_search_index(index)
+        return "break"
+
+    def _close_search_index(self, index: int) -> None:
+        try:
+            frame_name = str(self.searches.tabs()[index])
+        except (tk.TclError, IndexError):
+            return
+        board = next((item for item in self._boards if item.frame is not None and str(item.frame) == frame_name), None)
+        if board is None or board.frame is None:
+            return
+        board.closed = True
+        self.searches.forget(board.frame)
+        self._boards = [item for item in self._boards if item is not board]
+
+    def _current_board(self) -> SearchBoard | None:
+        try:
+            selected = str(self.searches.select())
+        except tk.TclError:
+            return None
+        for board in self._boards:
+            if board.frame is not None and str(board.frame) == selected and not board.closed:
+                return board
+        return None
+
+    def _read_filters(self, board: SearchBoard) -> None:
+        if board.closed:
+            return
+        try:
+            bitrate = int((board.bitrate_var.get() if board.bitrate_var else "") or 0)
+        except ValueError:
+            bitrate = 0
+        board.filters = SearchFilters(
+            text=board.filter_var.get() if board.filter_var else "",
+            flac=bool(board.flac_var.get()) if board.flac_var else False,
+            mp3=bool(board.mp3_var.get()) if board.mp3_var else False,
+            min_bitrate=max(0, bitrate),
+            free_only=bool(board.free_var.get()) if board.free_var else False,
+        )
+        self._paint_search(board)
+
+    def _sort_search(self, board: SearchBoard, column: str) -> None:
+        if board.sort_column == column:
+            board.sort_reverse = not board.sort_reverse
+        else:
+            board.sort_column = column
+            board.sort_reverse = column not in {"name", "format", "state"}
+        self._paint_search(board)
+
+    def _paint_search(self, board: SearchBoard) -> None:
+        tree = board.tree
+        if tree is None or board.closed:
+            return
+        selected_files = {board.row_files[iid].id for iid in tree.selection() if iid in board.row_files}
+        selected_users = {board.row_users[iid] for iid in tree.selection() if iid in board.row_users}
+        tree.delete(*tree.get_children())
+        board.row_files.clear()
+        board.row_users.clear()
+        visible = board.filters.apply(board.files)
+        shown = visible[:2000]
+        parent = ""
+        for row in display_rows(shown, sort_column=board.sort_column, reverse=board.sort_reverse):
+            if row.kind == "user":
+                label = f"{row.username} ({row.file_count})"
+                parent = tree.insert(
+                    "",
+                    "end",
+                    text=label,
+                    open=True,
+                    values=("", "", "", "", format_speed(row.speed), format_slot(row.free_slot, row.queue), ""),
+                    tags=("user",),
+                )
+                board.row_users[parent] = row.username
+                if row.username in selected_users:
+                    tree.selection_add(parent)
+                continue
+            item = row.file
+            if item is None:
+                continue
+            tag = "downloaded" if item.state == "downloaded" else ("failed" if item.state == "failed" else "")
+            iid = tree.insert(
+                parent or "",
+                "end",
+                text=display_name(item),
+                values=(
+                    format_size(item.size),
+                    f"{item.bitrate}" if item.bitrate else "",
+                    format_duration(item.duration),
+                    item.extension.upper(),
+                    "",
+                    "",
+                    state_label(item.state),
+                ),
+                tags=(tag,) if tag else (),
+            )
+            board.row_files[iid] = item
+            if item.id in selected_files:
+                tree.selection_add(iid)
+        if board.status is not None:
+            current = str(board.status.get())
+            counting = (not current) or "result" in current
+            if board.running or counting:
+                extra = ""
+                if not board.running and len(visible) != len(board.files):
+                    extra = f", {len(visible)} match the filter"
+                suffix = " so far" if board.running else ""
+                board.status.set(f"{len(board.files)} results{suffix}{extra}")
+        self._retitle(board)
+
+    def show_search_files(self, board: SearchBoard, files: list[SearchFile]) -> None:
+        """Replace a tab's results. Tests and the live watcher both use this."""
+        states = {item.id: item.state for item in board.files}
+        merged: list[SearchFile] = []
+        for item in files:
+            previous = states.get(item.id) or self.worker.manual_state(item.id)
+            if previous:
+                item.state = previous
+            merged.append(item)
+        board.files = merged
+        self._paint_search(board)
+
+    def _start_board_search(self, board: SearchBoard) -> None:
+        loop = getattr(self.worker, "_loop", None)
+        if loop is None or not loop.is_running():
+            if board.status is not None:
+                board.status.set("Start the worker to search. Search uses that Soulseek login.")
+            return
+        board.running = True
+        if board.status is not None:
+            board.status.set("Searching…")
+
+        def watch() -> None:
+            try:
+                request = asyncio.run_coroutine_threadsafe(self.worker.begin_manual_search(board.query), loop).result(timeout=30)
+            except Exception as exc:
+                self._post(lambda exc=exc: self._search_failed(board, exc))
+                return
+            deadline = time.monotonic() + max(1.0, float(self.worker.cfg.search_wait_seconds))
+            while time.monotonic() < deadline and not board.closed:
+                files = files_from_results(getattr(request, "results", None))
+                self._post(lambda files=files: None if board.closed else self.show_search_files(board, files))
+                time.sleep(0.4)
+            self._post(lambda: self._finish_search(board, request, loop))
+
+        threading.Thread(target=watch, name="manual-search", daemon=True).start()
+
+    def _search_failed(self, board: SearchBoard, exc: Exception) -> None:
+        board.running = False
+        if board.status is not None and not board.closed:
+            board.status.set(str(exc))
+
+    def _finish_search(self, board: SearchBoard, request, loop) -> None:
+        board.running = False
+        if not board.closed:
+            self.show_search_files(board, files_from_results(getattr(request, "results", None)))
+            if board.status is not None:
+                board.status.set(f"{len(board.files)} results")
+        try:
+            asyncio.run_coroutine_threadsafe(self._drop_request(request), loop)
+        except Exception:
+            pass
+
+    async def _drop_request(self, request) -> None:
+        client = self.worker.client
+        if client is None:
+            return
+        try:
+            client.searches.remove_request(request)
+        except Exception:
+            pass
+
+    def _refresh_open_search_states(self) -> None:
+        for board in list(getattr(self, "_boards", ())):
+            if board.closed:
+                continue
+            changed = False
+            for item in board.files:
+                state = self.worker.manual_state(item.id)
+                if state and state != item.state:
+                    item.state = state
+                    changed = True
+            if changed:
+                self._paint_search(board)
+
+    def _selected_search_targets(self, board: SearchBoard) -> tuple[set[str], set[str]]:
+        tree = board.tree
+        if tree is None:
+            return set(), set()
+        file_ids = {board.row_files[iid].id for iid in tree.selection() if iid in board.row_files}
+        users = {board.row_users[iid] for iid in tree.selection() if iid in board.row_users}
+        return file_ids, users
+
+    def download_selected_files(self) -> None:
+        self._queue_current(folder=False)
+
+    def download_selected_folder(self) -> None:
+        self._queue_current(folder=True)
+
+    def _queue_current(self, *, folder: bool) -> None:
+        board = self._current_board()
+        if board is None:
+            return
+        file_ids, users = self._selected_search_targets(board)
+        chosen = choose_downloads(board.filters.apply(board.files), file_ids, folder=folder, usernames=users if folder else set())
+        if not chosen and not folder:
+            chosen = choose_downloads(board.filters.apply(board.files), file_ids, folder=False)
+        if not chosen:
+            if board.status is not None:
+                board.status.set("Select a file first.")
+            return
+        self.queue_search_files(board, chosen)
+
+    def queue_search_files(self, board: SearchBoard, files: list[SearchFile]) -> None:
+        loop = getattr(self.worker, "_loop", None)
+        if loop is None or not loop.is_running():
+            if board.status is not None:
+                board.status.set("Start the worker to download. Downloads use that Soulseek connection.")
+            return
+        for item in files:
+            item.state = "queued"
+        self._paint_search(board)
+        if board.status is not None:
+            board.status.set(f"Queued {len(files)} file(s)")
+        link = None
+        if board.link is not None:
+            link = {
+                "kind": board.link.kind,
+                "key": board.link.key,
+                "artist": board.link.artist,
+                "album": board.link.album,
+                "title": board.link.title,
+                "album_id": board.link.album_id,
+                "track_id": board.link.track_id,
+            }
+        specs = [file_spec(item) for item in files]
+        future = asyncio.run_coroutine_threadsafe(self.worker.download_manual(specs, link), loop)
+
+        def done() -> None:
+            try:
+                future.result()
+            except Exception as exc:
+                self._post(lambda exc=exc: self._search_failed(board, exc))
+                return
+            self._post(lambda: self._refresh_open_search_states())
+
+        threading.Thread(target=done, name="manual-download", daemon=True).start()
+
+    def browse_selected_folder(self) -> None:
+        board = self._current_board()
+        if board is None or board.tree is None:
+            return
+        file_ids, users = self._selected_search_targets(board)
+        username = ""
+        folder = ""
+        for item in board.files:
+            if item.id in file_ids:
+                username = item.username
+                folder = item.folder
+                break
+        if not username and users:
+            username = next(iter(users))
+            for item in board.files:
+                if item.username == username and item.folder:
+                    folder = item.folder
+                    break
+        if not username or not folder:
+            if board.status is not None:
+                board.status.set("Select a file to browse its folder.")
+            return
+        loop = getattr(self.worker, "_loop", None)
+        if loop is None or not loop.is_running():
+            if board.status is not None:
+                board.status.set("Start the worker to browse. Browse uses that Soulseek login.")
+            return
+        if board.status is not None:
+            board.status.set(f"Browsing {username}…")
+        future = asyncio.run_coroutine_threadsafe(self.worker.browse_folder(username, folder), loop)
+
+        def done() -> None:
+            try:
+                records = future.result(timeout=20)
+            except Exception as exc:
+                self._post(lambda exc=exc: self._search_failed(board, exc))
+                return
+
+            def apply() -> None:
+                if board.closed:
+                    return
+                extra = [
+                    SearchFile(
+                        username=str(record.get("username") or username),
+                        filename=str(record.get("filename") or ""),
+                        folder=str(record.get("folder") or folder),
+                        size=int(record.get("size") or 0),
+                        bitrate=int(record.get("bitrate") or 0),
+                        duration=int(record.get("duration") or 0),
+                        extension=str(record.get("extension") or ""),
+                        free_slot=bool(record.get("free_slot")),
+                        speed=int(record.get("speed") or 0),
+                        queue=int(record.get("queue") or 0),
+                    )
+                    for record in records
+                    if record.get("filename")
+                ]
+                self.show_search_files(board, _merge_files(board.files, extra))
+                if board.status is not None:
+                    board.status.set(f"Browsed {folder}")
+
+            self._post(apply)
+
+        threading.Thread(target=done, name="browse-folder", daemon=True).start()
+
+    def _search_right_click(self, event) -> None:
+        tree = event.widget
+        row = tree.identify_row(event.y)
+        if row and row not in tree.selection():
+            tree.selection_set(row)
+        if self._search_menu is not None:
+            self._search_menu.tk_popup(event.x_root, event.y_root)
+
     def _checkbox_image(self, state: str) -> tk.PhotoImage:
         """A drawn box, so the control does not depend on a Unicode font."""
         size = 16
@@ -1602,7 +2180,7 @@ class DesktopApp(tk.Tk):
         return image
 
     def _row_values(self, item: WantedItem) -> tuple:
-        return (item.kind.title(), item.artist, item.album, item.song, item.detail)
+        return (item.kind.title(), item.artist, item.album, item.song, item.detail, "")
 
     def _paint_check(self, iid: str, item: WantedItem, state: str) -> None:
         self.wanted.item(iid, text="", image=self._check_images[state], values=self._row_values(item))
@@ -1621,7 +2199,8 @@ class DesktopApp(tk.Tk):
                 text = "No artists match that search."
             else:
                 text = f"Nothing in {self.view_var.get() or VIEW_EVERYTHING}."
-            self.wanted.insert("", "end", text="", values=("", text, "", "", ""))
+            self.wanted.insert("", "end", text="", values=("", text, "", "", "", ""))
+            self._place_finders()
             self.wanted_scroll.set(0, 1)
             return
 
@@ -1633,6 +2212,7 @@ class DesktopApp(tk.Tk):
             ]
         for iid, item in zip(children, items):
             self._paint_check(iid, item, self._shown.get(item.key, "on"))
+        self._place_finders()
         if total <= len(items):
             self.wanted_scroll.set(0, 1)
         else:
@@ -1678,7 +2258,8 @@ class DesktopApp(tk.Tk):
                 text = "Click Sync to load the wanted list from Lidarr."
             else:
                 text = f"Nothing in {self.view_var.get() or VIEW_EVERYTHING}."
-            self.wanted.insert("", "end", text="", values=("", text, "", "", ""))
+            self.wanted.insert("", "end", text="", values=("", text, "", "", "", ""))
+            self._place_finders()
             self.wanted_scroll.set(0, 1)
             return
         if len(children) != len(shown):
@@ -1689,6 +2270,7 @@ class DesktopApp(tk.Tk):
             ]
         for iid, item in zip(children, shown):
             self._paint_check(iid, item, self._memory_check_state(item, choices, grouped))
+        self._place_finders()
         if total <= window:
             self.wanted_scroll.set(0, 1)
         else:

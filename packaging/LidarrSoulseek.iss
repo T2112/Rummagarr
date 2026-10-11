@@ -2,7 +2,7 @@
 ; Build with scripts/build_windows.ps1, which passes /DMyAppVersion from VERSION.
 
 #ifndef MyAppVersion
-#define MyAppVersion "1.7.1"
+#define MyAppVersion "1.8.0"
 #endif
 
 #define MyAppName "Lidarr Soulseek"

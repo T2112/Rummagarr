@@ -1,6 +1,6 @@
 # Lidarr Soulseek Worker
 
-**Version 1.7.1** — Windows desktop app. No Docker. No slskd.
+**Version 1.8.0** — Windows desktop app. No Docker. No slskd.
 
 The worker reads Lidarr **Wanted → Missing**, searches Soulseek, downloads matching albums or individual missing tracks, converts FLAC/WAV to MP3 when needed, asks Lidarr to import and rename, then cleans leftover files.
 
@@ -26,8 +26,9 @@ Most people should install the desktop app instead of setting up Python.
 1. Download `LidarrSoulseek-Setup-<version>.exe` from the [latest release](https://github.com/T2112/lidarr-soulseek/releases/latest).
 2. Run the installer. It copies the app into your user programs folder and adds a **Start Menu** shortcut named Lidarr Soulseek. An optional task can also start the app when you sign in.
 3. The first window asks for the Lidarr URL, the Lidarr API key, the Soulseek username and password, and the Incomplete / Complete folders. Use **Test Lidarr**, then **Save**. You do not edit `config.toml` by hand.
-4. Open **Status**. **Start** begins searching. **Pause** holds the current work and resumes it later. **Stop** ends the run and keeps your place. **Skip** drops the album or song it is on and moves to the next one.
-5. Open **Wanted**. The saved list opens immediately. **Sync** reads Lidarr and fills the list as each page arrives; you can search and check rows while that is still running. **Artist** filters by name. Uncheck anything the worker should leave alone. **Select all** applies to the current view: Everything, Incomplete artists, Incomplete albums, or Incomplete songs. The list and the checkboxes are kept in the local database.
+4. Open **Status**. **Start** begins searching. The line under the buttons names the current search, wait, or download, and it says Idle only when nothing is selected. **Pause** holds the current work and resumes it later. **Stop** ends the run and keeps your place. **Skip** drops the album or song it is on and moves to the next one.
+5. Open **Wanted**. The saved list opens immediately. **Sync** reads Lidarr and fills the list as each page arrives; you can search and check rows while that is still running. **Artist** filters by name. Uncheck anything the worker should leave alone. **Select all** applies to the current view: Everything, Incomplete artists, Incomplete albums, or Incomplete songs. The magnifying glass on a row opens **Search** for that artist, album, or song. The list and the checkboxes are kept in the local database.
+6. Open **Search** to type a Soulseek query yourself. Results are grouped by user. Download sends the file through the same queue, conversion, and Lidarr import as an automatic grab. Search uses the login from **Start** and does not sign in a second time.
 
 The browser page at `http://127.0.0.1:8787` still works while the worker is running. The desktop window does not need a browser.
 
@@ -52,7 +53,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 That installs the Python dependencies and PyInstaller, freezes `desktop_app.py`, and compiles `packaging\LidarrSoulseek.iss` with Inno Setup 6. If Inno Setup is not already installed, the script downloads it. The setup program is written to:
 
 ```text
-dist\LidarrSoulseek-Setup-1.7.1.exe
+dist\LidarrSoulseek-Setup-1.8.0.exe
 ```
 
 The same steps run in GitHub Actions (`.github/workflows/windows-installer.yml`) on `windows-latest`. Pull requests and pushes to `main` upload the installer as a workflow artifact.
@@ -62,6 +63,13 @@ To publish a public download, push a tag `v<version>` that matches the `VERSION`
 This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs on, and Inno Setup is a Windows program. Push the branch and let that workflow produce the `.exe`.
 
 `python main.py` still runs the worker without the window, for the original script install below.
+
+## What's new in 1.8.0
+
+- Status names the current search, wait, download, or retry instead of sitting on Idle
+- A Search tab runs a Soulseek query on the same login and can queue the files it finds
+- Wanted rows have a magnifying glass that starts that search for the artist, album, or song
+- Full changelog: [CHANGELOG.md](CHANGELOG.md)
 
 ## What's new in 1.7.1
 

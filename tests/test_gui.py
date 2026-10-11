@@ -9,6 +9,7 @@ import pytest
 
 from dataclasses import replace
 
+from activity import Step
 from config_loader import app_version, default_config
 from desktop_app import (
     DesktopApp,
@@ -399,7 +400,77 @@ def test_status_line_matches_the_web_page_fields():
         {
             "run_state": "paused",
             "logged_in": True,
-            "job": {"phase": "downloading album", "artist": "Ella Langley", "title": "Hungover"},
+            "activity": "Downloading 3 of 12 · Ella Langley – Hungover",
+            "elapsed": 8,
+            "busy": False,
         }
     )
-    assert text == "Paused · Soulseek connected · downloading album · Ella Langley — Hungover"
+    assert text == "Paused · Soulseek connected · Downloading 3 of 12 · Ella Langley – Hungover · 8s"
+
+
+def test_status_tab_shows_a_search_instead_of_idle(desktop):
+    desktop.worker.control.start()
+    desktop.worker.set_step(
+        Step(
+            kind="searching",
+            artist="Ella Langley",
+            album="Hungover",
+            query_index=2,
+            query_total=3,
+            result_count=47,
+        )
+    )
+    desktop.refresh_status()
+    text = desktop.status_line.cget("text")
+    assert "Searching Soulseek" in text
+    assert "query 2 of 3" in text
+    assert "47 results" in text
+    assert "Idle" not in text
+    desktop.worker.set_step(Step(kind="idle"))
+    desktop.refresh_status()
+    assert "Idle – nothing selected" in desktop.status_line.cget("text")
+
+
+def test_magnifier_opens_a_folded_search(desktop):
+    from search_model import SearchFile
+
+    desktop.notebook.select(desktop.wanted_tab)
+    desktop.update()
+    album_iid, _album = _row(desktop, kind="album", album="Hungover")
+    _click_cell(desktop, album_iid, "find")
+    assert desktop.notebook.select() == str(desktop.search_tab)
+    assert desktop.query_var.get() == "ella langley hungover"
+    board = desktop._current_board()
+    assert board is not None
+    assert board.link is not None
+    assert board.link.album_id == 1
+    assert board.link.key == "album:1"
+    song_iid, _song = _row(desktop, kind="song", song="Cowboy")
+    desktop.search_wanted_row(song_iid)
+    assert desktop.query_var.get() == "ella langley cowboy"
+    song_board = desktop._current_board()
+    assert song_board is not None and song_board.link is not None
+    assert song_board.link.track_id == 21
+    desktop.show_search_files(
+        song_board,
+        [
+            SearchFile(
+                username="vinylqueen",
+                filename=r"music\Cowboy.flac",
+                folder="music",
+                size=20_000_000,
+                bitrate=900,
+                duration=180,
+                extension="flac",
+                free_slot=True,
+                speed=200_000,
+            )
+        ],
+    )
+    desktop.update()
+    assert song_board.tree is not None
+    labels = [song_board.tree.item(iid, "text") for iid in song_board.tree.get_children()]
+    assert any("vinylqueen" in label for label in labels)
+    file_iid = next(iter(song_board.row_files))
+    assert "Cowboy.flac" in song_board.tree.item(file_iid, "text")
+    assert song_board.tree.set(file_iid, "format") == "FLAC"

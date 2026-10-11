@@ -83,7 +83,10 @@ async function load(){
   const sel = document.getElementById('recent-limit');
   if (sel && document.activeElement !== sel) sel.value = String(limit);
   const r = await fetch('/api/status?limit=' + encodeURIComponent(limit)); const d = await r.json(); const job = d.job||{};
-  document.getElementById('job').textContent=[d.logged_in?'Soulseek connected':'Soulseek offline',job.phase||'idle',[job.artist,job.title].filter(Boolean).join(' \\u2014 ')].filter(Boolean).join(' \\u00b7 ');
+  const activity = d.activity || [job.phase||'idle',[job.artist,job.title].filter(Boolean).join(' \\u2014 ')].filter(Boolean).join(' \\u00b7 ');
+  const elapsed = d.elapsed_text ? (' \\u00b7 ' + d.elapsed_text) : '';
+  const mark = d.busy ? '\\u25cf ' : '\\u25cb ';
+  document.getElementById('job').textContent = mark + [d.logged_in?'Soulseek connected':'Soulseek offline', activity].filter(Boolean).join(' \\u00b7 ') + elapsed;
   const body=document.getElementById('rows'); body.innerHTML='';
   (d.transfers||[]).forEach((t,i)=>{
     const tr=document.createElement('tr');
