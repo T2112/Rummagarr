@@ -367,7 +367,7 @@ def test_gui_reads_the_saved_catalog_and_can_search(tmp_path):
     pytest.importorskip("tkinter")
     import tkinter as tk
 
-    from desktop_app import CHECKED, UNCHECKED, DesktopApp
+    from desktop_app import DesktopApp
 
     try:
         root = tk.Tk()
@@ -411,7 +411,7 @@ def test_gui_reads_the_saved_catalog_and_can_search(tmp_path):
         app.toggle_row(album_iid)
         app.update()
         assert worker.store.wanted_enabled("album:3") is False
-        assert app.wanted.set(album_iid, "mark") == UNCHECKED
+        assert app.checkbox_state(album_iid) == "off"
         app.view_var.set(VIEW_ARTISTS)
         app.on_view()
         app.update()
@@ -428,7 +428,7 @@ def test_gui_reads_the_saved_catalog_and_can_search(tmp_path):
         app.update()
         assert worker.store.wanted_enabled("album:1") is True
         assert worker.store.wanted_enabled("album:3") is True
-        assert app.wanted.set(app.wanted.get_children()[0], "mark") == CHECKED
+        assert app.checkbox_state(app.wanted.get_children()[0]) == "on"
     finally:
         app.destroy()
         worker.close()

@@ -951,11 +951,19 @@ class JobStore:
             key, kind, artist, album, song, detail, enabled, enabled_gen, token = row[:9]
             cursor = tuple(row[9 : 9 + width])
             shown = _effective(enabled, enabled_gen, kind, modes)
+            state = "on" if shown else "off"
             if kind == "artist":
                 info = artists.get(token)
                 if info is not None and info[0] + info[1] > 0:
-                    shown = 1 if info[2] == 0 else 0
-            page.append((key, kind, artist, album, song, detail or "", bool(shown), cursor))
+                    disabled = int(info[2])
+                    children = int(info[0]) + int(info[1])
+                    if disabled <= 0:
+                        state = "on"
+                    elif disabled >= children:
+                        state = "off"
+                    else:
+                        state = "mixed"
+            page.append((key, kind, artist, album, song, detail or "", state, cursor))
         return page, total
 
     def wanted_summary(self, kinds: tuple[str, ...] | None, search: str) -> tuple[int, int, str]:

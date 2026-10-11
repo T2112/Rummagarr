@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
+import tkinter as tk
 
 import pytest
 
@@ -9,8 +11,6 @@ from dataclasses import replace
 
 from config_loader import app_version, default_config
 from desktop_app import (
-    CHECKED,
-    UNCHECKED,
     DesktopApp,
     SettingsForm,
     format_status_line,
@@ -136,7 +136,7 @@ def test_wanted_checkboxes_views_and_select_all(desktop):
     _iid, hungover = _row(desktop, kind="album", album="Hungover")
     desktop.toggle_row(_iid)
     assert desktop.worker.store.wanted_enabled(hungover.key) is False
-    assert desktop.wanted.set(_row(desktop, kind="album", album="Hungover")[0], "mark") == UNCHECKED
+    assert desktop.checkbox_state(_row(desktop, kind="album", album="Hungover")[0]) == "off"
     desktop.view_var.set(VIEW_ALBUMS)
     desktop.on_view()
     assert {desktop.wanted.set(iid, "kind") for iid in desktop.wanted.get_children()} == {"Album"}
@@ -161,7 +161,7 @@ def test_wanted_checkboxes_views_and_select_all(desktop):
     desktop.on_select_all()
     assert desktop.worker.store.wanted_enabled("song:21") is True
     assert desktop.worker.store.wanted_enabled("song:31") is True
-    assert desktop.wanted.set(_row(desktop, kind="song", song="Cowboy")[0], "mark") == CHECKED
+    assert desktop.checkbox_state(_row(desktop, kind="song", song="Cowboy")[0]) == "on"
 
 
 def test_start_pause_stop_drive_the_worker_thread(desktop):
@@ -299,6 +299,99 @@ def test_wanted_list_draws_only_the_visible_rows(desktop):
     shown = desktop.wanted.get_children()
     assert desktop.wanted.set(shown[-1], "artist") != first
     assert len(shown) < 80
+
+
+def _click_cell(app, iid: str, column: str) -> None:
+    app.notebook.select(app.wanted_tab)
+    app.update_idletasks()
+    box = app.wanted.bbox(iid, column)
+    assert box and box[2] > 0 and box[3] > 0, box
+    x, y, width, height = box
+    app.wanted.event_generate("<Button-1>", x=x + width // 2, y=y + height // 2)
+    app.update()
+
+
+def test_checkbox_click_toggles_during_sync(tmp_path):
+    _tk_or_skip()
+    from tests.test_scale import PageLibrary
+    from wanted import sync_wanted_catalog
+
+    worker = make_worker(tmp_path)
+    library = PageLibrary(4)
+    sync_wanted_catalog(library, worker.store, max_pages=5)
+    app = DesktopApp(worker, tmp_path / "config.toml", start_status_server=False, honor_start_on_launch=False, poll_ms=60_000)
+    try:
+        app.notebook.select(app.wanted_tab)
+        app.update()
+        album_iid, album = _row(app, kind="album", album="Album 1")
+        artist_iid, _artist = _row(app, kind="artist", artist="Artist 00000")
+        assert app.checkbox_state(album_iid) == "on"
+        assert app.checkbox_state(artist_iid) == "on"
+
+        _click_cell(app, album_iid, "#0")
+        assert worker.store.wanted_enabled("album:1") is False
+        artist_iid, _artist = _row(app, kind="artist", artist="Artist 00000")
+        assert app.checkbox_state(artist_iid) == "mixed"
+
+        _click_cell(app, artist_iid, "#0")
+        assert worker.store.wanted_enabled("album:1") is True
+        assert worker.store.wanted_enabled("album:2") is True
+        artist_iid, _artist = _row(app, kind="artist", artist="Artist 00000")
+        assert app.checkbox_state(artist_iid) == "on"
+        _click_cell(app, artist_iid, "#0")
+        assert worker.store.wanted_enabled("album:1") is False
+        assert worker.store.wanted_enabled("song:1") is False
+        artist_iid, _artist = _row(app, kind="artist", artist="Artist 00000")
+        assert app.checkbox_state(artist_iid) == "off"
+
+        album_iid, album = _row(app, kind="album", album="Album 2")
+        _click_cell(app, album_iid, "album")
+        assert worker.store.wanted_enabled("album:2") is False
+        assert album_iid in app.wanted.selection()
+
+        app.wanted.focus_set()
+        app.wanted.event_generate("<space>")
+        app.update()
+        assert worker.store.wanted_enabled("album:2") is True
+
+        app._syncing = True
+        stop = threading.Event()
+
+        def keep_syncing() -> None:
+            while not stop.is_set():
+                sync_wanted_catalog(PageLibrary(4), worker.store, max_pages=5)
+                if stop.is_set():
+                    return
+                try:
+                    app.after(0, lambda: None if stop.is_set() else app._on_sync_progress("Syncing rows…"))
+                except (RuntimeError, tk.TclError):
+                    return
+                time.sleep(0.02)
+
+        thread = threading.Thread(target=keep_syncing, daemon=True)
+        thread.start()
+        try:
+            time.sleep(0.05)
+            album_iid, _album = _row(app, kind="album", album="Album 2")
+            _click_cell(app, album_iid, "#0")
+            assert worker.store.wanted_enabled("album:2") is False
+            time.sleep(0.15)
+            app.update()
+            assert worker.store.wanted_enabled("album:2") is False
+            album_iid, _album = _row(app, kind="album", album="Album 2")
+            assert app.checkbox_state(album_iid) == "off"
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+        app._syncing = False
+        app.refresh_wanted()
+        app.update()
+        assert worker.store.wanted_enabled("album:2") is False
+        assert app.checkbox_state(_row(app, kind="album", album="Album 2")[0]) == "off"
+        assert worker.store.wanted_enabled("album:1") is False
+    finally:
+        app.destroy()
+        worker.close()
 
 
 def test_status_line_matches_the_web_page_fields():
