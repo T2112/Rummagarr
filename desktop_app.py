@@ -39,11 +39,15 @@ from updater import (
     versions_equal,
     wait_for_worker_stop,
 )
+from match import normalize
 from wanted import (
+    VIEW_ALBUMS,
+    VIEW_ARTISTS,
     VIEW_EVERYTHING,
+    VIEW_SONGS,
     VIEWS,
     WantedItem,
-    catalog_from_lidarr,
+    artist_token,
     children_by_artist,
     choice_updates,
     filter_view,
@@ -51,6 +55,7 @@ from wanted import (
     select_all_state,
     select_all_updates,
     sort_items,
+    sync_wanted_catalog,
 )
 from worker import Worker
 
@@ -59,8 +64,9 @@ log = logging.getLogger("lidarr_slsk.desktop")
 CHECKED = "☑"
 UNCHECKED = "☐"
 DONE_TRANSFER = {"COMPLETE", "FAILED", "ABORTED"}
-# 2,000 pages × 250 albums. Sync can be cancelled before it finishes.
-WANTED_SYNC_PAGES = 2000
+# 200,000 pages × 250 albums. Enough for a multi-million wanted list.
+# Sync can be cancelled before it finishes; pages already saved stay on disk.
+WANTED_SYNC_PAGES = 200_000
 WANTED_WINDOW_MIN = 12
 # Small choice edits stay on the caller so tests see them immediately.
 # A select-all of a huge view is written in one transaction off the UI thread.
@@ -227,6 +233,15 @@ class BehaviorField:
 
 BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
     BehaviorField("concurrent_albums", "Albums at once", "int", "", "How many albums to search or download together. 1 is one after another.", 1, 8),
+    BehaviorField(
+        "lidarr_track_concurrency",
+        "Lidarr requests at once",
+        "int",
+        "",
+        "How many Lidarr track lookups to run together during Sync. 1 waits for each request.",
+        1,
+        8,
+    ),
     BehaviorField("search_wait_seconds", "Search wait", "float", "seconds", "How long to wait for Soulseek results before scoring them.", 1, 90),
     BehaviorField("max_albums_per_cycle", "Albums per pass", "int", "", "Album searches started in one pass.", 1, 20),
     BehaviorField("focus_one_artist", "One artist at a time", "bool", "", "Stay on a single artist, then move on."),
@@ -819,6 +834,10 @@ class DesktopApp(tk.Tk):
         self._wanted_offset = 0
         self._wanted_window = WANTED_WINDOW_MIN
         self._wanted_sort: tuple[str, bool] | None = None
+        self._wanted_total = 0
+        self._sql_mode = False
+        self._cursors: list[tuple] = []
+        self._shown: dict[str, bool] = {}
         self._choices_cache: dict[str, bool] | None = None
         self._choice_job = 0
         self._transfer_index: dict[str, int] = {}
@@ -829,6 +848,7 @@ class DesktopApp(tk.Tk):
         saved_limit = worker.store.get_meta("gui_recent_limit")
         self.limit_var = tk.StringVar(value=str(normalize_recent_limit(saved_limit or DEFAULT_RECENT_LIMIT)))
         self.view_var = tk.StringVar(value=VIEW_EVERYTHING)
+        self.search_var = tk.StringVar(value="")
         self.select_all_var = tk.IntVar(value=0)
         self.notice_var = tk.StringVar(value="")
         self.wanted_status = tk.StringVar(value="Click Sync to load the wanted list from Lidarr.")
@@ -949,8 +969,9 @@ class DesktopApp(tk.Tk):
     def _build_wanted(self, parent: ttk.Frame) -> None:
         ttk.Label(
             parent,
-            text="Checked rows are the only ones the worker searches. New rows from Sync start checked.",
+            text="Checked rows are the only ones the worker searches. New rows from Sync start checked. The list is kept on this computer and opens without another Sync.",
             style="Muted.TLabel",
+            wraplength=980,
         ).pack(anchor="w")
         toolbar = ttk.Frame(parent)
         toolbar.pack(fill="x", pady=(8, 8))
@@ -968,6 +989,12 @@ class DesktopApp(tk.Tk):
             command=self.on_select_all,
         )
         self.select_all.pack(side="right")
+        search_row = ttk.Frame(parent)
+        search_row.pack(fill="x", pady=(0, 6))
+        ttk.Label(search_row, text="Artist").pack(side="left")
+        self.search_entry = ttk.Entry(search_row, textvariable=self.search_var)
+        self.search_entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self.search_entry.bind("<KeyRelease>", lambda _event: self.on_search())
         self.count_label = ttk.Label(parent, textvariable=self.wanted_status, style="Muted.TLabel")
         self.count_label.pack(anchor="w", pady=(0, 6))
         frame = ttk.Frame(parent)
@@ -1195,6 +1222,20 @@ class DesktopApp(tk.Tk):
         self._wanted_offset = 0
         self.refresh_wanted()
 
+    def on_search(self) -> None:
+        self._wanted_offset = 0
+        self.refresh_wanted()
+
+    def _view_kinds(self) -> tuple[str, ...] | None:
+        view = self.view_var.get() or VIEW_EVERYTHING
+        if view == VIEW_ARTISTS:
+            return ("artist",)
+        if view == VIEW_ALBUMS:
+            return ("album",)
+        if view == VIEW_SONGS:
+            return ("song",)
+        return None
+
     def on_sync(self) -> None:
         if self._syncing:
             self._sync_cancel.set()
@@ -1208,40 +1249,41 @@ class DesktopApp(tk.Tk):
         cancel = self._sync_cancel
         last_paint = 0.0
 
-        def progress(done: int, total: int) -> None:
+        def progress(rows: int, albums: int) -> None:
             nonlocal last_paint
             now = time.monotonic()
-            if total and done < total and now - last_paint < 0.15:
+            if now - last_paint < 0.15:
                 return
             last_paint = now
-            if total <= 0:
-                text = f"Loading albums {done:,}…"
-            else:
-                text = f"Syncing {done:,} / {total:,}"
-            self._post(lambda text=text: self.wanted_status.set(text))
+            text = f"Syncing {rows:,} rows ({albums:,} albums)…"
+            self._post(lambda text=text: self._on_sync_progress(text))
 
         def work() -> None:
-            client = LidarrClient(cfg.lidarr_url, cfg.lidarr_api_key)
+            client = LidarrClient(
+                cfg.lidarr_url,
+                cfg.lidarr_api_key,
+                track_concurrency=cfg.lidarr_track_concurrency,
+            )
             try:
-                items, exhausted = catalog_from_lidarr(
+                count, exhausted, cancelled = sync_wanted_catalog(
                     client,
+                    self.worker.store,
                     max_pages=WANTED_SYNC_PAGES,
                     on_progress=progress,
                     should_cancel=cancel.is_set,
                 )
-                if cancel.is_set():
-                    self._post(lambda: self._sync_finished(None, [], True, cancelled=True))
-                    return
-                self.worker.store.remember_wanted_keys([item.key for item in items])
-                self.worker.catalog.replace(items)
-                choices = self.worker.store.wanted_choices()
-                self._post(lambda: self._sync_finished(None, items, exhausted, choices=choices))
+                self._post(lambda: self._sync_finished_db(None, count, exhausted, cancelled))
             except Exception as exc:
-                self._post(lambda exc=exc: self._sync_finished(exc, [], True))
+                self._post(lambda exc=exc: self._sync_finished_db(exc, 0, False, False))
             finally:
                 client.close()
 
         threading.Thread(target=work, name="wanted-sync", daemon=True).start()
+
+    def _on_sync_progress(self, text: str) -> None:
+        self.wanted_status.set(text)
+        if self.worker.store.wanted_catalog_ready():
+            self._refresh_wanted_sql(counts=False)
 
     def _post(self, func) -> None:
         try:
@@ -1249,37 +1291,36 @@ class DesktopApp(tk.Tk):
         except tk.TclError:
             pass
 
-    def _sync_finished(
+    def _sync_finished_db(
         self,
         error: Exception | None,
-        items: list[WantedItem],
+        count: int,
         exhausted: bool,
-        *,
-        cancelled: bool = False,
-        choices: dict[str, bool] | None = None,
+        cancelled: bool,
     ) -> None:
         self._syncing = False
         try:
             self.sync_button.configure(text="Sync")
         except tk.TclError:
             return
+        self._choices_cache = None
+        self._wanted_offset = 0
+        self.refresh_wanted()
         if cancelled:
-            self.wanted_status.set("Sync cancelled.")
+            self.wanted_status.set("Sync cancelled. Rows already saved stay available.")
             return
         if error is not None:
             self.wanted_status.set(f"Sync failed: {error}")
             return
-        if choices is not None:
-            self._choices_cache = choices
-        else:
-            self._choices_cache = None
-        self._wanted_offset = 0
-        self.refresh_wanted()
-        more = "" if exhausted else " Lidarr still has more pages; Sync again to continue, or raise the page cap."
-        self.wanted_status.set(f"Synced {len(items):,} rows from Lidarr.{more}")
+        more = "" if exhausted else " Sync again to continue."
+        self.wanted_status.set(f"Synced {count:,} rows from Lidarr.{more}")
 
     def on_select_all(self) -> None:
         if self._updating_select_all:
+            return
+        if self.worker.store.wanted_catalog_ready():
+            self.worker.store.set_view_enabled(self._view_kinds(), self.search_var.get(), bool(self.select_all_var.get()))
+            self.refresh_wanted()
             return
         items = self.worker.catalog.items()
         visible = self._ordered_rows(items)
@@ -1303,7 +1344,15 @@ class DesktopApp(tk.Tk):
 
     def toggle_row(self, iid: str) -> None:
         item = self._row_items.get(iid)
-        if item is None:
+        if item is None or not item.key:
+            return
+        if self.worker.store.wanted_catalog_ready():
+            enabled = not self._shown.get(item.key, True)
+            if item.kind == "artist":
+                self.worker.store.set_artist_enabled(artist_token(item.artist), enabled)
+            else:
+                self.worker.store.set_wanted_choices({item.key: enabled})
+            self.refresh_wanted()
             return
         items = self.worker.catalog.items()
         grouped = children_by_artist(items)
@@ -1351,6 +1400,9 @@ class DesktopApp(tk.Tk):
         if items is None:
             items = self.worker.catalog.items()
         visible = filter_view(items, self.view_var.get() or VIEW_EVERYTHING)
+        folded = normalize(self.search_var.get() or "")
+        if folded:
+            visible = [item for item in visible if folded in normalize(item.artist or "")]
         if self._wanted_sort:
             column, reverse = self._wanted_sort
             visible = sort_items(visible, column, reverse)
@@ -1370,23 +1422,58 @@ class DesktopApp(tk.Tk):
         if window == self._wanted_window:
             return
         self._wanted_window = window
-        if self._wanted_rows:
+        if self._sql_mode:
+            self._refresh_wanted_sql(counts=False)
+        elif self._wanted_rows:
             self._paint_wanted(self._choices(), self._wanted_grouped)
 
+    def _wanted_span(self) -> int:
+        if self._sql_mode:
+            return self._wanted_total
+        return len(self._wanted_rows)
+
     def _wanted_scroll(self, *args) -> None:
-        total = len(self._wanted_rows)
+        total = self._wanted_span()
         window = max(1, self._wanted_window)
         if total <= window:
             return
+        after = None
+        before = None
+        before_count = 0
+        keyed = False
         if args[0] == "moveto":
             self._wanted_offset = int(float(args[1]) * total)
         elif args[0] == "scroll":
             step = int(args[1])
             if len(args) > 2 and args[2] == "pages":
                 step *= window
+            reverse = bool(self._wanted_sort and self._wanted_sort[1])
+            cursors = self._cursors
+            if self._sql_mode and not reverse and cursors and step > 0 and step <= len(cursors):
+                after = cursors[step - 1]
+                keyed = True
+            elif (
+                self._sql_mode
+                and not reverse
+                and cursors
+                and step < 0
+                and abs(step) <= len(cursors)
+                and self._wanted_offset > 0
+            ):
+                before = cursors[0]
+                before_count = abs(step)
+                keyed = True
             self._wanted_offset += step
         self._wanted_offset = max(0, min(self._wanted_offset, total - window))
-        self._paint_wanted(self._choices(), self._wanted_grouped)
+        if self._sql_mode:
+            self._refresh_wanted_sql(
+                counts=False,
+                after=after if keyed else None,
+                before=before if keyed else None,
+                before_count=before_count if keyed else 0,
+            )
+        else:
+            self._paint_wanted(self._choices(), self._wanted_grouped)
 
     def _wanted_wheel(self, event):
         if getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
@@ -1401,7 +1488,7 @@ class DesktopApp(tk.Tk):
         if not children or not selected or selected[0] not in children:
             return
         index = children.index(selected[0])
-        if event.keysym == "Down" and index == len(children) - 1 and self._wanted_offset + len(children) < len(self._wanted_rows):
+        if event.keysym == "Down" and index == len(children) - 1 and self._wanted_offset + len(children) < self._wanted_span():
             self._wanted_scroll("scroll", 1, "units")
             last = self.wanted.get_children()
             if last:
@@ -1416,7 +1503,106 @@ class DesktopApp(tk.Tk):
                 self.wanted.focus(first[0])
             return "break"
 
+    def _refresh_wanted_sql(
+        self,
+        *,
+        counts: bool = True,
+        after: tuple | None = None,
+        before: tuple | None = None,
+        before_count: int = 0,
+    ) -> None:
+        self._sql_mode = True
+        kinds = self._view_kinds()
+        search = self.search_var.get()
+        order = "default"
+        reverse = False
+        if self._wanted_sort:
+            order, reverse = self._wanted_sort
+        limit = max(1, self._wanted_window)
+        keyed = after is not None or before is not None
+        page, total = self.worker.store.wanted_page(
+            kinds=kinds,
+            search=search,
+            order=order,
+            reverse=reverse,
+            limit=limit,
+            offset=self._wanted_offset,
+            after=after,
+            before=before,
+            before_count=before_count,
+        )
+        if not keyed:
+            if total <= limit:
+                self._wanted_offset = 0
+            elif self._wanted_offset > total - limit:
+                self._wanted_offset = max(0, total - limit)
+                page, total = self.worker.store.wanted_page(
+                    kinds=kinds,
+                    search=search,
+                    order=order,
+                    reverse=reverse,
+                    limit=limit,
+                    offset=self._wanted_offset,
+                )
+        elif total <= limit:
+            self._wanted_offset = 0
+        else:
+            self._wanted_offset = max(0, min(self._wanted_offset, max(0, total - max(1, len(page)))))
+        self._wanted_total = total
+        items: list[WantedItem] = []
+        self._shown = {}
+        self._cursors = []
+        for key, kind, artist, album, song, detail, shown, cursor in page:
+            items.append(WantedItem(kind=kind, key=key, artist=artist, album=album, song=song, detail=detail))
+            self._shown[key] = shown
+            self._cursors.append(cursor)
+        self._fill_tree(items, total)
+        if not counts or self._syncing:
+            return
+        view_total, checked, state = self.worker.store.wanted_summary(kinds, search)
+        self._updating_select_all = True
+        try:
+            self.select_all_var.set(1 if state == "all" and view_total else 0)
+        finally:
+            self._updating_select_all = False
+        if not str(self.wanted_status.get()).startswith("Saving "):
+            self.wanted_status.set(f"{checked:,} of {view_total:,} selected in this view.")
+
+    def _fill_tree(self, items: list[WantedItem], total: int) -> None:
+        self._row_items.clear()
+        children = self.wanted.get_children()
+        if not items:
+            self.wanted.delete(*children)
+            if self._syncing and total == 0:
+                text = "Syncing…"
+            elif (self.search_var.get() or "").strip():
+                text = "No artists match that search."
+            else:
+                text = f"Nothing in {self.view_var.get() or VIEW_EVERYTHING}."
+            self.wanted.insert("", "end", values=("", "", text, "", "", ""))
+            self.wanted_scroll.set(0, 1)
+            return
+
+        def values(item: WantedItem) -> tuple:
+            mark = CHECKED if self._shown.get(item.key, True) else UNCHECKED
+            return (mark, item.kind.title(), item.artist, item.album, item.song, item.detail)
+
+        if len(children) != len(items):
+            self.wanted.delete(*children)
+            children = [self.wanted.insert("", "end", values=values(item)) for item in items]
+        for iid, item in zip(children, items):
+            self.wanted.item(iid, values=values(item))
+            self._row_items[iid] = item
+        if total <= len(items):
+            self.wanted_scroll.set(0, 1)
+        else:
+            self.wanted_scroll.set(self._wanted_offset / total, (self._wanted_offset + len(items)) / total)
+
     def refresh_wanted(self) -> None:
+        if self.worker.store.wanted_catalog_ready():
+            self._refresh_wanted_sql()
+            return
+        self._sql_mode = False
         items = self.worker.catalog.items()
         visible = self._ordered_rows(items)
         choices = self._choices()

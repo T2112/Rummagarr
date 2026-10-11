@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 import threading
@@ -524,39 +526,678 @@ def catalog_from_lidarr(
         except Exception:
             log.exception("Could not read tracks for %s", album.get("title") or album_id)
             tracks = []
-        artist = artist_name(album)
-        title = album.get("title") or "Unknown Album"
-        if not isinstance(tracks, list):
-            log.warning("Lidarr returned no track list for %s — %s", artist, title)
-            continue
-        for track in tracks:
-            try:
-                if not isinstance(track, dict):
-                    log.warning("Skipping a track on %s — %s that is not an object", artist, title)
-                    continue
-                if not track.get("monitored", True) or track.get("hasFile"):
-                    continue
-                if optional_id(track.get("id")) is None:
-                    log.warning(
-                        "Skipping %s on %s — %s: no usable track id",
-                        track.get("trackNumber") or track.get("title") or "?",
-                        artist,
-                        title,
-                    )
-                    continue
-                holes.append(
-                    {
-                        "track": track,
-                        "album": album,
-                        "artist_name": artist,
-                        "album_title": title,
-                    }
-                )
-                seen += 1
-            except Exception:
-                log.exception("Skipping a track on %s — %s", artist, title)
+        found = missing_holes(album, tracks)
+        holes.extend(found)
+        seen += len(found)
         report(seen, expected)
     report(max(seen, expected), max(seen, expected), force=True)
     if should_cancel is not None and should_cancel():
         return [], False
     return build_catalog(albums, holes), bool(exhausted)
+
+
+def missing_holes(album: dict, tracks) -> list[dict]:
+    """Monitored tracks that still have no file. Bad rows are skipped."""
+    holes: list[dict] = []
+    if not isinstance(album, dict):
+        return holes
+    artist = artist_name(album)
+    title = album.get("title") or "Unknown Album"
+    if not isinstance(tracks, list):
+        log.warning("Lidarr returned no track list for %s — %s", artist, title)
+        return holes
+    for track in tracks:
+        try:
+            if not isinstance(track, dict):
+                log.warning("Skipping a track on %s — %s that is not an object", artist, title)
+                continue
+            if not track.get("monitored", True) or track.get("hasFile"):
+                continue
+            if optional_id(track.get("id")) is None:
+                log.warning(
+                    "Skipping %s on %s — %s: no usable track id",
+                    track.get("trackNumber") or track.get("title") or "?",
+                    artist,
+                    title,
+                )
+                continue
+            holes.append(
+                {
+                    "track": track,
+                    "album": album,
+                    "artist_name": artist,
+                    "album_title": title,
+                }
+            )
+        except Exception:
+            log.exception("Skipping a track on %s — %s", artist, title)
+    return holes
+
+
+def _dump(value: dict | None) -> str | None:
+    if not value:
+        return None
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def slim_album(album: dict) -> dict:
+    artist = album.get("artist") if isinstance(album.get("artist"), dict) else {}
+    slim_artist = {
+        "id": artist.get("id") or album.get("artistId"),
+        "artistName": artist_name(album),
+    }
+    aliases = artist.get("aliases")
+    if aliases:
+        slim_artist["aliases"] = aliases
+    return {
+        "id": album.get("id"),
+        "title": album.get("title"),
+        "artistId": album.get("artistId") or slim_artist.get("id"),
+        "artist": slim_artist,
+        "releaseDate": album.get("releaseDate"),
+        "statistics": album.get("statistics") if isinstance(album.get("statistics"), dict) else {},
+        "monitored": album.get("monitored", True),
+    }
+
+
+def slim_track(track: dict) -> dict:
+    return {
+        "id": track.get("id"),
+        "title": track.get("title"),
+        "trackNumber": track.get("trackNumber"),
+        "mediumNumber": track.get("mediumNumber"),
+        "monitored": track.get("monitored", True),
+        "hasFile": bool(track.get("hasFile")),
+    }
+
+
+def _sort_position(value, *, empty_last: bool = True) -> str:
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return "1|" if empty_last else "0|"
+    side, digits, rest = _POSITION.match(text).groups()
+    number = int(digits) if digits else 10**9
+    if not side and not digits:
+        return f"0|{rest.casefold()}|{number:010d}|"
+    return f"0|{side.casefold()}|{number:010d}|{rest.casefold()}"
+
+
+_KIND_RANK = {"artist": 0, "album": 1, "song": 2}
+
+
+def items_to_rows(items: list[WantedItem]) -> list[dict]:
+    """Rows ready for the SQLite catalog. Artist details are filled by the store."""
+    from match import normalize
+
+    rows = []
+    folds: dict[str, str] = {}
+    for item in items:
+        token = artist_token(item.artist)
+        rank = _KIND_RANK.get(item.kind, 9)
+        payload = None
+        track_json = None
+        detail = "" if item.kind == "artist" else (item.detail or "")
+        if item.kind == "album":
+            payload = _dump(slim_album(item.payload or {}))
+        elif item.kind == "song" and item.track:
+            track_json = _dump(slim_track(item.track))
+        sort_artist = token
+        sort_album = (item.album or "").casefold()
+        if item.kind == "song":
+            track = item.track or {}
+            sort_song = "|".join(
+                (
+                    _sort_position(track.get("mediumNumber"), empty_last=False),
+                    _sort_position(track.get("trackNumber")),
+                    (item.song or "").casefold(),
+                )
+            )
+        else:
+            sort_song = (item.song or "").casefold()
+        fold = folds.get(item.artist)
+        if fold is None:
+            fold = normalize(item.artist)
+            folds[item.artist] = fold
+        digest = hashlib.sha1(
+            "\n".join(
+                [
+                    item.kind,
+                    item.artist or "",
+                    item.album or "",
+                    item.song or "",
+                    "" if item.album_id is None else str(item.album_id),
+                    "" if item.track_id is None else str(item.track_id),
+                    detail,
+                    payload or "",
+                    track_json or "",
+                    sort_artist,
+                    sort_album,
+                    sort_song,
+                    fold,
+                ]
+            ).encode()
+        ).hexdigest()
+        rows.append(
+            {
+                "key": item.key,
+                "kind": item.kind,
+                "artist": item.artist or "",
+                "artist_key": token,
+                "album": item.album or "",
+                "song": item.song or "",
+                "album_id": item.album_id,
+                "track_id": item.track_id,
+                "detail": detail,
+                "enabled": 1,
+                "sort_artist": sort_artist,
+                "sort_album": sort_album,
+                "sort_song": sort_song,
+                "kind_rank": rank,
+                "content_hash": digest,
+                "payload": payload,
+                "track_json": track_json,
+                "fold": fold,
+            }
+        )
+    return rows
+
+
+def album_sync_digest(album: dict, holes: list[dict]) -> str:
+    """Cheap fingerprint of one album and its missing tracks.
+
+    A resync compares this to the stored value and skips rebuilding rows when
+    nothing that would land in the catalog has changed.
+    """
+    bits = []
+    for hole in holes:
+        track = hole.get("track") or {}
+        bits.append(
+            (
+                optional_id(track.get("id")),
+                track.get("title") or "",
+                "" if track.get("trackNumber") is None else str(track.get("trackNumber")),
+                "" if track.get("mediumNumber") is None else str(track.get("mediumNumber")),
+                1 if track.get("monitored", True) else 0,
+                1 if track.get("hasFile") else 0,
+                hole.get("album_title") or "",
+            )
+        )
+    bits.sort()
+    raw = "\n".join(
+        [
+            _dump(slim_album(album)) or "",
+            artist_name(album),
+            json.dumps(bits, separators=(",", ":"), ensure_ascii=False),
+        ]
+    )
+    return hashlib.sha1(raw.encode()).hexdigest()
+
+
+def album_page_fingerprint(album: dict) -> str:
+    """Fingerprint of the album fields Lidarr puts on a wanted/missing page.
+
+    Track titles are not in that payload. A resync uses this to decide whether
+    a track request is needed.
+    """
+    stats = album.get("statistics") if isinstance(album.get("statistics"), dict) else {}
+    artist = album.get("artist") if isinstance(album.get("artist"), dict) else {}
+    releases = []
+    raw_releases = album.get("releases")
+    if isinstance(raw_releases, list):
+        for release in raw_releases:
+            if not isinstance(release, dict):
+                continue
+            releases.append(
+                (
+                    str(release.get("foreignReleaseId") or release.get("id") or ""),
+                    str(release.get("title") or ""),
+                    release.get("trackCount"),
+                    bool(release.get("monitored", True)),
+                )
+            )
+    releases.sort()
+    payload = {
+        "id": album.get("id"),
+        "title": album.get("title") or "",
+        "artistId": album.get("artistId") or artist.get("id"),
+        "artistName": artist.get("artistName") or album.get("artistName") or "",
+        "monitored": bool(album.get("monitored", True)),
+        "releaseDate": album.get("releaseDate") or "",
+        "lastSearchTime": album.get("lastSearchTime") or "",
+        "anyReleaseOk": album.get("anyReleaseOk", True),
+        "foreignAlbumId": album.get("foreignAlbumId") or "",
+        "trackCount": stats.get("trackCount"),
+        "trackFileCount": stats.get("trackFileCount"),
+        "totalTrackCount": stats.get("totalTrackCount"),
+        "sizeOnDisk": stats.get("sizeOnDisk"),
+        "percentOfTracks": stats.get("percentOfTracks"),
+        "releases": releases,
+    }
+    return hashlib.sha1(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+
+
+def _artist_id_of(album: dict) -> int | None:
+    artist = album.get("artist") if isinstance(album.get("artist"), dict) else {}
+    return optional_id(album.get("artistId") or artist.get("id"))
+
+
+def _track_workers(client) -> int:
+    raw = getattr(client, "track_concurrency", 1)
+    try:
+        workers = int(raw or 1)
+    except (TypeError, ValueError):
+        workers = 1
+    return max(1, min(8, workers))
+
+
+def _fetch_tracks_for_albums(client, albums: list[dict], should_cancel) -> dict[int, list | None]:
+    """Track lists for albums that need a refresh.
+
+    ``None`` means the request failed and the album should stay queued.
+    Several albums by one artist use ``GET /api/v1/track?artistId=`` when the
+    client provides it. Lidarr's track list does not accept a repeated albumId.
+    """
+    use_artist = hasattr(client, "tracks_for_artist")
+    groups: dict[int | None, list[dict]] = {}
+    for album in albums:
+        artist_id = _artist_id_of(album) if use_artist else None
+        groups.setdefault(artist_id, []).append(album)
+    jobs = []
+    for artist_id, group in groups.items():
+        if use_artist and artist_id is not None and len(group) > 1:
+            jobs.append(("artist", artist_id, group))
+        else:
+            for album in group:
+                jobs.append(("album", optional_id(album.get("id")), [album]))
+
+    def run(job) -> dict[int, list | None]:
+        kind, ident, group = job
+        album_ids = [optional_id(album.get("id")) for album in group]
+        if should_cancel is not None and should_cancel():
+            return {album_id: None for album_id in album_ids if album_id is not None}
+        try:
+            if kind == "artist":
+                tracks = client.tracks_for_artist(ident) or []
+                by_album: dict[int, list] = {}
+                if not isinstance(tracks, list):
+                    tracks = []
+                for track in tracks:
+                    if not isinstance(track, dict):
+                        continue
+                    aid = optional_id(track.get("albumId"))
+                    if aid is None and isinstance(track.get("album"), dict):
+                        aid = optional_id(track["album"].get("id"))
+                    if aid is not None:
+                        by_album.setdefault(aid, []).append(track)
+                if tracks and not by_album:
+                    # Tracks came back without an album id, so they cannot be
+                    # split. Leave the albums queued instead of wiping songs.
+                    return {album_id: None for album_id in album_ids if album_id is not None}
+                return {
+                    album_id: by_album.get(album_id, [])
+                    for album_id in album_ids
+                    if album_id is not None
+                }
+            if ident is None:
+                return {}
+            return {int(ident): client.tracks_for_album(ident) or []}
+        except Exception:
+            log.exception("Could not read Lidarr tracks")
+            return {album_id: None for album_id in album_ids if album_id is not None}
+
+    results: dict[int, list | None] = {}
+    workers = _track_workers(client)
+    if workers == 1 or len(jobs) <= 1:
+        for job in jobs:
+            results.update(run(job))
+        return results
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(jobs))) as pool:
+        futures = [pool.submit(run, job) for job in jobs]
+        for future in as_completed(futures):
+            results.update(future.result())
+    return results
+
+
+def _accept_album_page(store, albums: list[dict]) -> int:
+    """Save album rows and queue track lookups only for new or changed albums."""
+    usable = []
+    fingerprints: dict[str, str] = {}
+    for album in albums:
+        album_id = optional_id(album.get("id"))
+        if album_id is None:
+            continue
+        usable.append(album)
+        fingerprints[album_key(album_id)] = album_page_fingerprint(album)
+    matched = store.matching_page_fingerprints(fingerprints) if fingerprints else {}
+    needs = []
+    seen_ids = []
+    unchanged_artists = []
+    unchanged_songs = 0
+    for album in usable:
+        album_id = optional_id(album.get("id"))
+        key = album_key(album_id)
+        seen_ids.append(album_id)
+        if key in matched:
+            unchanged_artists.append(artist_key(artist_name(album)))
+            unchanged_songs += matched[key]
+        else:
+            needs.append(album)
+    if unchanged_artists:
+        store.note_unchanged_keys(unchanged_artists, len(unchanged_artists), unchanged_songs)
+    store.note_sync_albums(seen_ids)
+    if needs:
+        store.write_wanted_page(items_to_rows(build_catalog(needs, [])))
+        store.queue_albums_for_tracks(
+            [
+                (optional_id(album.get("id")), _artist_id_of(album), album_page_fingerprint(album))
+                for album in needs
+            ]
+        )
+    return len(usable)
+
+
+def _album_for_tracks(item: dict) -> dict:
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    album = dict(payload)
+    album["id"] = item["album_id"]
+    album.setdefault("title", item.get("title") or "Unknown Album")
+    artist = album.get("artist") if isinstance(album.get("artist"), dict) else {}
+    if not artist.get("artistName"):
+        artist = dict(artist)
+        artist["artistName"] = item.get("artist") or "Unknown Artist"
+        album["artist"] = artist
+    if item.get("artist_id") is not None:
+        album["artistId"] = item["artist_id"]
+    return album
+
+
+def _store_tracks(store, item: dict, tracks: list) -> None:
+    album = _album_for_tracks(item)
+    holes = missing_holes(album, tracks)
+    songs = []
+    for hole in holes:
+        song = _song_item(item.get("artist") or artist_name(album), hole)
+        if song is not None:
+            songs.append(song)
+    rows = items_to_rows(songs) if songs else []
+    store.replace_album_songs(item["album_id"], rows, item["fingerprint"])
+
+
+def _drain_track_queue(client, store, should_cancel, on_progress, albums_seen: int) -> bool:
+    """Fetch queued tracks. A failed album stays queued for the next Sync.
+
+    Artists that fail are skipped for the rest of this pass so a downed Lidarr
+    does not retry the same request until the pass ends.
+    """
+    cancelled = False
+    failed_artists: set[int] = set()
+    skip_unassigned = False
+    while True:
+        if should_cancel is not None and should_cancel():
+            cancelled = True
+            break
+        queued = store.next_queued_albums(
+            skip_artists=failed_artists,
+            include_unassigned=not skip_unassigned,
+        )
+        if not queued:
+            break
+        albums = [_album_for_tracks(item) for item in queued]
+        fetched = _fetch_tracks_for_albums(client, albums, should_cancel)
+        for item in queued:
+            tracks = fetched.get(item["album_id"])
+            if tracks is None:
+                if item.get("artist_id") is None:
+                    skip_unassigned = True
+                else:
+                    failed_artists.add(int(item["artist_id"]))
+                continue
+            _store_tracks(store, item, tracks)
+        if on_progress is not None:
+            on_progress(store.wanted_row_count(), albums_seen)
+        if should_cancel is not None and should_cancel():
+            cancelled = True
+            break
+    return cancelled
+
+
+def _load_page(client, batch, should_cancel):
+    cancelled = False
+    albums: list[dict] = []
+    holes: list[dict] = []
+    for album in batch:
+        if should_cancel is not None and should_cancel():
+            cancelled = True
+            break
+        if not isinstance(album, dict):
+            log.warning("Skipping an album that is not an object")
+            continue
+        album_id = optional_id(album.get("id"))
+        if album_id is None:
+            log.warning("Skipping album %s: no usable id", album.get("title") or "?")
+            continue
+        albums.append(album)
+        try:
+            tracks = client.tracks_for_album(album_id) or []
+        except Exception:
+            log.exception("Could not read tracks for %s", album.get("title") or album_id)
+            tracks = []
+        holes.extend(missing_holes(album, tracks))
+    return albums, holes, cancelled
+
+
+def _page_plan(albums: list[dict], holes: list[dict]):
+    by_album: dict[int, list[dict]] = {}
+    for hole in holes:
+        album_id = optional_id((hole.get("album") or {}).get("id"))
+        if album_id is not None:
+            by_album.setdefault(album_id, []).append(hole)
+    digests: dict[str, str] = {}
+    song_counts: dict[str, int] = {}
+    artists: dict[str, str] = {}
+    for album in albums:
+        album_id = optional_id(album.get("id"))
+        if album_id is None:
+            continue
+        key = album_key(album_id)
+        own = by_album.get(album_id, [])
+        digests[key] = album_sync_digest(album, own)
+        song_counts[key] = len(own)
+        artists[key] = artist_key(artist_name(album))
+    return digests, song_counts, artists
+
+
+def _rows_for_changed(
+    albums: list[dict],
+    holes: list[dict],
+    unchanged: set[str],
+    digests: dict[str, str],
+) -> list[dict]:
+    changed_albums = []
+    changed_ids: set[int] = set()
+    for album in albums:
+        album_id = optional_id(album.get("id"))
+        if album_id is None or album_key(album_id) in unchanged:
+            continue
+        changed_albums.append(album)
+        changed_ids.add(album_id)
+    if not changed_albums:
+        return []
+    changed_holes = [
+        hole for hole in holes if optional_id((hole.get("album") or {}).get("id")) in changed_ids
+    ]
+    rows = items_to_rows(build_catalog(changed_albums, changed_holes))
+    for row in rows:
+        if row["kind"] == "album":
+            row["sync_digest"] = digests.get(row["key"])
+    return rows
+
+
+def _write_loaded_page(store, albums: list[dict], holes: list[dict]) -> int:
+    digests, song_counts, artists = _page_plan(albums, holes)
+    unchanged = store.unchanged_album_keys(digests) if digests else set()
+    if unchanged:
+        store.note_unchanged_keys(
+            [artists[key] for key in unchanged],
+            len(unchanged),
+            sum(song_counts.get(key, 0) for key in unchanged),
+        )
+    rows = _rows_for_changed(albums, holes, unchanged, digests)
+    if rows:
+        store.write_wanted_page(rows)
+    return len(unchanged) + sum(1 for row in rows if row["kind"] == "album")
+
+
+def _note_loaded_page(store, albums: list[dict], holes: list[dict]) -> None:
+    digests, _song_counts, artists = _page_plan(albums, holes)
+    unchanged = store.unchanged_album_keys(digests) if digests else set()
+    if unchanged:
+        store.note_seen_unchanged(
+            [int(key.split(":", 1)[1]) for key in unchanged],
+            [artists[key] for key in unchanged],
+        )
+    rows = _rows_for_changed(albums, holes, unchanged, digests)
+    if rows:
+        store.note_seen_keys([row["key"] for row in rows])
+
+
+def _delete_unseen(client, store, *, max_pages: int, page_size: int, should_cancel) -> int | None:
+    """Second Lidarr walk, used only when the first walk proved rows were removed.
+
+    Returns the new row count. Returns None when the walk is cancelled or does
+    not reach the end, and leaves every saved row in place.
+    """
+    store.begin_delete_pass()
+    try:
+        page = 1
+        pages = 0
+        limit = max(1, int(max_pages or 1))
+        exhausted = False
+        while pages < limit:
+            if should_cancel is not None and should_cancel():
+                store.abort_delete_pass()
+                return None
+            batch, next_page, exhausted = client.wanted_missing(
+                start_page=page,
+                max_pages=1,
+                page_size=page_size,
+                should_cancel=should_cancel,
+            )
+            pages += 1
+            if should_cancel is not None and should_cancel():
+                store.abort_delete_pass()
+                return None
+            if not batch:
+                exhausted = True
+                break
+            albums, holes, cancelled = _load_page(client, batch, should_cancel)
+            if albums:
+                _note_loaded_page(store, albums, holes)
+            if cancelled:
+                store.abort_delete_pass()
+                return None
+            if exhausted:
+                break
+            page = next_page if next_page else page + 1
+        if not exhausted:
+            store.abort_delete_pass()
+            return None
+        return store.finish_delete_pass()
+    except Exception:
+        try:
+            store.abort_delete_pass()
+        except Exception:
+            log.exception("Could not abandon the wanted delete pass")
+        raise
+
+
+def sync_wanted_catalog(
+    client,
+    store,
+    *,
+    max_pages: int = 200_000,
+    page_size: int = 250,
+    on_progress=None,
+    should_cancel=None,
+) -> tuple[int, bool, bool]:
+    """Stream Lidarr wanted/missing into the job store, one page at a time.
+
+    Album rows are written as each page arrives. Track requests run in the same
+    sync, after the pages, and only for albums whose wanted/missing fields
+    changed. Titles are not loaded on expand: the song filter and the worker
+    need the missing titles, and album statistics do not name them. A track
+    title edit that does not change those album fields waits until an album
+    field changes. A cancelled or crashed sync continues at the next page, or
+    at the remaining track queue, instead of starting over. A failed track
+    request stays queued. Returns ``(row_count, exhausted, cancelled)``.
+    """
+    phase, page = store.prepare_catalog_sync()
+    cancelled = False
+    exhausted = phase == "tracks"
+    albums_seen = store.wanted_kind_count("album") if phase == "tracks" else 0
+    limit = max(1, int(max_pages or 1))
+    try:
+        if phase != "tracks":
+            pages = 0
+            while pages < limit:
+                if should_cancel is not None and should_cancel():
+                    cancelled = True
+                    break
+                batch, next_page, exhausted = client.wanted_missing(
+                    start_page=page,
+                    max_pages=1,
+                    page_size=page_size,
+                    should_cancel=should_cancel,
+                )
+                pages += 1
+                if should_cancel is not None and should_cancel():
+                    cancelled = True
+                    if batch:
+                        albums_seen += _accept_album_page(store, batch)
+                        if on_progress is not None:
+                            on_progress(store.wanted_row_count(), albums_seen)
+                        if not exhausted:
+                            store.checkpoint_sync_page(next_page if next_page else page + 1)
+                    break
+                if not batch:
+                    if not exhausted and should_cancel is not None and should_cancel():
+                        cancelled = True
+                    else:
+                        exhausted = True
+                    break
+                albums_seen += _accept_album_page(store, batch)
+                if on_progress is not None:
+                    on_progress(store.wanted_row_count(), albums_seen)
+                if exhausted:
+                    break
+                store.checkpoint_sync_page(next_page if next_page else page + 1)
+                page = next_page if next_page else page + 1
+                if should_cancel is not None and should_cancel():
+                    cancelled = True
+                    break
+            if cancelled or not exhausted:
+                count = store.finish_wanted_sync(complete=False)
+                return count, False, cancelled
+            if store.sync_walk_is_full():
+                store.delete_albums_not_seen()
+            store.mark_track_phase()
+        cancelled = _drain_track_queue(client, store, should_cancel, on_progress, albums_seen)
+        if cancelled:
+            count = store.finish_wanted_sync(complete=False)
+            return count, False, True
+        if store.track_queue_pending():
+            count = store.finish_wanted_sync(complete=False)
+            return count, False, False
+        store.mark_sync_done()
+        count = store.finish_wanted_sync(complete=True)
+        return count, True, False
+    except Exception:
+        try:
+            store.finish_wanted_sync(complete=False)
+        except Exception:
+            log.exception("Could not close the wanted sync")
+        raise

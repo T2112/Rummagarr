@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -11,20 +12,49 @@ log = logging.getLogger("lidarr_slsk")
 
 
 class LidarrClient:
-    def __init__(self, base_url: str, api_key: str, timeout: float = 60.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        timeout: float = 60.0,
+        track_concurrency: int = 6,
+    ) -> None:
+        self.track_concurrency = max(1, min(8, int(track_concurrency or 1)))
         self._client = httpx.Client(
             base_url=base_url,
             headers={"X-Api-Key": api_key, "Accept": "application/json"},
             timeout=timeout,
+            limits=httpx.Limits(
+                max_connections=self.track_concurrency + 2,
+                max_keepalive_connections=self.track_concurrency + 2,
+            ),
         )
 
     def close(self) -> None:
         self._client.close()
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        r = self._client.get(f"/api/v1{path}", params=params)
-        r.raise_for_status()
-        return r.json()
+        delay = 0.4
+        last_error: Exception | None = None
+        for attempt in range(4):
+            try:
+                response = self._client.get(f"/api/v1{path}", params=params)
+            except httpx.TransportError as exc:
+                last_error = exc
+                if attempt == 3:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 8)
+                continue
+            if response.status_code in {429, 502, 503, 504} and attempt < 3:
+                time.sleep(delay)
+                delay = min(delay * 2, 8)
+                continue
+            response.raise_for_status()
+            return response.json()
+        if last_error is not None:
+            raise last_error
+        raise httpx.HTTPError(f"Lidarr did not answer {path}")
 
     def _post(self, path: str, payload: dict[str, Any]) -> Any:
         r = self._client.post(f"/api/v1{path}", json=payload)
@@ -82,7 +112,13 @@ class LidarrClient:
         return albums, next_page, exhausted
 
     def tracks_for_album(self, album_id: int) -> list[dict[str, Any]]:
-        return self._get("/track", params={"albumId": album_id}) or []
+        payload = self._get("/track", params={"albumId": album_id}) or []
+        return payload if isinstance(payload, list) else []
+
+    def tracks_for_artist(self, artist_id: int) -> list[dict[str, Any]]:
+        """Every track for one artist. Lidarr has no multi-album id on this route."""
+        payload = self._get("/track", params={"artistId": int(artist_id)}) or []
+        return payload if isinstance(payload, list) else []
 
     def albums(self) -> list[dict[str, Any]]:
         return self._get("/album") or []

@@ -81,3 +81,26 @@ def test_check_updates_defaults_on_when_the_key_is_missing(tmp_path: Path):
     path.write_text(text, encoding="utf-8")
     assert "check_updates =" not in text
     assert try_load_config(path).check_updates is True
+
+
+def test_lidarr_track_concurrency_defaults_and_clamps(tmp_path: Path):
+    path = tmp_path / "config.toml"
+    cfg = default_config(
+        lidarr_api_key="abc123",
+        slsk_username="souluser",
+        slsk_password="soulpass",
+        download_dir=tmp_path / "in",
+        complete_dir=tmp_path / "out",
+    )
+    assert cfg.lidarr_track_concurrency == 6
+    save_config(path, cfg)
+    text = path.read_text(encoding="utf-8")
+    assert "lidarr_track_concurrency = 6" in text
+    assert try_load_config(path).lidarr_track_concurrency == 6
+    path.write_text(text.replace("lidarr_track_concurrency = 6\n", ""), encoding="utf-8")
+    assert "lidarr_track_concurrency =" not in path.read_text(encoding="utf-8")
+    assert try_load_config(path).lidarr_track_concurrency == 6
+    path.write_text(text.replace("lidarr_track_concurrency = 6", "lidarr_track_concurrency = 100"), encoding="utf-8")
+    assert try_load_config(path).lidarr_track_concurrency == 8
+    path.write_text(text.replace("lidarr_track_concurrency = 6", "lidarr_track_concurrency = 0"), encoding="utf-8")
+    assert try_load_config(path).lidarr_track_concurrency == 1
