@@ -51,6 +51,7 @@ from wanted import (
     children_by_artist,
     choice_updates,
     filter_view,
+    is_enabled,
     item_checked,
     select_all_state,
     select_all_updates,
@@ -61,8 +62,6 @@ from worker import Worker
 
 log = logging.getLogger("lidarr_slsk.desktop")
 
-CHECKED = "☑"
-UNCHECKED = "☐"
 DONE_TRANSFER = {"COMPLETE", "FAILED", "ABORTED"}
 # 200,000 pages × 250 albums. Enough for a multi-million wanted list.
 # Sync can be cancelled before it finishes; pages already saved stay on disk.
@@ -837,7 +836,9 @@ class DesktopApp(tk.Tk):
         self._wanted_total = 0
         self._sql_mode = False
         self._cursors: list[tuple] = []
-        self._shown: dict[str, bool] = {}
+        self._shown: dict[str, str] = {}
+        self._row_checks: dict[str, str] = {}
+        self._check_images: dict[str, tk.PhotoImage] = {}
         self._choices_cache: dict[str, bool] | None = None
         self._choice_job = 0
         self._transfer_index: dict[str, int] = {}
@@ -999,7 +1000,6 @@ class DesktopApp(tk.Tk):
         self.count_label.pack(anchor="w", pady=(0, 6))
         frame = ttk.Frame(parent)
         columns = (
-            ("mark", "", 46, False),
             ("kind", "Kind", 80, False),
             ("artist", "Artist", 180, True),
             ("album", "Album", 220, True),
@@ -1007,17 +1007,17 @@ class DesktopApp(tk.Tk):
             ("detail", "Detail", 180, True),
         )
         names = [column[0] for column in columns]
-        self.wanted = ttk.Treeview(frame, columns=names, show="headings", selectmode="browse")
+        self._check_images = {state: self._checkbox_image(state) for state in ("on", "off", "mixed")}
+        self.wanted = ttk.Treeview(frame, columns=names, show="tree headings", selectmode="browse")
         self.wanted_scroll = ttk.Scrollbar(frame, orient="vertical", command=self._wanted_scroll)
         self.wanted.grid(row=0, column=0, sticky="nsew")
         self.wanted_scroll.grid(row=0, column=1, sticky="ns")
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
+        self.wanted.column("#0", width=44, minwidth=44, stretch=False, anchor="center")
+        self.wanted.heading("#0", text="")
         for name, heading, width, stretch in columns:
-            if name == "mark":
-                self.wanted.heading(name, text=heading)
-            else:
-                self.wanted.heading(name, text=heading, command=lambda column=name: self.on_wanted_sort(column))
+            self.wanted.heading(name, text=heading, command=lambda column=name: self.on_wanted_sort(column))
             self.wanted.column(name, width=width, minwidth=40, anchor="w", stretch=stretch)
         frame.pack(fill="both", expand=True)
         self.wanted.bind("<Button-1>", self.on_wanted_click)
@@ -1327,27 +1327,37 @@ class DesktopApp(tk.Tk):
         enabled = bool(self.select_all_var.get())
         self._apply_choices(select_all_updates(visible, items, enabled))
 
+    def checkbox_state(self, iid: str) -> str:
+        return self._row_checks.get(iid, "on")
+
     def on_wanted_click(self, event) -> None:
-        if self.wanted.identify_region(event.y) not in {"cell", "tree"}:
+        # identify_region needs both coordinates. Passing only y raises
+        # TypeError, and Tk then drops the click, so the box never toggles.
+        region = self.wanted.identify_region(event.x, event.y)
+        if region not in {"cell", "tree"}:
             return
         row = self.wanted.identify_row(event.y)
-        column = self.wanted.identify_column(event.x)
-        if not row or column != "#1":
+        if not row or row not in self._row_items:
             return
+        column = str(self.wanted.identify_column(event.x))
+        if region != "tree" and column != "#0":
+            return
+        self.wanted.selection_set(row)
+        self.wanted.focus(row)
         self.toggle_row(row)
         return "break"
 
     def on_wanted_space(self, _event) -> None:
-        selected = self.wanted.selection()
-        if selected:
-            self.toggle_row(selected[0])
+        for iid in self.wanted.selection():
+            self.toggle_row(iid)
+        return "break"
 
     def toggle_row(self, iid: str) -> None:
         item = self._row_items.get(iid)
         if item is None or not item.key:
             return
         if self.worker.store.wanted_catalog_ready():
-            enabled = not self._shown.get(item.key, True)
+            enabled = self._shown.get(item.key, "on") != "on"
             if item.kind == "artist":
                 self.worker.store.set_artist_enabled(artist_token(item.artist), enabled)
             else:
@@ -1554,7 +1564,7 @@ class DesktopApp(tk.Tk):
         self._cursors = []
         for key, kind, artist, album, song, detail, shown, cursor in page:
             items.append(WantedItem(kind=kind, key=key, artist=artist, album=album, song=song, detail=detail))
-            self._shown[key] = shown
+            self._shown[key] = shown if shown in {"on", "off", "mixed"} else ("on" if shown else "off")
             self._cursors.append(cursor)
         self._fill_tree(items, total)
         if not counts or self._syncing:
@@ -1568,8 +1578,40 @@ class DesktopApp(tk.Tk):
         if not str(self.wanted_status.get()).startswith("Saving "):
             self.wanted_status.set(f"{checked:,} of {view_total:,} selected in this view.")
 
+    def _checkbox_image(self, state: str) -> tk.PhotoImage:
+        """A drawn box, so the control does not depend on a Unicode font."""
+        size = 16
+        image = tk.PhotoImage(master=self, width=size, height=size)
+        border = "#d5d5d5"
+        if state == "off":
+            fill = "#2a2a2a"
+            glyph = None
+        else:
+            fill = "#3d8bfd"
+            glyph = "#ffffff"
+        image.put(border, to=(0, 0, size, size))
+        image.put(fill, to=(2, 2, size - 2, size - 2))
+        if state == "on":
+            for x, y in (
+                (3, 8), (4, 9), (5, 10), (6, 11), (7, 10), (8, 9), (9, 8), (10, 7), (11, 6), (12, 5),
+                (4, 8), (5, 9), (6, 10), (7, 9), (8, 8), (9, 7), (10, 6), (11, 5),
+            ):
+                image.put(glyph, to=(x, y, x + 1, y + 1))
+        elif state == "mixed":
+            image.put(glyph, to=(4, 7, 12, 10))
+        return image
+
+    def _row_values(self, item: WantedItem) -> tuple:
+        return (item.kind.title(), item.artist, item.album, item.song, item.detail)
+
+    def _paint_check(self, iid: str, item: WantedItem, state: str) -> None:
+        self.wanted.item(iid, text="", image=self._check_images[state], values=self._row_values(item))
+        self._row_checks[iid] = state
+        self._row_items[iid] = item
+
     def _fill_tree(self, items: list[WantedItem], total: int) -> None:
         self._row_items.clear()
+        self._row_checks.clear()
         children = self.wanted.get_children()
         if not items:
             self.wanted.delete(*children)
@@ -1579,20 +1621,18 @@ class DesktopApp(tk.Tk):
                 text = "No artists match that search."
             else:
                 text = f"Nothing in {self.view_var.get() or VIEW_EVERYTHING}."
-            self.wanted.insert("", "end", values=("", "", text, "", "", ""))
+            self.wanted.insert("", "end", text="", values=("", text, "", "", ""))
             self.wanted_scroll.set(0, 1)
             return
 
-        def values(item: WantedItem) -> tuple:
-            mark = CHECKED if self._shown.get(item.key, True) else UNCHECKED
-            return (mark, item.kind.title(), item.artist, item.album, item.song, item.detail)
-
         if len(children) != len(items):
             self.wanted.delete(*children)
-            children = [self.wanted.insert("", "end", values=values(item)) for item in items]
+            children = [
+                self.wanted.insert("", "end", text="", image=self._check_images["on"], values=self._row_values(item))
+                for item in items
+            ]
         for iid, item in zip(children, items):
-            self.wanted.item(iid, values=values(item))
-            self._row_items[iid] = item
+            self._paint_check(iid, item, self._shown.get(item.key, "on"))
         if total <= len(items):
             self.wanted_scroll.set(0, 1)
         else:
@@ -1630,6 +1670,7 @@ class DesktopApp(tk.Tk):
             self._wanted_offset = max(0, min(self._wanted_offset, total - window))
         shown = rows[self._wanted_offset : self._wanted_offset + window]
         self._row_items.clear()
+        self._row_checks.clear()
         children = self.wanted.get_children()
         if not shown:
             self.wanted.delete(*children)
@@ -1637,25 +1678,39 @@ class DesktopApp(tk.Tk):
                 text = "Click Sync to load the wanted list from Lidarr."
             else:
                 text = f"Nothing in {self.view_var.get() or VIEW_EVERYTHING}."
-            self.wanted.insert("", "end", values=("", "", text, "", "", ""))
+            self.wanted.insert("", "end", text="", values=("", text, "", "", ""))
             self.wanted_scroll.set(0, 1)
             return
         if len(children) != len(shown):
             self.wanted.delete(*children)
-            children = []
-            for item in shown:
-                children.append(self.wanted.insert("", "end", values=self._wanted_values(item, choices, grouped)))
+            children = [
+                self.wanted.insert("", "end", text="", image=self._check_images["on"], values=self._row_values(item))
+                for item in shown
+            ]
         for iid, item in zip(children, shown):
-            self.wanted.item(iid, values=self._wanted_values(item, choices, grouped))
-            self._row_items[iid] = item
+            self._paint_check(iid, item, self._memory_check_state(item, choices, grouped))
         if total <= window:
             self.wanted_scroll.set(0, 1)
         else:
             self.wanted_scroll.set(self._wanted_offset / total, (self._wanted_offset + len(shown)) / total)
 
-    def _wanted_values(self, item: WantedItem, choices: dict[str, bool], grouped: dict[str, list[WantedItem]]) -> tuple:
-        mark = CHECKED if item_checked(item, self._wanted_rows, choices, grouped) else UNCHECKED
-        return (mark, item.kind.title(), item.artist, item.album, item.song, item.detail)
+    def _memory_check_state(
+        self,
+        item: WantedItem,
+        choices: dict[str, bool],
+        grouped: dict[str, list[WantedItem]],
+    ) -> str:
+        if item.kind != "artist":
+            return "on" if is_enabled(item.key, choices) else "off"
+        children = grouped.get(artist_token(item.artist), [])
+        if not children:
+            return "on" if is_enabled(item.key, choices) else "off"
+        flags = [is_enabled(row.key, choices) for row in children]
+        if all(flags):
+            return "on"
+        if any(flags):
+            return "mixed"
+        return "off"
 
 
     def check_for_updates(self, manual: bool = True) -> None:

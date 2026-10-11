@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## [1.7.1] — 2026-10-11
+
+### Fixed
+
+- Wanted checkboxes respond to a click. The handler asked which part of the row was clicked with the wrong arguments, so Tk discarded every click on a box. Each row now draws a checkbox image, which shows on Windows 10 and 11 without a special font. Click the box to toggle it. Click the rest of the row to select it. Space toggles the selected row. A click still saves while Sync is running, and the next page does not turn it back on. An artist box checks or unchecks that artist's albums and songs, and shows a mixed mark when only some of them are checked.
+
 ## [1.7.0] — 2026-10-11
 
 ### Changed
