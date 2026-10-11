@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [1.8.0] — 2026-10-11
+
+### Added
+
+- The Status tab names what the worker is doing. It stays on Idle only when nothing is selected. A search shows the artist and album, which query is running, how many results have arrived, and how long the step has taken. The same text is on the browser status page.
+- Search is a new tab for typing a Soulseek query yourself. Results show up while they arrive, grouped by user, with speed, free slot or queue, size, bitrate, length, and format. Filter the list, then download a file or a folder into the same queue Lidarr already imports from. It uses the worker's Soulseek login.
+- Each Wanted row has a magnifying glass. Click it to open Search with that artist, album, or song already filled in. A download from that search is tied to the Lidarr album or track.
+
 ## [1.7.1] — 2026-10-11
 
 ### Fixed
