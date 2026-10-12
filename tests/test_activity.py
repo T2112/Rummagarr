@@ -152,8 +152,7 @@ def test_search_send_timeout_reports_the_session(tmp_path, monkeypatch):
     try:
         text = asyncio.run(scenario())
     finally:
-        worker.client = None
-        worker.close()
+        _disarm(worker)
     assert "did not accept" in text
     assert "login=yes" in text
     assert "loop_lag=" in text
@@ -196,8 +195,7 @@ def test_connected_requires_a_live_server(tmp_path):
         assert responsive is True
         assert label == "Soulseek connected"
     finally:
-        worker.client = None
-        worker.close()
+        _disarm(worker)
 
 
 def test_search_wait_is_not_reported_as_idle(tmp_path):
@@ -297,8 +295,17 @@ def _arm_search(worker):
         def tracks_for_album(self, album_id):
             return [{"id": int(album_id) * 10, "title": "Blue", "monitored": True, "hasFile": False, "trackNumber": 1}]
 
+    worker._real_lidarr = worker.lidarr
     worker.lidarr = Lidarr()
     return found
+
+
+def _disarm(worker) -> None:
+    worker.client = None
+    real = getattr(worker, "_real_lidarr", None)
+    if real is not None:
+        worker.lidarr = real
+    worker.close()
 
 
 def _one_pass(worker) -> int:
@@ -344,8 +351,7 @@ def test_nothing_to_search_does_not_restart_the_five_second_wait(tmp_path):
         assert "Ella Langley" in text
         assert pause > 3600
     finally:
-        worker.client = None
-        worker.close()
+        _disarm(worker)
 
 
 def test_partial_album_without_songs_does_not_block_the_next_artist(tmp_path):
@@ -370,8 +376,7 @@ def test_partial_album_without_songs_does_not_block_the_next_artist(tmp_path):
         assert "Aaa First" in text
         assert pause > 60
     finally:
-        worker.client = None
-        worker.close()
+        _disarm(worker)
 
 
 def test_imported_album_is_not_marked_visited(tmp_path):
@@ -398,8 +403,7 @@ def test_imported_album_is_not_marked_visited(tmp_path):
         assert "next artist in 5s" not in text
         assert pause != 5
     finally:
-        worker.client = None
-        worker.close()
+        _disarm(worker)
 
 
 def test_legacy_artist_prefix_cooldowns_expire_on_the_real_clock(tmp_path):
@@ -429,8 +433,7 @@ def test_legacy_artist_prefix_cooldowns_expire_on_the_real_clock(tmp_path):
         assert "next artist in 5s" not in text
         assert "5s" not in text
     finally:
-        worker.client = None
-        worker.close()
+        _disarm(worker)
 
 
 def test_countdown_reaches_zero_then_searches_the_next_artist(tmp_path):
@@ -459,8 +462,7 @@ def test_countdown_reaches_zero_then_searches_the_next_artist(tmp_path):
         _one_pass(worker)
         assert any("ella langley" in query.casefold() for query in found)
     finally:
-        worker.client = None
-        worker.close()
+        _disarm(worker)
 
 
 def test_same_artist_without_a_search_waits_instead_of_spinning(tmp_path):
