@@ -192,6 +192,101 @@ def search_receipt(results) -> tuple[int, int, int]:
     return len(rows), len(files_from_results(rows)), locked
 
 
+def counts_for_server(folders: int, files: int) -> tuple[int, int]:
+    """Folder and file totals to send in SharedFoldersFiles.
+
+    A client that reports files but zero folders is treated as misreporting, and
+    other clients ignore its searches. Zero files stays zero: inventing a share
+    is the same kind of misreport.
+    """
+    try:
+        folder_count = max(0, int(folders))
+    except (TypeError, ValueError):
+        folder_count = 0
+    try:
+        file_count = max(0, int(files))
+    except (TypeError, ValueError):
+        file_count = 0
+    if file_count > 0 and folder_count <= 0:
+        folder_count = 1
+    return folder_count, file_count
+
+
+def explain_search(
+    replies: int,
+    shown: int,
+    locked: int,
+    *,
+    logged_in: bool,
+    server_connected: bool,
+    listen_port: int,
+    share_files: int | None,
+    share_folders: int,
+    parent_name: str,
+    scanning: bool,
+) -> str:
+    """Why a search listed nothing, or how many files it listed.
+
+    ``share_files`` is None when this process cannot see the share totals.
+    """
+    if shown > 0:
+        noun = "file" if shown == 1 else "files"
+        return f"Listed {shown} {noun}."
+    if not logged_in:
+        return "No results (0 peer replies). Soulseek is not logged in, so the search was not sent."
+    if not server_connected:
+        return "No results (0 peer replies). The server connection is down, so the search was not sent."
+    if replies <= 0 and not listen_port:
+        return "No results (0 peer replies). The listen port is closed, so peers cannot deliver results."
+    if replies <= 0 and share_files is not None and share_files <= 0:
+        if scanning:
+            return (
+                "No results (0 peer replies). The share scan is still running and Soulseek has been told "
+                "this client shares 0 files. Other users often ignore that search until the scan reports files."
+            )
+        return (
+            "No results (0 peer replies). This client is sharing 0 files. "
+            "Other users often ignore searches from a client that shares nothing."
+        )
+    if replies <= 0:
+        parent = parent_name or "none"
+        files = "unknown" if share_files is None else str(share_files)
+        port = listen_port or "closed"
+        return (
+            f"No results (0 peer replies). The search was sent. Listening on port {port}. "
+            f"Sharing {files} files in {share_folders} folders. Distributed parent: {parent}."
+        )
+    reply_word = "reply" if replies == 1 else "replies"
+    if locked:
+        file_word = "file was" if locked == 1 else "files were"
+        return (
+            f"No results ({replies} peer {reply_word}, 0 files shown). "
+            f"{locked} locked {file_word} hidden."
+        )
+    return f"No results ({replies} peer {reply_word}, 0 files shown)."
+
+
+def neutral_search_outcome(replies: int, shown: int, locked: int) -> str:
+    """Outcome when the connection state is not available to inspect."""
+    if shown > 0:
+        noun = "file" if shown == 1 else "files"
+        return f"Listed {shown} {noun}."
+    if replies <= 0:
+        return "No results (0 peer replies). No peer answered."
+    return explain_search(
+        replies,
+        shown,
+        locked,
+        logged_in=True,
+        server_connected=True,
+        listen_port=1,
+        share_files=None,
+        share_folders=0,
+        parent_name="",
+        scanning=False,
+    )
+
+
 def result_count(request) -> int:
     total = 0
     for result in list(getattr(request, "results", None) or []):

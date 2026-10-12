@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import struct
 
-from aioslsk.protocol.messages import FileSearch, Login, PeerInit, PeerSearchReply, ServerMessage
+from aioslsk.protocol.messages import FileSearch, Login, PeerInit, PeerSearchReply, ServerMessage, ServerSearchRequest
 from aioslsk.protocol.obfuscation import encode
 from aioslsk.protocol.primitives import Attribute, FileData
 
@@ -52,6 +52,9 @@ class MockSoulseek:
         self.obfuscated_port = 0
         self.mode = "clear"
         self.searches: list[tuple[int, str]] = []
+        # When set, the server pushes one distributed search right after login.
+        # A real server does this continuously once the client is a branch root.
+        self.push_server_search = False
         self.server: asyncio.Server | None = None
         self.port = 0
 
@@ -81,6 +84,20 @@ class MockSoulseek:
                         ).serialize()
                     )
                     await writer.drain()
+                    if self.push_server_search:
+                        # Another user's search, delivered the way the server
+                        # delivers them to a distributed branch root.
+                        writer.write(
+                            ServerSearchRequest.Response(
+                                distributed_code=3,
+                                unknown=0,
+                                username="browser",
+                                ticket=99,
+                                query="mp3",
+                            ).serialize()
+                        )
+                        await writer.drain()
+                        self.push_server_search = False
                 elif isinstance(message, FileSearch.Request):
                     self.searches.append((message.ticket, message.query))
                     asyncio.create_task(self._reply(message.ticket))

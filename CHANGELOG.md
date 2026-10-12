@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [1.9.2] — 2026-10-12
+
+### Fixed
+
+- A Search for a common artist stayed on "Searching…" and listed nothing. The same happened to automatic searches for wanted albums. 1.9.0 indexes the shared library. Until a distributed parent is chosen, the Soulseek server sends this client every search on the network, and answering one walks that index. Those answers ran on the same loop that sends our search and accepts the peers who reply. A large index, or a stream of those searches, never gave the loop a turn, so our search was not sent and the replies were not read. 1.9.1 paused during the share scan, which does not move those answers off the loop. Incoming share queries now run on a side thread, two at a time. Further ones are dropped. The loop keeps sending our search and reading replies. The scan still pauses between files.
+- A search that finishes with nothing leaves the Search tab, instead of staying on "Searching…". The status and the log say why. Examples: not logged in, the server connection is down, the listen port is closed, the client is sharing 0 files, the share scan has not reported files yet, peers answered but every file was locked, or the search was sent and no peer answered. If Soulseek does not accept the search within 30 seconds, the status says it was not sent.
+- A share report that has files but 0 folders is sent as 1 folder. Other clients ignore searches from a client that reports files in zero folders. A report of 0 files is left as 0 and written to the log. Inventing a file count is the same kind of misreport.
+
 ## [1.9.1] — 2026-10-12
 
 ### Fixed

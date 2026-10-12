@@ -514,6 +514,28 @@ def test_status_tab_shows_a_search_instead_of_idle(desktop):
     assert "Idle – nothing selected" in desktop.status_line.cget("text")
 
 
+def test_empty_search_settles_instead_of_staying_on_searching(desktop):
+    board = desktop._add_search_board("3 doors down", None)
+    desktop.searches.select(board.frame)
+    board.running = True
+    board.status.set("Searching…")
+    desktop.update()
+    request = type("Request", (), {"results": []})()
+    desktop._finish_search(board, request, None)
+    desktop.update()
+    text = board.status.get()
+    assert board.running is False
+    assert "Searching" not in text
+    assert "0 peer replies" in text
+    assert "not logged in" in text
+
+    desktop._search_failed(board, TimeoutError())
+    desktop.update()
+    failed = board.status.get()
+    assert "Searching" not in failed
+    assert "was not sent" in failed
+
+
 def test_magnifier_opens_a_folded_search(desktop):
     from search_model import SearchFile
 
