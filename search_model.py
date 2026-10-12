@@ -183,6 +183,15 @@ def files_from_results(results) -> list[SearchFile]:
     return found
 
 
+def search_receipt(results) -> tuple[int, int, int]:
+    """Peer replies received, files the Search tab can list, and locked files it hides."""
+    rows = list(results or [])
+    locked = 0
+    for result in rows:
+        locked += len(list(getattr(result, "locked_results", None) or []))
+    return len(rows), len(files_from_results(rows)), locked
+
+
 def result_count(request) -> int:
     total = 0
     for result in list(getattr(request, "results", None) or []):

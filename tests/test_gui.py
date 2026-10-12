@@ -4,6 +4,7 @@ import asyncio
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
 
 import pytest
 
@@ -265,6 +266,88 @@ def test_behavior_tab_saves_ranges_and_restore_defaults(tmp_path):
     assert saved["cfg"].concurrent_albums == 3
     assert saved["cfg"].check_updates is True
     root.destroy()
+
+
+def _widgets(widget):
+    yield widget
+    for child in widget.winfo_children():
+        yield from _widgets(child)
+
+
+def _label_named(form, text: str):
+    import tkinter.ttk as ttk
+
+    matches = [widget for widget in _widgets(form) if isinstance(widget, ttk.Label) and widget.cget("text") == text]
+    assert matches, text
+    return matches[0]
+
+
+def test_wait_before_next_artist_is_visible_and_the_behavior_tab_scrolls(tmp_path):
+    _tk_or_skip()
+    import tkinter as tk
+    import tkinter.ttk as ttk
+
+    from desktop_app import BEHAVIOR_FIELDS
+
+    keys = [spec.key for spec in BEHAVIOR_FIELDS]
+    assert keys.index("cycle_seconds") == keys.index("artist_cooldown_days") + 1
+    assert keys.index("cycle_seconds") < 4
+
+    root = tk.Tk()
+    root.geometry("760x640")
+    worker = make_worker(tmp_path)
+    path = tmp_path / "config.toml"
+    saved = {}
+    form = SettingsForm(
+        root,
+        path,
+        worker.cfg,
+        lambda cfg: saved.update(cfg=cfg),
+        root.destroy,
+        store=worker.store,
+    )
+    form.pack(fill="both", expand=True)
+    form.notebook.select(1)
+    root.update_idletasks()
+    root.update()
+
+    canvas = form._behavior_canvas
+    wait = _label_named(form, "Wait before next artist")
+    retry = _label_named(form, "Artist retry period")
+    assert retry.winfo_rooty() < wait.winfo_rooty()
+    top = wait.winfo_rooty() - canvas.winfo_rooty()
+    assert canvas.winfo_height() > 100
+    assert 0 <= top < canvas.winfo_height()
+
+    form.fields["cycle_seconds"].set("0")
+    assert form.save() is True
+    assert saved["cfg"].cycle_seconds == 0
+
+    bbox = canvas.bbox("all")
+    assert bbox is not None and bbox[3] > canvas.winfo_height()
+    canvas.yview_moveto(0)
+    root.update()
+    entry = next(
+        widget
+        for widget in _widgets(form)
+        if isinstance(widget, ttk.Entry) and str(widget.cget("textvariable")) == str(form.fields["cycle_seconds"])
+    )
+    entry.event_generate("<MouseWheel>", delta=-120, x=4, y=4)
+    root.update()
+    assert canvas.yview()[0] > 0
+    entry.event_generate("<Button-4>", x=4, y=4)
+    root.update()
+    assert canvas.yview()[0] == 0
+    root.destroy()
+
+
+def test_wait_field_is_part_of_the_pyinstaller_script():
+    root = Path(__file__).resolve().parents[1]
+    spec = (root / "packaging" / "lidarr_soulseek.spec").read_text(encoding="utf-8")
+    assert "desktop_app.py" in spec
+    source = (root / "desktop_app.py").read_text(encoding="utf-8")
+    assert '"cycle_seconds"' in source
+    assert '"Wait before next artist"' in source
 
 
 def test_settings_apply_message_says_when_a_restart_is_required():

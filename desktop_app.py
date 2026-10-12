@@ -256,6 +256,25 @@ class BehaviorField:
 
 
 BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
+    BehaviorField("focus_one_artist", "One artist at a time", "bool", "", "Stay on a single artist, then move on."),
+    BehaviorField(
+        "artist_cooldown_days",
+        "Artist retry period",
+        "float",
+        "days",
+        "After a visit, skip that artist for this many days. 0 lets the worker pick them again on a later pass. This is not the short wait between artists.",
+        0,
+        90,
+    ),
+    BehaviorField(
+        "cycle_seconds",
+        "Wait before next artist",
+        "int",
+        "seconds",
+        "How long to wait after one artist before starting the next artist that is ready. 0 starts that artist immediately, with no 'Waiting for retry period' notice. This is separate from Artist retry period.",
+        0,
+        7200,
+    ),
     BehaviorField("concurrent_albums", "Albums at once", "int", "", "How many albums to search or download together. 1 is one after another.", 1, 8),
     BehaviorField(
         "lidarr_track_concurrency",
@@ -268,28 +287,9 @@ BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
     ),
     BehaviorField("search_wait_seconds", "Search wait", "float", "seconds", "How long to wait for Soulseek results before scoring them.", 1, 90),
     BehaviorField("max_albums_per_cycle", "Albums per pass", "int", "", "Album searches started in one pass.", 1, 20),
-    BehaviorField("focus_one_artist", "One artist at a time", "bool", "", "Stay on a single artist, then move on."),
-    BehaviorField(
-        "artist_cooldown_days",
-        "Artist retry period",
-        "float",
-        "days",
-        "After a visit, skip that artist for this many days. 0 lets the worker pick them again on a later pass. This is not the short wait between artists.",
-        0,
-        90,
-    ),
     BehaviorField("max_missing_pages", "Wanted pages per pass", "int", "pages", "Lidarr wanted/missing pages read each pass. Each page is 250 albums.", 1, 200),
     BehaviorField("fill_missing_tracks", "Fill missing songs", "bool", "", "Search Soulseek for individual songs on albums Lidarr already has in part."),
     BehaviorField("max_tracks_per_cycle", "Songs per pass", "int", "", "Individual song searches started in one pass. 0 turns song fill off for that pass.", 0, 50),
-    BehaviorField(
-        "cycle_seconds",
-        "Wait before next artist",
-        "int",
-        "seconds",
-        "How long to wait after one artist before starting the next artist that is ready. 0 starts that artist immediately, with no 'Waiting for retry period' notice. This is separate from Artist retry period.",
-        0,
-        7200,
-    ),
     BehaviorField("retry_hours", "Retry a miss after", "int", "hours", "How long to wait before searching again for an album or song that did not match.", 0, 168),
     BehaviorField("min_filename_ratio", "Filename match", "float", "0–1", "How close a filename must be to the Lidarr title. Higher is stricter.", 0.2, 0.95),
     BehaviorField("track_count_tolerance", "Track count slack", "int", "tracks", "How many extra or missing files an album folder may have.", 0, 15),
@@ -628,9 +628,6 @@ class SettingsForm(ttk.Frame):
         canvas.configure(yscrollcommand=scroll.set)
         canvas.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
-        canvas.bind("<Enter>", self._wheel_on)
-        canvas.bind("<Leave>", self._wheel_off)
-        canvas.bind("<Destroy>", self._wheel_off)
         row = 0
         if self.history_var is not None:
             ttk.Label(inner, text="Recent history").grid(row=row, column=0, sticky="w", pady=(2, 0))
@@ -654,6 +651,10 @@ class SettingsForm(ttk.Frame):
             self._behavior_row(inner, row, spec)
             row += 2
         inner.columnconfigure(1, weight=1)
+        # Bind the wheel on every field. Enter/Leave on the canvas unbinds as
+        # soon as the pointer moves onto this inner frame, which is the whole
+        # page, so Windows never scrolled.
+        self._bind_behavior_wheel(parent)
 
     def _share_count_text(self) -> str:
         worker = self.worker
@@ -838,29 +839,24 @@ class SettingsForm(ttk.Frame):
             row=row + 1, column=0, columnspan=3, sticky="w", pady=(0, 2)
         )
 
-    def _wheel_on(self, _event) -> None:
-        canvas = self._behavior_canvas
-        if canvas is None:
+    def _bind_behavior_wheel(self, widget: tk.Misc) -> None:
+        if isinstance(widget, (tk.Scrollbar, ttk.Scrollbar)):
             return
-        canvas.bind_all("<Button-4>", self._wheel)
-        canvas.bind_all("<Button-5>", self._wheel)
-        canvas.bind_all("<MouseWheel>", self._wheel)
+        widget.bind("<MouseWheel>", self._wheel, add="+")
+        widget.bind("<Button-4>", self._wheel, add="+")
+        widget.bind("<Button-5>", self._wheel, add="+")
+        for child in widget.winfo_children():
+            self._bind_behavior_wheel(child)
 
-    def _wheel_off(self, _event) -> None:
+    def _wheel(self, event) -> str:
         canvas = self._behavior_canvas
         if canvas is None:
-            return
-        for sequence in ("<Button-4>", "<Button-5>", "<MouseWheel>"):
-            canvas.unbind_all(sequence)
-
-    def _wheel(self, event) -> None:
-        canvas = self._behavior_canvas
-        if canvas is None:
-            return
+            return "break"
         if getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
             canvas.yview_scroll(1, "units")
         else:
             canvas.yview_scroll(-1, "units")
+        return "break"
 
     def _path_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
@@ -2396,8 +2392,10 @@ class DesktopApp(tk.Tk):
 
     def _finish_search(self, board: SearchBoard, request, loop) -> None:
         board.running = False
+        results = getattr(request, "results", None)
+        self.worker.note_search_receipt(board.query, results)
         if not board.closed:
-            self.show_search_files(board, files_from_results(getattr(request, "results", None)))
+            self.show_search_files(board, files_from_results(results))
             if board.status is not None:
                 board.status.set(f"{len(board.files)} results")
         try:
