@@ -1,9 +1,23 @@
 from __future__ import annotations
 
+import gc
 from pathlib import Path
+
+import pytest
 
 from config_loader import Config
 from worker import Worker
+
+
+@pytest.fixture(autouse=True)
+def collect_tk_on_the_main_thread():
+    """Free leftover Tk objects before the next test starts a worker thread.
+
+    A StringVar or PhotoImage destroyed off the main thread waits one second
+    for a Tk loop that is not running. The parallel Lidarr lookup is that thread.
+    """
+    yield
+    gc.collect()
 
 
 def album(album_id: int, artist: str, title: str, *, files: int = 0, total: int = 10, artist_id: int = 1) -> dict:
