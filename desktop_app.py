@@ -1136,10 +1136,47 @@ class SearchBoard:
     row_users: dict[str, str] = field(default_factory=dict)
 
 
-class WantedPreview(tk.Toplevel):
-    """Albums this user has that are still on the Wanted list. All start checked."""
+def _wanted_word(count: int) -> str:
+    return "item" if count == 1 else "items"
 
-    def __init__(self, master: tk.Misc, matches, on_queue) -> None:
+
+def _attach_tip(widget: tk.Widget, text: str) -> None:
+    """A small hover note. The Search tab uses it to say who Download all wanted covers."""
+    tip: dict[str, tk.Toplevel | None] = {"window": None}
+
+    def hide(_event=None) -> None:
+        window = tip["window"]
+        if window is not None:
+            window.destroy()
+            tip["window"] = None
+
+    def show(_event=None) -> None:
+        if tip["window"] is not None:
+            return
+        window = tk.Toplevel(widget)
+        tip["window"] = window
+        window.wm_overrideredirect(True)
+        window.wm_geometry(f"+{widget.winfo_rootx() + 12}+{widget.winfo_rooty() + widget.winfo_height() + 4}")
+        tk.Label(
+            window,
+            text=text,
+            justify="left",
+            background="#2a2a2a",
+            foreground="#f2f2f2",
+            padx=8,
+            pady=4,
+            wraplength=380,
+        ).pack()
+
+    widget.bind("<Enter>", show)
+    widget.bind("<Leave>", hide)
+    widget.bind("<ButtonPress>", hide)
+
+
+class WantedPreview(tk.Toplevel):
+    """Wanted files about to be queued. All start checked."""
+
+    def __init__(self, master: tk.Misc, matches, on_queue, summary: str = "") -> None:
         super().__init__(master)
         self.title("Download wanted files")
         self.transient(master)
@@ -1151,9 +1188,12 @@ class WantedPreview(tk.Toplevel):
         self._checked = {index: True for index in range(len(self.matches))}
         frame = ttk.Frame(self, padding=12)
         frame.pack(fill="both", expand=True)
+        intro = "These files match the Wanted list. Uncheck any you do not want, then queue them."
+        if summary:
+            intro = summary + " Uncheck any you do not want, then queue them."
         ttk.Label(
             frame,
-            text="These files match the Wanted list. Uncheck any you do not want, then queue them.",
+            text=intro,
             style="Muted.TLabel",
             wraplength=700,
         ).pack(anchor="w", pady=(0, 8))
@@ -2124,8 +2164,12 @@ class DesktopApp(tk.Tk):
         self.search_button.pack(side="left", padx=(8, 0))
         hint = ttk.Label(
             parent,
-            text="Uses the worker's Soulseek login. Pause stops the worker's own searches and leaves this tab running.",
+            text=(
+                "Uses the worker's Soulseek login. Pause stops the worker's own searches and leaves this tab running. "
+                "Download all wanted uses every result unless a user is selected."
+            ),
             style="Muted.TLabel",
+            wraplength=760,
         )
         hint.pack(anchor="w", pady=(6, 6))
         self.searches = ttk.Notebook(parent)
@@ -2196,7 +2240,14 @@ class DesktopApp(tk.Tk):
         ttk.Button(actions, text="Download file(s)", command=self.download_selected_files).pack(side="left")
         ttk.Button(actions, text="Download folder", command=self.download_selected_folder).pack(side="left", padx=(8, 0))
         ttk.Button(actions, text="Download all from this user", command=self.download_all_from_user).pack(side="left", padx=(8, 0))
-        ttk.Button(actions, text="Download all wanted", command=self.download_all_wanted).pack(side="left", padx=(8, 0))
+        wanted_button = ttk.Button(actions, text="Download all wanted", command=self.download_all_wanted)
+        wanted_button.pack(side="left", padx=(8, 0))
+        _attach_tip(
+            wanted_button,
+            "With no user selected, this finds every wanted album and track for the searched artist "
+            "across all results, keeps the best source for each, and queues them. "
+            "Select a user, or one of their files, to limit it to that user.",
+        )
         ttk.Button(actions, text="Browse folder", command=self.browse_selected_folder).pack(side="left", padx=(8, 0))
         board.status = tk.StringVar(value="")
         ttk.Label(actions, textvariable=board.status, style="Muted.TLabel").pack(side="left", padx=(12, 0))
@@ -2629,24 +2680,79 @@ class DesktopApp(tk.Tk):
             return
         self.queue_search_files(board, chosen)
 
+    def _search_wanted_scope(self, board: SearchBoard) -> dict:
+        link = board.link
+        if link is not None and (link.artist or "").strip():
+            kind = (link.kind or "artist").casefold()
+            return {
+                "artist": link.artist.strip(),
+                "album": (link.album or "").strip() if kind in {"album", "song"} else "",
+                "kind": kind,
+                "album_id": link.album_id if kind in {"album", "song"} else None,
+                "track_id": link.track_id if kind == "song" else None,
+                "title": (link.title or "").strip() if kind == "song" else "",
+            }
+        return {
+            "artist": (board.query or "").strip(),
+            "album": "",
+            "kind": "artist",
+            "album_id": None,
+            "track_id": None,
+            "title": "",
+        }
+
     def download_all_wanted(self) -> None:
         board = self._current_board()
         if board is None:
             return
         username = self._selected_username(board)
-        if not username:
-            if board.status is not None:
-                board.status.set("Select a user or one of their files.")
+        if username:
+            self._download_wanted_from_user(board, username)
             return
+        self._download_wanted_from_everyone(board)
+
+    def _download_wanted_from_user(self, board: SearchBoard, username: str) -> None:
         files = [item for item in board.files if item.username == username]
         matches = self.worker.match_user_files(files)
         if not matches:
+            text = f"No wanted matches in {username}'s results."
             if board.status is not None:
-                board.status.set(f"No wanted matches in {username}'s results.")
+                board.status.set(text)
+            log.info("Download all wanted from %s for %r: %s", username, board.query, text)
             return
-        WantedPreview(self, matches, lambda picked, board=board: self._queue_matches(board, picked))
+        text = f"{len(matches)} wanted {_wanted_word(len(matches))} matched from {username}."
+        if board.status is not None:
+            board.status.set(text)
+        log.info("Download all wanted from %s for %r: %s", username, board.query, text)
+        WantedPreview(self, matches, lambda picked, board=board: self._queue_matches(board, picked), summary=text)
 
-    def _queue_matches(self, board: SearchBoard, matches) -> None:
+    def _download_wanted_from_everyone(self, board: SearchBoard) -> None:
+        scope = self._search_wanted_scope(board)
+        artist = scope["artist"]
+        if not artist:
+            if board.status is not None:
+                board.status.set("Search for an artist first.")
+            return
+        plan = self.worker.plan_wanted_downloads(board.files, **scope)
+        text = plan.line()
+        extra = ""
+        if plan.skipped and plan.matched == 0 and plan.missing == 0:
+            extra = f" {plan.skipped} already downloaded or queued."
+        elif plan.matched == 0 and plan.missing == 0:
+            extra = " No wanted rows for this artist."
+        if board.status is not None:
+            board.status.set(text + extra)
+        log.info("Download all wanted for %r: %s%s", artist, text, extra)
+        if not plan.matches:
+            return
+        WantedPreview(
+            self,
+            plan.matches,
+            lambda picked, board=board, text=text: self._queue_matches(board, picked, note=text),
+            summary=text,
+        )
+
+    def _queue_matches(self, board: SearchBoard, matches, note: str = "") -> None:
         by_id = {item.id: item for item in board.files}
         files = []
         specs = []
@@ -2660,7 +2766,7 @@ class DesktopApp(tk.Tk):
             spec = file_spec(item)
             spec["link"] = match.link()
             specs.append(spec)
-        self.queue_search_files(board, files, specs=specs)
+        self.queue_search_files(board, files, specs=specs, note=note)
 
     def download_selected_files(self) -> None:
         self._queue_current(folder=False)
@@ -2682,7 +2788,13 @@ class DesktopApp(tk.Tk):
             return
         self.queue_search_files(board, chosen)
 
-    def queue_search_files(self, board: SearchBoard, files: list[SearchFile], specs: list[dict] | None = None) -> None:
+    def queue_search_files(
+        self,
+        board: SearchBoard,
+        files: list[SearchFile],
+        specs: list[dict] | None = None,
+        note: str = "",
+    ) -> None:
         loop = getattr(self.worker, "_loop", None)
         if loop is None or not loop.is_running():
             if board.status is not None:
@@ -2692,7 +2804,12 @@ class DesktopApp(tk.Tk):
             item.state = "queued"
         self._paint_search(board)
         if board.status is not None:
-            board.status.set(f"Queued {len(files)} file(s)")
+            message = f"Queued {len(files)} file(s)"
+            if note:
+                message = f"{message}. {note}"
+            board.status.set(message)
+            if note:
+                log.info("%s", message)
         link = None
         if board.link is not None:
             link = {
@@ -2792,6 +2909,10 @@ class DesktopApp(tk.Tk):
         if row and row not in tree.selection():
             tree.selection_set(row)
         if self._search_menu is not None:
+            board = self._current_board()
+            username = self._selected_username(board) if board is not None else ""
+            label = "Download all wanted from this user" if username else "Download all wanted from every user"
+            self._search_menu.entryconfig(3, label=label)
             self._search_menu.tk_popup(event.x_root, event.y_root)
 
     def _checkbox_image(self, state: str) -> tk.PhotoImage:

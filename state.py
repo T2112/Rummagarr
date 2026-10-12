@@ -29,6 +29,16 @@ def _chunks(items, size: int):
         yield items[start : start + size]
 
 
+def _cooldown_stamp(stamp: str) -> datetime | None:
+    try:
+        at = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return at
+
+
 class JobStore:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -227,12 +237,34 @@ class JobStore:
         self.set_meta("focus_artist", artist)
 
     def artist_cooldowns(self) -> dict[str, str]:
+        """Active cooldowns keyed by the casefolded artist name.
+
+        Older builds stored ``artist:`` plus that name. Those rows never matched
+        the wanted list, so they never expired and the artist still looked ready.
+        The prefix is stripped here, and a timestamp that has passed is dropped.
+        """
         raw = self.get_meta("artist_cooldowns") or "{}"
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
             return {}
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        now = datetime.now(timezone.utc)
+        merged: dict[str, tuple[datetime, str]] = {}
+        for key, stamp in data.items():
+            token = (str(key) or "").casefold().strip()
+            if token.startswith("artist:"):
+                token = token[len("artist:") :].strip()
+            if not token or not stamp:
+                continue
+            at = _cooldown_stamp(str(stamp))
+            if at is None or at <= now:
+                continue
+            current = merged.get(token)
+            if current is None or at > current[0]:
+                merged[token] = (at, str(stamp))
+        return {token: stamp for token, (_at, stamp) in merged.items()}
 
     def artist_on_cooldown(self, artist: str) -> bool:
         key = (artist or "").casefold().strip()
@@ -1205,7 +1237,7 @@ class JobStore:
                     rows = self._db.execute(
                         """
                         SELECT artist, artist_key FROM wanted_artists
-                        WHERE (albums + songs) = 0 OR disabled_children < (albums + songs)
+                        WHERE disabled_children < (albums + songs)
                         ORDER BY sort_artist
                         LIMIT 200 OFFSET ?
                         """,
@@ -1220,7 +1252,7 @@ class JobStore:
             params: list = []
             sql = """
                 SELECT artist FROM wanted_artists
-                WHERE ((albums + songs) = 0 OR disabled_children < (albums + songs))
+                WHERE disabled_children < (albums + songs)
             """
             if skip:
                 marks = ",".join("?" * len(skip))
@@ -1229,6 +1261,22 @@ class JobStore:
             sql += " ORDER BY sort_artist LIMIT 1"
             row = self._db.execute(sql, params).fetchone()
         return None if row is None else row[0]
+
+    def wanted_artist_label(self, token: str) -> str:
+        """Display name for a casefolded artist key. The key itself if it is unknown."""
+        token = (token or "").casefold().strip()
+        if token.startswith("artist:"):
+            token = token[len("artist:") :].strip()
+        if not token:
+            return ""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT artist FROM wanted_artists WHERE artist_key = ?",
+                (token,),
+            ).fetchone()
+        if row and row[0]:
+            return str(row[0])
+        return token
 
     def artist_work(self, artist: str) -> tuple[list[dict], list[dict]]:
         token = (artist or "").casefold().strip()

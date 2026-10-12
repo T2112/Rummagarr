@@ -7,7 +7,8 @@ import shutil
 import subprocess
 import threading
 import time
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
 
@@ -72,10 +73,13 @@ from sharing import (
     QueuedUpload,
     RemoteFile,
     SharePolicy,
+    WantedPick,
     WantedTrack,
     admit,
     candidate_names,
+    choose_wanted_downloads,
     match_files_to_wanted,
+    narrow_wanted_tracks,
     uploads_to_pause,
 )
 from state import JobStore
@@ -655,6 +659,10 @@ class Worker:
         self._loop_beat = 0.0
         self._heartbeat_task: asyncio.Task | None = None
         self._cycle_attempted_search = False
+        # Artists with nothing to search right now, and when to look at them again.
+        self._not_ready_until: dict[str, datetime] = {}
+        self._wait_artist = ""
+        self._last_focus = ""
         self.share_counts: tuple[int, int] = (0, 0)
         self._share_task: asyncio.Task | None = None
         self._housekeeping_task: asyncio.Task | None = None
@@ -755,6 +763,9 @@ class Worker:
             if step.kind == "error":
                 return describe_step(step), 0, False
             return "Stopped", 0, False
+        if step.kind == "retry" and step.retry_deadline:
+            remaining = max(0, int(round(step.retry_deadline - time.monotonic())))
+            step = replace(step, retry_seconds=remaining)
         text = describe_step(step)
         active = step.kind not in {"idle", "stopped", "error"}
         busy = active and not self.control.is_paused()
@@ -1149,15 +1160,7 @@ class Worker:
                 if self.control.is_stopped():
                     self.set_step(Step(kind="stopped"))
                     break
-                pause = self._note_between_passes()
-                if pause <= 0 and not self._cycle_attempted_search:
-                    log.warning(
-                        "No Soulseek search was sent on this pass. Waiting %ss before retrying. %s",
-                        IDLE_FLOOR_SECONDS,
-                        self.search_diagnostics(),
-                    )
-                    pause = IDLE_FLOOR_SECONDS
-                    self._apply_wait(pause, "pass")
+                pause = self._pause_after_cycle()
                 signal = await self.control.gate(sleep=pause)
                 if signal == "stop":
                     break
@@ -1198,30 +1201,20 @@ class Worker:
         current = self.store.focus_artist()
         cooldowns = self.store.artist_cooldowns()
         now = datetime.now(timezone.utc)
+        saved = self.store.wanted_catalog_ready() or self.catalog.synced
         if current and not self._cooled(current, cooldowns, now):
-            return current
-        if current:
+            if not saved or self._searchable_now(current):
+                return current
+            self._defer_artist(current, self._soonest_item_retry(current))
+            log.info("Artist %s has nothing to search; picking the next one", current)
+        elif current:
             log.info("Artist %s is on cooldown; picking the next one", current)
-        if self.store.wanted_catalog_ready():
-            chosen = self.store.next_wanted_artist(self._cooled_artist_keys())
-            if not chosen:
-                self.store.set_focus_artist(None)
-                return None
+        if saved:
+            chosen = self._next_ready_artist()
             self.store.set_focus_artist(chosen)
-            log.info("Focusing on artist: %s", chosen)
-            return chosen
-        if self.catalog.synced:
-            choices = self.store.wanted_choices()
-            for chosen in self.catalog.artist_labels():
-                if self._cooled(chosen, cooldowns, now):
-                    continue
-                if not self.catalog.has_enabled_work(chosen, choices):
-                    continue
-                self.store.set_focus_artist(chosen)
+            if chosen:
                 log.info("Focusing on artist: %s", chosen)
-                return chosen
-            self.store.set_focus_artist(None)
-            return None
+            return chosen
         for album in sorted(missing, key=lambda a: artist_name(a).casefold()):
             chosen = artist_name(album)
             if self._cooled(chosen, cooldowns, now):
@@ -1296,26 +1289,139 @@ class Worker:
             truly_missing.append(album)
         return truly_missing
 
-    def _soonest_cooldown_seconds(self) -> int | None:
+    def _artist_token(self, artist: str) -> str:
+        return (artist or "").casefold().strip()
+
+    def _defer_artist(self, artist: str, until: datetime | None) -> None:
+        """Skip this artist until `until`. A pass that searches nothing must not spin on them."""
+        token = self._artist_token(artist)
+        if not token:
+            return
         now = datetime.now(timezone.utc)
-        best: int | None = None
-        for until in self.store.artist_cooldowns().values():
+        if until is None or until <= now:
+            until = now + timedelta(hours=max(1, int(self.cfg.retry_hours or 12)))
+        current = self._not_ready_until.get(token)
+        if current is None or until > current:
+            self._not_ready_until[token] = until
+
+    def _blocked_tokens(self) -> set[str]:
+        now = datetime.now(timezone.utc)
+        blocked = set(self._cooled_artist_keys())
+        for token, until in self._not_ready_until.items():
+            if until > now:
+                blocked.add(token)
+        return blocked
+
+    def _searchable_now(self, artist: str) -> bool:
+        ready, _until = self._searchable_delay(artist)
+        return ready
+
+    def _soonest_item_retry(self, artist: str) -> datetime | None:
+        _ready, until = self._searchable_delay(artist)
+        return until
+
+    def _searchable_delay(self, artist: str) -> tuple[bool, datetime | None]:
+        """Whether this artist has an album or track to search, and the soonest retry otherwise."""
+        if self.store.wanted_catalog_ready():
+            albums, holes = self.store.artist_work(artist)
+        elif self.catalog.synced:
+            albums, holes = self.catalog.work_for_artist(artist)
+        else:
+            return True, None
+        soonest: datetime | None = None
+        covered: set[int] = set()
+        for album in self._empty_albums(albums):
+            album_id = album.get("id")
+            if album_id is None:
+                continue
+            covered.add(int(album_id))
+            if not self.store.should_skip(int(album_id), self.cfg.retry_hours):
+                return True, None
+            until = self._album_ready_at(int(album_id))
+            if until is not None and (soonest is None or until < soonest):
+                soonest = until
+        for hole in holes:
+            album = hole.get("album") or {}
+            album_id = album.get("id") if isinstance(album, dict) else None
+            # An empty album is searched as one album. Its songs are not a second search.
+            if album_id is not None and int(album_id) in covered:
+                continue
+            track = hole.get("track") or {}
+            track_id = track.get("id")
+            if track_id is None:
+                continue
+            if not self.store.should_skip_track(int(track_id), self.cfg.retry_hours):
+                return True, None
+            until = self._track_ready_at(int(track_id))
+            if until is not None and (soonest is None or until < soonest):
+                soonest = until
+        return False, soonest
+
+    def _album_ready_at(self, album_id: int) -> datetime | None:
+        job = self.store.get(album_id)
+        if not job or job.get("status") not in {"failed", "no_match"}:
+            return None
+        return self._retry_stamp(str(job.get("updated_at") or ""))
+
+    def _track_ready_at(self, track_id: int) -> datetime | None:
+        job = self.store.get_track(track_id)
+        if not job or job.get("status") not in {"failed", "no_match"}:
+            return None
+        return self._retry_stamp(str(job.get("updated_at") or ""))
+
+    def _retry_stamp(self, updated_at: str) -> datetime | None:
+        try:
+            updated = datetime.fromisoformat(updated_at)
+        except ValueError:
+            return None
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        return updated + timedelta(hours=max(0, int(self.cfg.retry_hours or 0)))
+
+    def _soonest_blocked(self) -> tuple[int | None, str]:
+        """Seconds until the earliest cooled or deferred artist, and that artist's name."""
+        now = datetime.now(timezone.utc)
+        best_at: datetime | None = None
+        best_token = ""
+        for token, stamp in self.store.artist_cooldowns().items():
             try:
-                stamp = datetime.fromisoformat(str(until))
+                at = datetime.fromisoformat(str(stamp))
             except ValueError:
                 continue
-            if stamp.tzinfo is None:
-                stamp = stamp.replace(tzinfo=timezone.utc)
-            delta = int((stamp - now).total_seconds())
-            if delta > 0:
-                best = delta if best is None else min(best, delta)
-        return best
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+            if at > now and (best_at is None or at < best_at):
+                best_at = at
+                best_token = token
+        for token, at in self._not_ready_until.items():
+            if at > now and (best_at is None or at < best_at):
+                best_at = at
+                best_token = token
+        if best_at is None:
+            return None, ""
+        seconds = max(1, int((best_at - now).total_seconds()))
+        return seconds, self._artist_display(best_token)
+
+    def _artist_display(self, token: str) -> str:
+        label = self.store.wanted_artist_label(token)
+        if label and label != (token or "").casefold().strip():
+            return label
+        if self.catalog.synced:
+            folded = (token or "").casefold().strip()
+            for name in self.catalog.artist_labels():
+                if name.casefold().strip() == folded:
+                    return name
+        return label or token
+
+    def _soonest_cooldown_seconds(self) -> int | None:
+        seconds, _artist = self._soonest_blocked()
+        return seconds
 
     def _cooled_artist_keys(self) -> set[str]:
         now = datetime.now(timezone.utc)
         cooldowns = self.store.artist_cooldowns()
-        # wanted_artists.artist_key is the casefolded name. The "artist:" prefix
-        # is only the choice-row key, and using it here skips nobody.
+        # wanted_artists.artist_key is the casefolded name. Legacy "artist:" keys
+        # are stripped by artist_cooldowns() so a saved cooldown matches that row.
         return {name for name in cooldowns if self._cooled(name, cooldowns, now)}
 
     def _has_enabled_wanted(self) -> bool:
@@ -1326,66 +1432,137 @@ class Worker:
             return any(self.catalog.has_enabled_work(name, choices) for name in self.catalog.artist_labels())
         return False
 
-    def _next_ready_artist(self) -> str | None:
+    def _next_saved_name(self, skip: set[str]) -> str | None:
         if self.store.wanted_catalog_ready():
-            return self.store.next_wanted_artist(self._cooled_artist_keys())
-        if self.catalog.synced:
-            choices = self.store.wanted_choices()
-            cooldowns = self.store.artist_cooldowns()
-            now = datetime.now(timezone.utc)
-            for name in self.catalog.artist_labels():
-                if self._cooled(name, cooldowns, now):
-                    continue
-                if self.catalog.has_enabled_work(name, choices):
-                    return name
+            return self.store.next_wanted_artist(skip)
+        if not self.catalog.synced:
+            return None
+        choices = self.store.wanted_choices()
+        cooldowns = self.store.artist_cooldowns()
+        now = datetime.now(timezone.utc)
+        for name in self.catalog.artist_labels():
+            token = self._artist_token(name)
+            if token in skip or self._cooled(name, cooldowns, now):
+                continue
+            if self.catalog.has_enabled_work(name, choices):
+                return name
+        return None
+
+    def _next_ready_artist(self) -> str | None:
+        """The next artist who has an album or track that can be searched now."""
+        if not (self.store.wanted_catalog_ready() or self.catalog.synced):
+            return None
+        skip = self._blocked_tokens()
+        for _ in range(10000):
+            name = self._next_saved_name(skip)
+            if not name:
+                return None
+            ready, until = self._searchable_delay(name)
+            if ready:
+                return name
+            self._defer_artist(name, until)
+            skip.add(self._artist_token(name))
         return None
 
     def between_pass_wait(self) -> tuple[int, str]:
         """Seconds to sleep, and which setting that wait comes from.
 
         ``pass`` is Wait before next artist (cycle_seconds). 0 starts the next
-        ready artist immediately. ``artist`` is Artist retry period, the
-        multi-day skip after a visit. A zero pass wait still sleeps a short
-        floor when nobody is ready, so the loop does not spin.
+        ready artist immediately. ``artist`` is the real wait until the earliest
+        artist can be searched again. That wait is not capped, so the Status
+        line can count it down to zero and then search that artist.
         """
         cycle = max(0, int(self.cfg.cycle_seconds or 0))
         catalog = self.store.wanted_catalog_ready() or self.catalog.synced
         if catalog and not self._has_enabled_wanted():
+            self._wait_artist = ""
             return (cycle if cycle else IDLE_FLOOR_SECONDS), "idle"
         if self._next_ready_artist():
+            self._wait_artist = ""
             return cycle, "pass"
-        wait = self._soonest_cooldown_seconds()
+        wait, artist = self._soonest_blocked()
+        self._wait_artist = artist
         if wait:
-            if cycle == 0:
-                pause = min(wait, IDLE_FLOOR_SECONDS)
-            else:
-                pause = wait
-            return max(1, pause), "artist"
+            return max(1, wait), "artist"
+        self._wait_artist = ""
         return (cycle if cycle else IDLE_FLOOR_SECONDS), "idle"
 
     def _apply_wait(self, seconds: int, kind: str) -> None:
-        if kind == "artist":
-            self.set_step(Step(kind="retry", retry_seconds=seconds, retry_kind="artist"))
+        if kind != "pass" and kind != "artist":
+            self._wait_artist = ""
+            self.set_step(Step(kind="idle"))
             return
-        if kind == "pass" and seconds <= 0:
-            self.set_step(Step(kind="retry", retry_seconds=0, retry_kind="pass"))
-            return
-        if kind == "pass":
-            self.set_step(Step(kind="retry", retry_seconds=seconds, retry_kind="pass"))
-            return
-        self.set_step(Step(kind="idle"))
+        artist = self._wait_artist if kind == "artist" else ""
+        now = time.monotonic()
+        deadline = now + max(0, int(seconds))
+        previous = self.step
+        if (
+            previous.kind == "retry"
+            and previous.retry_kind == kind
+            and (previous.artist or "") == artist
+            and previous.retry_deadline
+            and abs(previous.retry_deadline - deadline) < 1.5
+        ):
+            deadline = previous.retry_deadline
+        self.set_step(
+            Step(
+                kind="retry",
+                artist=artist,
+                retry_seconds=max(0, int(seconds)),
+                retry_kind=kind,
+                retry_deadline=deadline,
+            )
+        )
 
     def _note_nothing_ready(self) -> None:
         seconds, kind = self.between_pass_wait()
         self._apply_wait(seconds, kind)
 
-    def _note_between_passes(self) -> int:
+    def _note_between_passes(self) -> tuple[int, str]:
         if self.control.is_stopped():
             self.set_step(Step(kind="stopped"))
-            return 0
+            return 0, "idle"
         seconds, kind = self.between_pass_wait()
         self._apply_wait(seconds, kind)
-        return seconds
+        return seconds, kind
+
+    def _pause_after_cycle(self) -> int:
+        """How long to sleep before the next pass.
+
+        The short "wait before next artist" gap runs only after a search was
+        sent. A pass that found nothing ready must not restart that gap, or the
+        Status line stays on "next artist in 5s" and the next artist is never
+        searched. When nobody can be searched, sleep until the earliest artist
+        is actually ready.
+        """
+        searched = self._cycle_attempted_search
+        pause, kind = self._note_between_passes()
+        if searched:
+            return pause
+        if kind == "pass":
+            ready = self._next_ready_artist()
+            if ready and not self._same_artist(ready, self._last_focus):
+                # The short gap is only after a search. A different artist is ready now.
+                pause = 0
+                self._apply_wait(0, "pass")
+                return pause
+            log.warning(
+                "No Soulseek search was sent on this pass. Waiting %ss before retrying. %s",
+                IDLE_FLOOR_SECONDS,
+                self.search_diagnostics(),
+            )
+            pause = IDLE_FLOOR_SECONDS
+            self._apply_wait(pause, "pass")
+            return pause
+        if pause <= 0:
+            log.warning(
+                "No Soulseek search was sent on this pass. Waiting %ss before retrying. %s",
+                IDLE_FLOOR_SECONDS,
+                self.search_diagnostics(),
+            )
+            pause = IDLE_FLOOR_SECONDS
+            self._apply_wait(pause, "pass")
+        return pause
 
     async def cycle(self) -> None:
         if self.control.is_stopped():
@@ -1398,9 +1575,11 @@ class Worker:
             focus = self.choose_focus_artist([], [])
             if not focus:
                 log.info("No artist ready (all cooled off or nothing missing)")
+                self._last_focus = ""
                 self._note_nothing_ready()
                 self.sweep_incomplete_folder()
                 return
+            self._last_focus = focus
             artist_albums, artist_holes = self.store.artist_work(focus)
             truly_missing = self._empty_albums(artist_albums)
             checked_missing = truly_missing
@@ -1419,9 +1598,11 @@ class Worker:
             focus = self.choose_focus_artist([], [])
             if not focus:
                 log.info("No artist ready (all cooled off or nothing missing)")
+                self._last_focus = ""
                 self._note_nothing_ready()
                 self.sweep_incomplete_folder()
                 return
+            self._last_focus = focus
             choices = self.store.wanted_choices()
             artist_albums, artist_holes = self.catalog.work_for_artist(focus)
             truly_missing = self._empty_albums(artist_albums)
@@ -1453,9 +1634,11 @@ class Worker:
             focus = self.choose_focus_artist(catalog, [])
             if not focus:
                 log.info("No artist ready (all cooled off or nothing missing)")
+                self._last_focus = ""
                 self._note_nothing_ready()
                 self.sweep_incomplete_folder()
                 return
+            self._last_focus = focus
             missing, api_holes = self._work_for_artist(focus, catalog, include_tracks=True)
             truly_missing = self._empty_albums(missing)
             choices = self.store.wanted_choices()
@@ -1466,9 +1649,9 @@ class Worker:
             log.info("Left out %s unchecked album(s)", hidden)
         missing = checked_missing
         if not missing and not holes:
-            log.info("Artist %s has no checked items; moving on without a cooldown", focus)
+            log.info("Artist %s has nothing to search; moving on without a cooldown", focus)
+            self._defer_artist(focus, None)
             self.store.set_focus_artist(None)
-            self._note_between_passes()
             self.sweep_incomplete_folder()
             return
         log.info("Artist %s: %s empty albums, %s partial tracks", focus, len(missing), len(holes))
@@ -1509,7 +1692,16 @@ class Worker:
         if self.control.is_stopped():
             self.set_step(Step(kind="stopped"))
             return
-        self._finish_artist_visit(focus)
+        if self._cycle_attempted_search:
+            self._finish_artist_visit(focus)
+        else:
+            still_ready, until = self._searchable_delay(focus)
+            if still_ready:
+                log.info("Artist %s was not searched; trying again without a cooldown", focus)
+            else:
+                log.info("Artist %s had nothing new to search; not starting the retry cooldown", focus)
+                self._defer_artist(focus, until)
+                self.store.set_focus_artist(None)
         self.sweep_incomplete_folder()
         self._note_between_passes()
 
@@ -2324,22 +2516,32 @@ class Worker:
                 return transfer
         return None
 
-    def match_user_files(self, files: list) -> list:
-        remotes = [
-            RemoteFile(
-                username=str(getattr(item, "username", "") or ""),
-                filename=str(getattr(item, "filename", "") or ""),
-                size=int(getattr(item, "size", 0) or 0),
-                bitrate=int(getattr(item, "bitrate", 0) or 0),
-                extension=str(getattr(item, "extension", "") or ""),
+    def _remote_files(self, files: list) -> list[RemoteFile]:
+        remotes: list[RemoteFile] = []
+        for item in files:
+            filename = str(getattr(item, "filename", "") or "")
+            if not filename:
+                continue
+            remotes.append(
+                RemoteFile(
+                    username=str(getattr(item, "username", "") or ""),
+                    filename=filename,
+                    size=int(getattr(item, "size", 0) or 0),
+                    bitrate=int(getattr(item, "bitrate", 0) or 0),
+                    extension=str(getattr(item, "extension", "") or ""),
+                    free_slot=bool(getattr(item, "free_slot", False)),
+                    speed=int(getattr(item, "speed", 0) or 0),
+                    queue=int(getattr(item, "queue", 0) or 0),
+                    state=str(getattr(item, "state", "") or ""),
+                    folder=str(getattr(item, "folder", "") or ""),
+                )
             )
-            for item in files
-            if getattr(item, "filename", None)
-        ]
-        names, folds = candidate_names(remotes)
+        return remotes
+
+    def _wanted_tracks(self, names: list[str], folds: list[str]) -> list[WantedTrack]:
         if self.store.wanted_catalog_ready():
             rows = self.store.wanted_tracks_for(names, folds)
-            tracks = [
+            return [
                 WantedTrack(
                     artist=row["artist"],
                     album=row["album"],
@@ -2352,9 +2554,45 @@ class Worker:
                 )
                 for row in rows
             ]
-        else:
-            tracks = self._tracks_from_memory(names, folds)
+        return self._tracks_from_memory(names, folds)
+
+    def match_user_files(self, files: list) -> list:
+        remotes = self._remote_files(files)
+        names, folds = candidate_names(remotes)
+        tracks = self._wanted_tracks(names, folds)
         return match_files_to_wanted(
+            remotes,
+            tracks,
+            min_filename_ratio=float(self.cfg.min_filename_ratio),
+            preferred_extensions=list(self.cfg.preferred_extensions),
+            min_mp3_bitrate=int(self.cfg.min_mp3_bitrate),
+        )
+
+    def plan_wanted_downloads(
+        self,
+        files: list,
+        *,
+        artist: str,
+        album: str = "",
+        kind: str = "artist",
+        album_id: int | None = None,
+        track_id: int | None = None,
+        title: str = "",
+    ) -> WantedPick:
+        """Wanted albums and tracks for this artist, best source across every result."""
+        artist_name = (artist or "").strip()
+        if not artist_name:
+            return WantedPick()
+        remotes = self._remote_files(files)
+        tracks = narrow_wanted_tracks(
+            self._wanted_tracks([artist_name], [normalize(artist_name)]),
+            kind=kind,
+            album=album,
+            album_id=album_id,
+            track_id=track_id,
+            title=title,
+        )
+        return choose_wanted_downloads(
             remotes,
             tracks,
             min_filename_ratio=float(self.cfg.min_filename_ratio),

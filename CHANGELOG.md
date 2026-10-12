@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here.
 
+## [1.9.4] — 2026-10-12
+
+### Added
+
+- Search → Download all wanted works with no user selected. After an artist search it reads every result, finds that artist's wanted albums and tracks, and queues the best source for each. A folder that already has every wanted song anyone is sharing for an album is kept together from that one user. Otherwise each missing song comes from another user. Free slot, then speed, then the format and bitrate from Behavior decide which source wins. A file already downloaded or queued, or the same path twice, is not queued again. The status line and the log say how many wanted items matched, from how many users, and how many were not found. Select a user, or one of their files, and the button still downloads only that user's matches. The button's hover note says which of the two it will do.
+
+### Fixed
+
+- Automatic search could stay on "Waiting for retry period (next artist in 5s)" and never send another FileSearch. Manual search and downloads already queued still worked. An artist with nothing to send — a wanted row with no albums or songs, a partial album with no missing tracks, or an album already imported — still looked ready. The short wait before the next artist started over, so the countdown never reached a search. That wait now runs only after a search was sent. When it reaches 0, the next artist who has something to search is searched. If every artist is actually waiting, the status names the earliest one and counts down the real time left. A cooldown saved by an older version under an "artist:" id is included in that time. A pass that sends no search does not mark the artist as visited.
+
 ## [1.9.3] — 2026-10-12
 
 ### Fixed
