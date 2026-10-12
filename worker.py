@@ -8,6 +8,7 @@ import subprocess
 import threading
 import time
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 
 from aioslsk.client import SoulSeekClient
@@ -34,7 +35,7 @@ from activity import Step, describe_step, format_elapsed, step_from_legacy
 from config_loader import Config
 from control import WorkerControl
 from lidarr_client import LidarrClient
-from search_model import file_from_share, result_count
+from search_model import file_from_share, result_count, search_receipt
 from status_ui import normalize_recent_limit, start_status_ui
 from wanted import (
     WantedCatalog,
@@ -243,6 +244,74 @@ def build_slsk_settings(cfg: Config) -> Settings:
 
 
 LOSSLESS_EXT = {".flac", ".wav", ".aiff", ".aif", ".wv", ".ape"}
+# Yield this often so a large share scan cannot freeze the loop that reads search replies.
+_SCAN_CHUNK = 25
+
+
+def install_responsive_share_scan(client) -> None:
+    """Let the event loop read peer search replies while a share index is built.
+
+    aioslsk builds the term map, and schedules every attribute job, without an
+    await. On a large library that blocks the loop for longer than Search wait,
+    so replies sit in the socket until the Search tab drops the ticket.
+    """
+    shares = getattr(client, "shares", None)
+    if shares is None or getattr(shares, "_lidarr_responsive_scan", False):
+        return
+
+    async def scan_directory_files(shared_directory):
+        from aioslsk.exceptions import SharedDirectoryError
+        from aioslsk.shares.manager import scan_directory as walk_share
+
+        loop = asyncio.get_running_loop()
+        if shared_directory not in shares._shared_directories:
+            raise SharedDirectoryError("attempted to scan directory which was not added to the manager")
+        try:
+            shared_items = await loop.run_in_executor(
+                shares.executor,
+                partial(
+                    walk_share,
+                    shared_directory,
+                    children=shares._get_child_directories(shared_directory),
+                ),
+            )
+        except Exception:
+            log.exception("exception scanning directory : %r", shared_directory)
+        else:
+            for item in shared_items:
+                item.shared_directory = shared_directory
+            shared_directory.items |= shared_items
+            shared_directory.items -= shared_directory.items ^ shared_items
+        items = list(shared_directory.items)
+        for start in range(0, len(items), _SCAN_CHUNK):
+            for item in items[start : start + _SCAN_CHUNK]:
+                shares._add_item_to_term_map(item)
+            await asyncio.sleep(0)
+        shares._cleanup_term_map()
+        await asyncio.sleep(0)
+
+    async def scan_directory_file_attributes(shared_directory):
+        from aioslsk.shares.manager import extract_attributes
+
+        loop = asyncio.get_running_loop()
+        futures: list[asyncio.Future] = []
+        scheduled = 0
+        for item in list(shared_directory.items):
+            if item.attributes is None:
+                future = loop.run_in_executor(
+                    shares.executor,
+                    partial(extract_attributes, item.get_absolute_path()),
+                )
+                future.add_done_callback(partial(shares._extract_attributes_callback, item))
+                futures.append(future)
+                scheduled += 1
+                if scheduled % _SCAN_CHUNK == 0:
+                    await asyncio.sleep(0)
+        await asyncio.gather(*futures, return_exceptions=True)
+
+    shares.scan_directory_files = scan_directory_files
+    shares.scan_directory_file_attributes = scan_directory_file_attributes
+    shares._lidarr_responsive_scan = True
 
 
 def ffmpeg_path() -> str | None:
@@ -552,6 +621,18 @@ class Worker:
         if not await self.ensure_soulseek():
             raise RuntimeError("Start the worker to search. Search uses that Soulseek login.")
         return await self._send_search(query)
+
+    def note_search_receipt(self, query: str, results) -> tuple[int, int, int]:
+        """Log raw peer replies against the files the Search tab will list."""
+        replies, shown, locked = search_receipt(results)
+        log.info(
+            "Search %r: %d peer replies, %d files shown, %d locked files not shown",
+            query,
+            replies,
+            shown,
+            locked,
+        )
+        return replies, shown, locked
 
     async def _await_results(
         self,
@@ -1210,6 +1291,7 @@ class Worker:
             signal = await self._await_results(
                 request, key, self.cfg.search_wait_seconds, artist, album_title, index, len(queries)
             )
+            self.note_search_receipt(query, getattr(request, "results", None))
             if signal != "ok":
                 try:
                     self.client.searches.remove_request(request)
@@ -1385,6 +1467,7 @@ class Worker:
             signal = await self._await_results(
                 request, key, self.cfg.search_wait_seconds, artist, title, index, len(queries)
             )
+            self.note_search_receipt(query, getattr(request, "results", None))
             if signal != "ok":
                 try:
                     self.client.searches.remove_request(request)
@@ -1709,6 +1792,7 @@ class Worker:
         client = self.client
         if client is None:
             return
+        install_responsive_share_scan(client)
         try:
             await client.shares.scan()
             self.share_counts = tuple(client.shares.get_stats())

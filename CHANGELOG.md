@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [1.9.1] — 2026-10-12
+
+### Fixed
+
+- Behavior → Wait before next artist was already in the installed app, directly under a long list of other options. On a normal Windows window it sat below the visible area. The mouse wheel also stopped working as soon as the pointer moved onto the fields, so the page could not be scrolled to it. The control is now at the top of Behavior, directly under Artist retry period, and it still accepts 0. The mouse wheel scrolls that tab when the pointer is over the fields.
+- A Search could finish with nothing to show even though peers had answered. The share scan added in 1.9.0 built its file index on the same loop that reads incoming search replies, and it did not pause while doing that. Replies sat unread until the Search tab gave up and dropped the request. The scan now lets that loop read replies while it indexes. The log line `Search 'query': N peer replies, M files shown, K locked files not shown` separates "nobody answered" from "answered, but nothing was listed". Upload slots, speed limits, "share only with users who share", and the minimum peer file count still apply only when someone downloads from you.
+
 ## [1.9.0] — 2026-10-11
 
 ### Added
