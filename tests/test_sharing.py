@@ -10,7 +10,9 @@ from sharing import (
     SharePolicy,
     WantedTrack,
     admit,
+    choose_wanted_downloads,
     match_files_to_wanted,
+    narrow_wanted_tracks,
     uploads_to_pause,
 )
 from tests.conftest import album, hole, make_config, make_worker
@@ -99,6 +101,281 @@ def test_wanted_matching_uses_folded_names_and_skips_other_artists():
     assert by_song["Hungover"].album_id == 1
     assert by_song["Kickstart My Heart"].artist == "Mötley Crüe"
     assert by_song["Kickstart My Heart"].track_id == 2
+
+
+def _pick_options() -> dict:
+    return {
+        "min_filename_ratio": 0.5,
+        "preferred_extensions": ["flac", "mp3"],
+        "min_mp3_bitrate": 320,
+    }
+
+
+def _hungover_songs() -> list[WantedTrack]:
+    return [
+        WantedTrack("Ella Langley", "Hungover", "Hungover", "song:1", "song", album_id=1, track_id=1),
+        WantedTrack("Ella Langley", "Hungover", "Cowboy", "song:2", "song", album_id=1, track_id=2),
+        WantedTrack("Ella Langley", "Still", "Nicotine", "song:3", "song", album_id=2, track_id=3),
+    ]
+
+
+def test_complete_folder_beats_a_faster_free_slot():
+    tracks = _hungover_songs()[:2]
+    files = [
+        RemoteFile("slow", r"Ella Langley\Hungover\01 Hungover.flac", extension="flac", speed=100),
+        RemoteFile("slow", r"Ella Langley\Hungover\02 Cowboy.flac", extension="flac", speed=100),
+        RemoteFile(
+            "fast",
+            r"Ella Langley\Hungover\01 Hungover.flac",
+            extension="flac",
+            free_slot=True,
+            speed=9_000,
+        ),
+    ]
+    pick = choose_wanted_downloads(files, tracks, **_pick_options())
+    assert {(match.username, match.song) for match in pick.matches} == {
+        ("slow", "Hungover"),
+        ("slow", "Cowboy"),
+    }
+    assert pick.line() == "2 wanted items matched from 1 user, and 0 wanted items not found."
+
+
+def test_complete_folders_prefer_free_slot_then_speed_then_format():
+    tracks = _hungover_songs()[:2]
+    busy = [
+        RemoteFile("busy", r"Ella Langley\Hungover\01 Hungover.flac", extension="flac", speed=9_000),
+        RemoteFile("busy", r"Ella Langley\Hungover\02 Cowboy.flac", extension="flac", speed=9_000),
+    ]
+    free = [
+        RemoteFile("free", r"Ella Langley\Hungover\01 Hungover.flac", extension="flac", free_slot=True, speed=100),
+        RemoteFile("free", r"Ella Langley\Hungover\02 Cowboy.flac", extension="flac", free_slot=True, speed=100),
+    ]
+    pick = choose_wanted_downloads(busy + free, tracks, **_pick_options())
+    assert {match.username for match in pick.matches} == {"free"}
+
+    slow = [
+        RemoteFile("slow", r"Ella Langley\Hungover\01 Hungover.flac", extension="flac", free_slot=True, speed=100),
+        RemoteFile("slow", r"Ella Langley\Hungover\02 Cowboy.flac", extension="flac", free_slot=True, speed=100),
+    ]
+    fast = [
+        RemoteFile("fast", r"Ella Langley\Hungover\01 Hungover.flac", extension="flac", free_slot=True, speed=5_000),
+        RemoteFile("fast", r"Ella Langley\Hungover\02 Cowboy.flac", extension="flac", free_slot=True, speed=5_000),
+    ]
+    faster = choose_wanted_downloads(slow + fast, tracks, **_pick_options())
+    assert {match.username for match in faster.matches} == {"fast"}
+
+    mp3 = [
+        RemoteFile("mp3user", r"Ella Langley\Hungover\01 Hungover.mp3", extension="mp3", bitrate=320, free_slot=True, speed=1_000),
+        RemoteFile("mp3user", r"Ella Langley\Hungover\02 Cowboy.mp3", extension="mp3", bitrate=320, free_slot=True, speed=1_000),
+    ]
+    flac = [
+        RemoteFile("flacuser", r"Ella Langley\Hungover\01 Hungover.flac", extension="flac", free_slot=True, speed=1_000),
+        RemoteFile("flacuser", r"Ella Langley\Hungover\02 Cowboy.flac", extension="flac", free_slot=True, speed=1_000),
+    ]
+    formatted = choose_wanted_downloads(mp3 + flac, tracks, **_pick_options())
+    assert {match.username for match in formatted.matches} == {"flacuser"}
+
+
+def test_missing_tracks_fall_back_to_other_users_and_report_gaps():
+    tracks = _hungover_songs()
+    files = [
+        RemoteFile("busy", r"Ella Langley\Hungover\01 Hungover.flac", extension="flac", speed=100),
+        RemoteFile(
+            "free",
+            r"Ella Langley\Hungover\01 Hungover.mp3",
+            extension="mp3",
+            bitrate=320,
+            free_slot=True,
+            speed=5_000,
+        ),
+        RemoteFile("other", r"Ella Langley\Hungover\02 Cowboy.flac", extension="flac", free_slot=True, speed=100),
+    ]
+    pick = choose_wanted_downloads(files, tracks, **_pick_options())
+    by_song = {match.song: match.username for match in pick.matches}
+    assert by_song == {"Hungover": "free", "Cowboy": "other"}
+    assert pick.matched == 2
+    assert pick.users == 2
+    assert pick.missing == 1
+    assert pick.line() == "2 wanted items matched from 2 users, and 1 wanted item not found."
+
+
+def test_a_gap_in_the_catalog_does_not_split_a_folder_that_has_the_rest():
+    tracks = _hungover_songs()
+    files = [
+        RemoteFile("album", r"Ella Langley\Hungover\01 Hungover.flac", extension="flac", speed=100),
+        RemoteFile("album", r"Ella Langley\Hungover\02 Cowboy.flac", extension="flac", speed=100),
+        RemoteFile(
+            "single",
+            r"Ella Langley\Hungover\01 Hungover.flac",
+            extension="flac",
+            free_slot=True,
+            speed=9_000,
+        ),
+    ]
+    pick = choose_wanted_downloads(files, tracks, **_pick_options())
+    assert {match.username for match in pick.matches} == {"album"}
+    assert pick.missing == 1
+    assert pick.users == 1
+
+
+def test_downloaded_and_queued_files_are_not_queued_again():
+    tracks = _hungover_songs()[:2]
+    files = [
+        RemoteFile("old", r"Ella Langley\Hungover\01 Hungover.flac", extension="flac", state="downloaded"),
+        RemoteFile(
+            "new",
+            r"Ella Langley\Hungover\01 Hungover.flac",
+            extension="flac",
+            free_slot=True,
+            speed=9_000,
+        ),
+        RemoteFile("new", r"Ella Langley\Hungover\02 Cowboy.flac", extension="flac", free_slot=True, speed=9_000),
+        RemoteFile("new", r"Ella Langley\Hungover\02 Cowboy.flac", extension="flac", state="queued"),
+        RemoteFile("new", r"Ella Langley\Hungover\02 Cowboy.flac", extension="flac", state=""),
+    ]
+    pick = choose_wanted_downloads(files, tracks, **_pick_options())
+    assert pick.matches == []
+    assert pick.skipped == 2
+    assert pick.missing == 0
+    assert pick.line() == "0 wanted items matched from 0 users, and 0 wanted items not found."
+
+
+def test_duplicate_paths_are_queued_once_and_low_bitrate_mp3_is_rejected():
+    tracks = _hungover_songs()[:1]
+    files = [
+        RemoteFile("peer", r"Ella Langley\Hungover\01 Hungover.flac", extension="flac", size=10),
+        RemoteFile("peer", r"Ella Langley\Hungover\01 Hungover.flac", extension="flac", size=10),
+        RemoteFile("peer", r"Ella Langley\Hungover\01 Hungover.mp3", extension="mp3", bitrate=128),
+    ]
+    pick = choose_wanted_downloads(files, tracks, **_pick_options())
+    assert len(pick.matches) == 1
+    assert pick.matches[0].filename.endswith(".flac")
+    assert pick.matched == 1
+    assert pick.missing == 0
+
+
+def test_album_without_songs_keeps_one_users_folder():
+    tracks = [WantedTrack("Ella Langley", "Hungover", "", "album:1", "album", album_id=1)]
+    files = [
+        RemoteFile("slow", r"Ella Langley\Hungover\01 Blue.flac", extension="flac", speed=100),
+        RemoteFile("slow", r"Ella Langley\Hungover\02 Red.flac", extension="flac", speed=100),
+        RemoteFile("slow", r"Ella Langley\Hungover\01 Blue.mp3", extension="mp3", bitrate=320, speed=100),
+        RemoteFile(
+            "fast",
+            r"Ella Langley\Hungover\01 Blue.flac",
+            extension="flac",
+            free_slot=True,
+            speed=9_000,
+        ),
+    ]
+    pick = choose_wanted_downloads(files, tracks, **_pick_options())
+    assert pick.matched == 1
+    assert pick.users == 1
+    assert pick.missing == 0
+    assert {match.username for match in pick.matches} == {"slow"}
+    assert len(pick.matches) == 2
+    assert all(match.filename.endswith(".flac") for match in pick.matches)
+
+    tied = [
+        RemoteFile("busy", r"Ella Langley\Hungover\01 Blue.flac", extension="flac", speed=9_000),
+        RemoteFile("busy", r"Ella Langley\Hungover\02 Red.flac", extension="flac", speed=9_000),
+        RemoteFile("free", r"Ella Langley\Hungover\01 Blue.mp3", extension="mp3", bitrate=320, free_slot=True, speed=100),
+        RemoteFile("free", r"Ella Langley\Hungover\02 Red.mp3", extension="mp3", bitrate=320, free_slot=True, speed=100),
+    ]
+    free_pick = choose_wanted_downloads(tied, tracks, **_pick_options())
+    assert {match.username for match in free_pick.matches} == {"free"}
+
+
+def test_narrow_wanted_tracks_keeps_the_search_target():
+    tracks = _hungover_songs()
+    album = narrow_wanted_tracks(tracks, kind="album", album="Hungover", album_id=1)
+    assert {track.key for track in album} == {"song:1", "song:2"}
+    song = narrow_wanted_tracks(tracks, kind="song", album="Still", title="Nicotine", track_id=3)
+    assert [track.key for track in song] == ["song:3"]
+    artist = narrow_wanted_tracks(tracks, kind="artist")
+    assert len(artist) == 3
+
+
+def test_plan_wanted_downloads_uses_the_artist_and_skips_queued_files(tmp_path):
+    worker = make_worker(tmp_path)
+    try:
+        items = build_catalog(
+            [
+                album(1, "Ella Langley", "Hungover", files=0, total=2),
+                album(2, "Someone Else", "Other", files=0, total=1),
+            ],
+            [
+                hole(11, 1, "Ella Langley", "Hungover", "Hungover"),
+                hole(12, 1, "Ella Langley", "Hungover", "Cowboy", number=2),
+                hole(21, 2, "Someone Else", "Other", "Hungover"),
+            ],
+        )
+        worker.store.write_wanted_page(items_to_rows(items))
+
+        class File:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        files = [
+            File(
+                username="slow",
+                filename=r"Ella Langley\Hungover\01 Hungover.flac",
+                extension="flac",
+                size=10,
+                bitrate=0,
+                speed=100,
+                free_slot=False,
+                queue=2,
+                state="",
+                folder="",
+            ),
+            File(
+                username="slow",
+                filename=r"Ella Langley\Hungover\02 Cowboy.flac",
+                extension="flac",
+                size=10,
+                bitrate=0,
+                speed=100,
+                free_slot=False,
+                queue=2,
+                state="queued",
+                folder="",
+            ),
+            File(
+                username="fast",
+                filename=r"Ella Langley\Hungover\02 Cowboy.flac",
+                extension="flac",
+                size=10,
+                bitrate=0,
+                speed=8_000,
+                free_slot=True,
+                queue=0,
+                state="",
+                folder="",
+            ),
+            File(
+                username="other",
+                filename=r"Someone Else\Other\01 Hungover.flac",
+                extension="flac",
+                size=10,
+                bitrate=0,
+                speed=9_000,
+                free_slot=True,
+                queue=0,
+                state="",
+                folder="",
+            ),
+        ]
+        plan = worker.plan_wanted_downloads(files, artist="Ella Langley")
+        songs = {match.song: match.username for match in plan.matches}
+        assert songs.get("Hungover") == "slow"
+        assert "Cowboy" not in songs
+        assert all(match.artist == "Ella Langley" for match in plan.matches)
+        assert plan.skipped == 1
+        assert plan.missing == 0
+        assert plan.users == 1
+    finally:
+        worker.close()
 
 
 def test_store_lookup_does_not_return_other_artists(tmp_path):

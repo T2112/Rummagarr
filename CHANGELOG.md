@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## [1.9.4] — 2026-10-12
+
+### Added
+
+- Search → Download all wanted works with no user selected. After an artist search it reads every result, finds that artist's wanted albums and tracks, and queues the best source for each. A folder that already has every wanted song anyone is sharing for an album is kept together from that one user. Otherwise each missing song comes from another user. Free slot, then speed, then the format and bitrate from Behavior decide which source wins. A file already downloaded or queued, or the same path twice, is not queued again. The status line and the log say how many wanted items matched, from how many users, and how many were not found. Select a user, or one of their files, and the button still downloads only that user's matches. The button's hover note says which of the two it will do.
+
 ## [1.9.3] — 2026-10-12
 
 ### Fixed

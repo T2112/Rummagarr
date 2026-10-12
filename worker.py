@@ -72,10 +72,13 @@ from sharing import (
     QueuedUpload,
     RemoteFile,
     SharePolicy,
+    WantedPick,
     WantedTrack,
     admit,
     candidate_names,
+    choose_wanted_downloads,
     match_files_to_wanted,
+    narrow_wanted_tracks,
     uploads_to_pause,
 )
 from state import JobStore
@@ -2324,22 +2327,32 @@ class Worker:
                 return transfer
         return None
 
-    def match_user_files(self, files: list) -> list:
-        remotes = [
-            RemoteFile(
-                username=str(getattr(item, "username", "") or ""),
-                filename=str(getattr(item, "filename", "") or ""),
-                size=int(getattr(item, "size", 0) or 0),
-                bitrate=int(getattr(item, "bitrate", 0) or 0),
-                extension=str(getattr(item, "extension", "") or ""),
+    def _remote_files(self, files: list) -> list[RemoteFile]:
+        remotes: list[RemoteFile] = []
+        for item in files:
+            filename = str(getattr(item, "filename", "") or "")
+            if not filename:
+                continue
+            remotes.append(
+                RemoteFile(
+                    username=str(getattr(item, "username", "") or ""),
+                    filename=filename,
+                    size=int(getattr(item, "size", 0) or 0),
+                    bitrate=int(getattr(item, "bitrate", 0) or 0),
+                    extension=str(getattr(item, "extension", "") or ""),
+                    free_slot=bool(getattr(item, "free_slot", False)),
+                    speed=int(getattr(item, "speed", 0) or 0),
+                    queue=int(getattr(item, "queue", 0) or 0),
+                    state=str(getattr(item, "state", "") or ""),
+                    folder=str(getattr(item, "folder", "") or ""),
+                )
             )
-            for item in files
-            if getattr(item, "filename", None)
-        ]
-        names, folds = candidate_names(remotes)
+        return remotes
+
+    def _wanted_tracks(self, names: list[str], folds: list[str]) -> list[WantedTrack]:
         if self.store.wanted_catalog_ready():
             rows = self.store.wanted_tracks_for(names, folds)
-            tracks = [
+            return [
                 WantedTrack(
                     artist=row["artist"],
                     album=row["album"],
@@ -2352,9 +2365,45 @@ class Worker:
                 )
                 for row in rows
             ]
-        else:
-            tracks = self._tracks_from_memory(names, folds)
+        return self._tracks_from_memory(names, folds)
+
+    def match_user_files(self, files: list) -> list:
+        remotes = self._remote_files(files)
+        names, folds = candidate_names(remotes)
+        tracks = self._wanted_tracks(names, folds)
         return match_files_to_wanted(
+            remotes,
+            tracks,
+            min_filename_ratio=float(self.cfg.min_filename_ratio),
+            preferred_extensions=list(self.cfg.preferred_extensions),
+            min_mp3_bitrate=int(self.cfg.min_mp3_bitrate),
+        )
+
+    def plan_wanted_downloads(
+        self,
+        files: list,
+        *,
+        artist: str,
+        album: str = "",
+        kind: str = "artist",
+        album_id: int | None = None,
+        track_id: int | None = None,
+        title: str = "",
+    ) -> WantedPick:
+        """Wanted albums and tracks for this artist, best source across every result."""
+        artist_name = (artist or "").strip()
+        if not artist_name:
+            return WantedPick()
+        remotes = self._remote_files(files)
+        tracks = narrow_wanted_tracks(
+            self._wanted_tracks([artist_name], [normalize(artist_name)]),
+            kind=kind,
+            album=album,
+            album_id=album_id,
+            track_id=track_id,
+            title=title,
+        )
+        return choose_wanted_downloads(
             remotes,
             tracks,
             min_filename_ratio=float(self.cfg.min_filename_ratio),

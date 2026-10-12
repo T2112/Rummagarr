@@ -579,3 +579,80 @@ def test_magnifier_opens_a_folded_search(desktop):
     file_iid = next(iter(song_board.row_files))
     assert "Cowboy.flac" in song_board.tree.item(file_iid, "text")
     assert song_board.tree.set(file_iid, "format") == "FLAC"
+
+
+def test_download_all_wanted_without_a_selected_user(desktop, caplog):
+    import logging
+
+    from desktop_app import WantedPreview
+    from search_model import SearchFile
+    from wanted import items_to_rows
+
+    desktop.worker.store.write_wanted_page(items_to_rows(desktop.worker.catalog.items()))
+    board = desktop._add_search_board("Ella Langley", None)
+    desktop.searches.select(board.frame)
+    desktop.show_search_files(
+        board,
+        [
+            SearchFile(username="slow", filename=r"Ella Langley\Hungover\01 Blue.flac", extension="flac", size=1000, speed=100),
+            SearchFile(username="slow", filename=r"Ella Langley\Hungover\02 Red.flac", extension="flac", size=1000, speed=100),
+            SearchFile(
+                username="fast",
+                filename=r"Ella Langley\Hungover\01 Blue.flac",
+                extension="flac",
+                size=1000,
+                free_slot=True,
+                speed=9_000,
+            ),
+            SearchFile(
+                username="fast",
+                filename=r"Ella Langley\Still\01 Cowboy.flac",
+                extension="flac",
+                size=1000,
+                free_slot=True,
+                speed=9_000,
+            ),
+            SearchFile(
+                username="other",
+                filename=r"Chris Stapleton\Traveller\01 Tennessee Whiskey.flac",
+                extension="flac",
+                size=1000,
+                free_slot=True,
+                speed=9_000,
+            ),
+            SearchFile(username="noise", filename=r"Noise\not wanted.mp3", extension="mp3", bitrate=128, size=10),
+        ],
+    )
+    desktop.update()
+    with caplog.at_level(logging.INFO, logger="lidarr_slsk.desktop"):
+        desktop.download_all_wanted()
+    desktop.update()
+    summary = "2 wanted items matched from 2 users, and 0 wanted items not found."
+    assert board.status.get() == summary
+    assert summary in caplog.text
+    previews = [child for child in desktop.winfo_children() if isinstance(child, WantedPreview)]
+    assert len(previews) == 1
+    queued = {(match.username, match.song or match.album) for match in previews[0].matches}
+    assert ("slow", "Hungover") in queued
+    assert ("fast", "Cowboy") in queued
+    assert all(match.artist == "Ella Langley" for match in previews[0].matches)
+    previews[0].destroy()
+    desktop.update()
+
+    noise = next(iid for iid, name in board.row_users.items() if name == "noise")
+    board.tree.selection_set(noise)
+    desktop.download_all_wanted()
+    desktop.update()
+    assert board.status.get() == "No wanted matches in noise's results."
+    assert not [child for child in desktop.winfo_children() if isinstance(child, WantedPreview)]
+
+    slow = next(iid for iid, name in board.row_users.items() if name == "slow")
+    board.tree.selection_set(slow)
+    desktop.download_all_wanted()
+    desktop.update()
+    assert board.status.get() == "1 wanted item matched from slow."
+    selected = [child for child in desktop.winfo_children() if isinstance(child, WantedPreview)]
+    assert len(selected) == 1
+    assert {match.username for match in selected[0].matches} == {"slow"}
+    assert all(not match.song for match in selected[0].matches)
+    selected[0].destroy()
