@@ -1123,6 +1123,7 @@ class SearchBoard:
     sort_reverse: bool = False
     closed: bool = False
     running: bool = False
+    outcome: str = ""
     frame: ttk.Frame | None = None
     tree: ttk.Treeview | None = None
     status: tk.StringVar | None = None
@@ -2338,14 +2339,13 @@ class DesktopApp(tk.Tk):
             if item.id in selected_files:
                 tree.selection_add(iid)
         if board.status is not None:
-            current = str(board.status.get())
-            counting = (not current) or "result" in current
-            if board.running or counting:
-                extra = ""
-                if not board.running and len(visible) != len(board.files):
-                    extra = f", {len(visible)} match the filter"
-                suffix = " so far" if board.running else ""
-                board.status.set(f"{len(board.files)} results{suffix}{extra}")
+            extra = ""
+            if board.files and len(visible) != len(board.files):
+                extra = f" {len(visible)} match the filter."
+            if board.running:
+                board.status.set(f"Searching… {len(board.files)} results so far{extra}")
+            elif board.outcome:
+                board.status.set(f"{board.outcome}{extra}")
         self._retitle(board)
 
     def show_search_files(self, board: SearchBoard, files: list[SearchFile]) -> None:
@@ -2367,39 +2367,77 @@ class DesktopApp(tk.Tk):
                 board.status.set("Start the worker to search. Search uses that Soulseek login.")
             return
         board.running = True
+        board.outcome = ""
         if board.status is not None:
             board.status.set("Searching…")
 
         def watch() -> None:
+            request = None
             try:
-                request = asyncio.run_coroutine_threadsafe(self.worker.begin_manual_search(board.query), loop).result(timeout=30)
+                self._post(lambda: self._mark_search(board, "Sending the search to Soulseek…"))
+                request = asyncio.run_coroutine_threadsafe(
+                    self.worker.begin_manual_search(board.query), loop
+                ).result(timeout=30)
+                deadline = time.monotonic() + max(1.0, float(self.worker.cfg.search_wait_seconds))
+                while time.monotonic() < deadline and not board.closed:
+                    try:
+                        files = files_from_results(getattr(request, "results", None))
+                    except Exception:
+                        log.exception("Could not read search results for %r", board.query)
+                        files = list(board.files)
+                    self._post(lambda files=files: None if board.closed else self.show_search_files(board, files))
+                    time.sleep(0.4)
             except Exception as exc:
                 self._post(lambda exc=exc: self._search_failed(board, exc))
                 return
-            deadline = time.monotonic() + max(1.0, float(self.worker.cfg.search_wait_seconds))
-            while time.monotonic() < deadline and not board.closed:
-                files = files_from_results(getattr(request, "results", None))
-                self._post(lambda files=files: None if board.closed else self.show_search_files(board, files))
-                time.sleep(0.4)
             self._post(lambda: self._finish_search(board, request, loop))
 
         threading.Thread(target=watch, name="manual-search", daemon=True).start()
 
+    def _mark_search(self, board: SearchBoard, text: str) -> None:
+        if board.closed or not board.running or board.status is None:
+            return
+        board.status.set(text)
+
     def _search_failed(self, board: SearchBoard, exc: Exception) -> None:
         board.running = False
+        if isinstance(exc, TimeoutError):
+            text = (
+                "No results (0 peer replies). The search was not sent because "
+                "Soulseek did not respond in time."
+            )
+        else:
+            text = str(exc).strip() or type(exc).__name__
+        board.outcome = text
         if board.status is not None and not board.closed:
-            board.status.set(str(exc))
+            board.status.set(text)
 
     def _finish_search(self, board: SearchBoard, request, loop) -> None:
         board.running = False
         results = getattr(request, "results", None)
-        self.worker.note_search_receipt(board.query, results)
-        if not board.closed:
-            self.show_search_files(board, files_from_results(results))
-            if board.status is not None:
-                board.status.set(f"{len(board.files)} results")
         try:
-            asyncio.run_coroutine_threadsafe(self._drop_request(request), loop)
+            replies, shown, _locked, outcome = self.worker.note_search_receipt(board.query, results)
+        except Exception:
+            log.exception("Could not record the search result for %r", board.query)
+            replies, shown, outcome = (
+                0,
+                len(board.files),
+                "No results (0 peer replies). Could not read the search replies.",
+            )
+        if shown:
+            noun = "result" if shown == 1 else "results"
+            reply_word = "reply" if replies == 1 else "replies"
+            board.outcome = f"{shown} {noun} ({replies} peer {reply_word})"
+        else:
+            board.outcome = outcome
+        if not board.closed:
+            try:
+                self.show_search_files(board, files_from_results(results))
+            except Exception:
+                log.exception("Could not list search results for %r", board.query)
+        try:
+            if loop is not None and loop.is_running():
+                asyncio.run_coroutine_threadsafe(self._drop_request(request), loop)
         except Exception:
             pass
 

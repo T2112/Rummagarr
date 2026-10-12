@@ -175,6 +175,60 @@ def test_share_scan_yields_so_a_peer_reply_is_not_dropped(tmp_path, monkeypatch)
     assert indexed_when_seen < total
 
 
+def test_share_query_does_not_block_our_search(tmp_path, monkeypatch):
+    """Answering someone else's search must not freeze the loop that reads our replies.
+
+    After a share index exists, every distributed search calls SharesManager.query
+    on the event loop. A large index makes that call slow, and the server sends
+    those searches constantly. The listen socket then never accepts the peers
+    who are answering us, and the Search tab stays on Searching.
+    """
+    import threading
+
+    from aioslsk.shares.manager import SharesManager
+
+    entered = threading.Event()
+    finished = threading.Event()
+    callers: list[threading.Thread] = []
+
+    def slow_query(self, query, username=None, excluded_search_phrases=None):
+        callers.append(threading.current_thread())
+        entered.set()
+        time.sleep(8)
+        finished.set()
+        return [], []
+
+    monkeypatch.setattr(SharesManager, "query", slow_query)
+
+    async def scenario():
+        loop_thread = threading.current_thread()
+        mock = MockSoulseek()
+        mock.push_server_search = True
+        await mock.start()
+        worker = None
+        try:
+            worker = await _login(tmp_path, mock, monkeypatch)
+            assert entered.is_set(), "the server search never reached the client"
+            request = await worker.begin_manual_search("ella langley hungover")
+            files = await _wait_for_file(request, seconds=3)
+            # Captured before shutdown. Stopping the client waits out a query
+            # that is still sitting on the executor.
+            still_querying = not finished.is_set()
+            return files, loop_thread, list(mock.searches), still_querying
+        finally:
+            if worker is not None:
+                await worker.stop_soulseek()
+                worker.close()
+            await mock.close()
+
+    files, loop_thread, sent, still_querying = asyncio.run(scenario())
+    assert sent, "our FileSearch was never sent"
+    assert [item.filename for item in files] == [r"music\Ella Langley\Hungover\01 Blue.flac"]
+    assert callers, "share query did not run"
+    assert callers[0] is not loop_thread
+    assert still_querying
+
+
 def test_search_receipt_separates_no_answer_from_filtered(caplog):
     caplog.set_level("INFO", logger="lidarr_slsk")
     from tests.test_manual_search import Item, Result
@@ -197,5 +251,41 @@ def test_search_receipt_separates_no_answer_from_filtered(caplog):
     host.note("locked-only", [reply])
     text = caplog.text
     assert "Search 'nobody': 0 peer replies, 0 files shown, 0 locked files not shown" in text
+    assert "No peer answered." in text
     assert "Search 'ella': 1 peer replies, 1 files shown, 0 locked files not shown" in text
+    assert "Listed 1 file." in text
     assert "Search 'locked-only': 1 peer replies, 0 files shown, 1 locked files not shown" in text
+    assert "1 locked file was hidden." in text
+
+
+def test_explain_search_names_the_reason_it_is_empty():
+    from search_model import counts_for_server, explain_search
+
+    assert counts_for_server(0, 0) == (0, 0)
+    assert counts_for_server(0, 12) == (1, 12)
+    assert counts_for_server(4, 12) == (4, 12)
+    assert "not logged in" in explain_search(
+        0, 0, 0, logged_in=False, server_connected=False, listen_port=0, share_files=0, share_folders=0, parent_name="", scanning=False
+    )
+    assert "server connection is down" in explain_search(
+        0, 0, 0, logged_in=True, server_connected=False, listen_port=2234, share_files=10, share_folders=2, parent_name="", scanning=False
+    )
+    assert "listen port is closed" in explain_search(
+        0, 0, 0, logged_in=True, server_connected=True, listen_port=0, share_files=10, share_folders=2, parent_name="root", scanning=False
+    )
+    assert "sharing 0 files" in explain_search(
+        0, 0, 0, logged_in=True, server_connected=True, listen_port=2234, share_files=0, share_folders=0, parent_name="", scanning=False
+    )
+    scanning = explain_search(
+        0, 0, 0, logged_in=True, server_connected=True, listen_port=2234, share_files=0, share_folders=0, parent_name="", scanning=True
+    )
+    assert "share scan is still running" in scanning
+    sent = explain_search(
+        0, 0, 0, logged_in=True, server_connected=True, listen_port=2234, share_files=40, share_folders=3, parent_name="", scanning=False
+    )
+    assert "0 peer replies" in sent
+    assert "The search was sent" in sent
+    assert "Distributed parent: none" in sent
+    assert "locked file was hidden" in explain_search(
+        1, 0, 1, logged_in=True, server_connected=True, listen_port=2234, share_files=40, share_folders=3, parent_name="root", scanning=False
+    )

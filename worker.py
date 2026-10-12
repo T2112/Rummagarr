@@ -35,7 +35,14 @@ from activity import Step, describe_step, format_elapsed, step_from_legacy
 from config_loader import Config
 from control import WorkerControl
 from lidarr_client import LidarrClient
-from search_model import file_from_share, result_count, search_receipt
+from search_model import (
+    counts_for_server,
+    explain_search,
+    file_from_share,
+    neutral_search_outcome,
+    result_count,
+    search_receipt,
+)
 from status_ui import normalize_recent_limit, start_status_ui
 from wanted import (
     WantedCatalog,
@@ -312,6 +319,157 @@ def install_responsive_share_scan(client) -> None:
     shares.scan_directory_files = scan_directory_files
     shares.scan_directory_file_attributes = scan_directory_file_attributes
     shares._lidarr_responsive_scan = True
+
+
+# How many incoming share queries may be queued before new ones are dropped.
+# Answering them is optional. Reading the replies to our own searches is not.
+_QUERY_QUEUE = 8
+_QUERY_SLOTS = 2
+
+
+def install_nonblocking_share_queries(client) -> None:
+    """Answer other people's searches off the loop that reads our own replies.
+
+    aioslsk runs SharesManager.query inside the server and parent readers, with
+    no await. Once a library is indexed, that call walks the term map. The
+    server sends those searches continuously to a client that has no distributed
+    parent yet, so the reader never gets back to accepting peer connections.
+    Search replies sit unaccepted and the Search tab stays on Searching.
+    """
+    searches = getattr(client, "searches", None)
+    if searches is None or getattr(searches, "_lidarr_async_query", False):
+        return
+
+    from aioslsk.events import SearchRequestReceivedEvent
+    from aioslsk.protocol.messages import PeerSearchReply
+    from aioslsk.search.model import ReceivedSearch
+    from aioslsk.shares.utils import convert_items_to_file_data
+
+    searches._lidarr_async_query = True
+    searches._lidarr_query_sem = asyncio.Semaphore(_QUERY_SLOTS)
+    searches._lidarr_query_tasks: set[asyncio.Task] = set()
+    pending = {"n": 0}
+
+    async def answer(ticket: int, username: str, query: str) -> None:
+        try:
+            session = searches._session
+            if session is None:
+                return
+            if searches._settings.users.is_blocked(username, BlockingFlag.SEARCHES):
+                return
+            shares = searches._shares_manager
+            loop = asyncio.get_running_loop()
+            excluded = list(searches.excluded_search_phrases or [])
+            try:
+                async with searches._lidarr_query_sem:
+                    visible, locked = await loop.run_in_executor(
+                        getattr(shares, "executor", None),
+                        partial(
+                            shares.query,
+                            query,
+                            username=username,
+                            excluded_search_phrases=excluded,
+                        ),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Could not query shares for %r", query)
+                return
+            if searches._session is None:
+                return
+            found = len(visible) + len(locked)
+            searches.received_searches.append(
+                ReceivedSearch(username=username, query=query, result_count=found)
+            )
+            await searches._event_bus.emit(
+                SearchRequestReceivedEvent(username=username, query=query, result_count=found)
+            )
+            if found == 0:
+                return
+            task = asyncio.create_task(
+                searches._network.send_peer_messages(
+                    username,
+                    PeerSearchReply.Request(
+                        username=searches._session.user.name,
+                        ticket=ticket,
+                        results=convert_items_to_file_data(visible, use_full_path=True),
+                        has_slots_free=searches._upload_info_provider.has_slots_free(),
+                        avg_speed=int(searches._upload_info_provider.get_average_upload_speed()),
+                        queue_size=searches._upload_info_provider.get_queue_size(),
+                        locked_results=convert_items_to_file_data(locked, use_full_path=True),
+                    ),
+                ),
+                name="search-reply",
+            )
+            task.add_done_callback(partial(searches._search_reply_task_callback, ticket, username, query))
+            searches._search_reply_tasks.append(task)
+        finally:
+            pending["n"] -= 1
+
+    async def query_shares_and_reply(ticket: int, username: str, query: str) -> None:
+        # The server reader can already have several searches buffered. Returning
+        # without an await would drain that buffer before any peer reply is read.
+        if pending["n"] >= _QUERY_QUEUE:
+            log.debug("Skipping share query %r from %s; %d already queued", query, username, pending["n"])
+        else:
+            pending["n"] += 1
+            task = asyncio.create_task(answer(ticket, username, query))
+            searches._lidarr_query_tasks.add(task)
+            task.add_done_callback(searches._lidarr_query_tasks.discard)
+        await asyncio.sleep(0)
+
+    searches._query_shares_and_reply = query_shares_and_reply
+    log.info("Incoming share queries run off the loop that reads search replies")
+
+
+def install_share_count_reporting(client, worker) -> None:
+    """Log the folder and file totals sent to the server, and correct a zero folder count."""
+    shares = getattr(client, "shares", None)
+    if shares is None or getattr(shares, "_lidarr_report", False):
+        return
+    original = shares.report_shares
+
+    async def report() -> None:
+        if not shares._session:
+            return
+        raw_folders, raw_files = shares.get_stats()
+        folders, files = counts_for_server(raw_folders, raw_files)
+        if (folders, files) != (max(0, int(raw_folders or 0)), max(0, int(raw_files or 0))):
+            from aioslsk.protocol.messages import SharedFoldersFiles
+
+            log.info(
+                "Share count had %s folders for %s files; reporting 1 folder so searches are not ignored",
+                raw_folders,
+                raw_files,
+            )
+            await shares._network.send_server_messages(
+                SharedFoldersFiles.Request(shared_folder_count=folders, shared_file_count=files)
+            )
+        else:
+            await original()
+        worker.share_counts = (folders, files)
+        log.info("Reported share counts to Soulseek: %s folders, %s files", folders, files)
+        if files <= 0 and effective_share_dirs(worker.cfg):
+            log.info(
+                "Share counts stay at 0 until the share scan finishes. Other users may ignore searches until then."
+            )
+        elif files <= 0:
+            log.warning(
+                "Soulseek was told this client shares 0 files. Other users often ignore searches from a client that shares nothing."
+            )
+
+    shares.report_shares = report
+    shares._lidarr_report = True
+
+
+def cancel_share_queries(client) -> None:
+    searches = getattr(client, "searches", None)
+    tasks = getattr(searches, "_lidarr_query_tasks", None) if searches is not None else None
+    if not tasks:
+        return
+    for task in list(tasks):
+        task.cancel()
 
 
 def ffmpeg_path() -> str | None:
@@ -622,17 +780,68 @@ class Worker:
             raise RuntimeError("Start the worker to search. Search uses that Soulseek login.")
         return await self._send_search(query)
 
-    def note_search_receipt(self, query: str, results) -> tuple[int, int, int]:
+    def search_outcome(self, replies: int, shown: int, locked: int) -> str:
+        """Say why a search listed the files it did, using the live connection."""
+        logged_in = self.soulseek_logged_in()
+        server_connected = False
+        listen_port = 0
+        share_files: int | None = None
+        share_folders = 0
+        parent_name = ""
+        scanning = self._share_task is not None and not self._share_task.done()
+        client = self.client
+        if client is not None:
+            try:
+                from aioslsk.network.connection import ConnectionState
+
+                server = getattr(getattr(client, "network", None), "server_connection", None)
+                server_connected = bool(server and server.state == ConnectionState.CONNECTED)
+                ports = client.network.get_listening_ports()
+                listen_port = int(ports[0] or 0)
+            except Exception:
+                log.debug("Could not read Soulseek listen state", exc_info=True)
+            try:
+                share_folders, share_files = client.shares.get_stats()
+                share_folders = int(share_folders)
+                share_files = int(share_files)
+            except Exception:
+                if self.share_counts:
+                    share_folders, share_files = self.share_counts
+            try:
+                parent = getattr(getattr(client, "distributed_network", None), "parent", None)
+                parent_name = str(getattr(parent, "username", "") or "")
+            except Exception:
+                parent_name = ""
+        return explain_search(
+            replies,
+            shown,
+            locked,
+            logged_in=logged_in,
+            server_connected=server_connected,
+            listen_port=listen_port,
+            share_files=share_files,
+            share_folders=share_folders,
+            parent_name=parent_name,
+            scanning=scanning,
+        )
+
+    def note_search_receipt(self, query: str, results) -> tuple[int, int, int, str]:
         """Log raw peer replies against the files the Search tab will list."""
         replies, shown, locked = search_receipt(results)
+        describer = getattr(self, "search_outcome", None)
+        if callable(describer):
+            outcome = describer(replies, shown, locked)
+        else:
+            outcome = neutral_search_outcome(replies, shown, locked)
         log.info(
-            "Search %r: %d peer replies, %d files shown, %d locked files not shown",
+            "Search %r: %d peer replies, %d files shown, %d locked files not shown. %s",
             query,
             replies,
             shown,
             locked,
+            outcome,
         )
-        return replies, shown, locked
+        return replies, shown, locked, outcome
 
     async def _await_results(
         self,
@@ -767,6 +976,11 @@ class Worker:
 
     async def start_soulseek(self) -> None:
         self.client = SoulSeekClient(build_slsk_settings(self.cfg))
+        # Install before login. The server reader starts at the end of login and
+        # can deliver distributed searches before this function continues.
+        install_responsive_share_scan(self.client)
+        install_nonblocking_share_queries(self.client)
+        install_share_count_reporting(self.client, self)
         await self.client.start()
         await self.client.login()
         signal = await self.control.gate(sleep=2)
@@ -808,6 +1022,7 @@ class Worker:
         self._share_task = None
         self._housekeeping_task = None
         if self.client:
+            cancel_share_queries(self.client)
             await self.client.stop()
             self.client = None
 
