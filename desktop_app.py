@@ -1173,6 +1173,20 @@ def _attach_tip(widget: tk.Widget, text: str) -> None:
     widget.bind("<ButtonPress>", hide)
 
 
+def _release_tk_objects(widget: tk.Misc) -> None:
+    """Drop Tcl variables and images on the thread that is closing the window.
+
+    Tcl only accepts those objects from the thread that created them. If a
+    later garbage collection runs on a worker, each one waits a second for a
+    main loop that is not running, then raises. Clearing the instance dict
+    runs the destructors here instead.
+    """
+    try:
+        widget.__dict__.clear()
+    except Exception:
+        pass
+
+
 class WantedPreview(tk.Toplevel):
     """Wanted files about to be queued. All start checked."""
 
@@ -1262,11 +1276,19 @@ class WantedPreview(tk.Toplevel):
         self._checked[index] = not self._checked.get(index, False)
         self.tree.item(row, image=self._images["on" if self._checked[index] else "off"])
 
+    def destroy(self) -> None:
+        try:
+            super().destroy()
+        except tk.TclError:
+            pass
+        _release_tk_objects(self)
+
     def _queue(self) -> None:
         picked = [match for index, match in enumerate(self.matches) if self._checked.get(index, False)]
+        callback = self.on_queue
         self.destroy()
         if picked:
-            self.on_queue(picked)
+            callback(picked)
 
 
 class DesktopApp(tk.Tk):
@@ -1331,6 +1353,14 @@ class DesktopApp(tk.Tk):
             self.after(300, self.on_start)
         if check_updates:
             self.after(400, lambda: self.check_for_updates(manual=False))
+
+    def destroy(self) -> None:
+        self._shutting_down = True
+        try:
+            super().destroy()
+        except tk.TclError:
+            pass
+        _release_tk_objects(self)
 
     def _build(self) -> None:
         self._build_menu()

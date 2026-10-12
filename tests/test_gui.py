@@ -656,3 +656,50 @@ def test_download_all_wanted_without_a_selected_user(desktop, caplog):
     assert {match.username for match in selected[0].matches} == {"slow"}
     assert all(not match.song for match in selected[0].matches)
     selected[0].destroy()
+
+
+def test_closed_window_does_not_stall_another_thread(tmp_path):
+    """Closing the window must not leave Tk objects for a worker to collect.
+
+    Each one waits a second for a main loop. Enough of them make the parallel
+    Lidarr lookup take about 89 seconds even though the requests overlap.
+    """
+    import gc
+    import threading
+    import time
+
+    _tk_or_skip()
+    gc.disable()
+    try:
+        worker = make_worker(tmp_path)
+        items = build_catalog(
+            [album(1, "Ella Langley", "Hungover", files=0, total=4)],
+            [hole(21, 1, "Ella Langley", "Hungover", "Blue")],
+        )
+        worker.catalog.replace(items)
+        app = DesktopApp(
+            worker,
+            tmp_path / "config.toml",
+            start_status_server=False,
+            honor_start_on_launch=False,
+            poll_ms=60_000,
+        )
+        app.update()
+        app.destroy()
+        worker.close()
+        del app, worker, items
+        spent: dict[str, float] = {}
+
+        def collect() -> None:
+            started = time.perf_counter()
+            gc.collect()
+            spent["seconds"] = time.perf_counter() - started
+
+        thread = threading.Thread(target=collect)
+        thread.start()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert spent["seconds"] < 1
+    finally:
+        gc.enable()
+        gc.collect()

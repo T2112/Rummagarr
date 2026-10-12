@@ -10,6 +10,7 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- The check that parallel Lidarr track lookups overlap could take about 89 seconds and fail, so the 1.9.4 release was not published. The lookups did overlap. Closing the window left its fields and checkbox images for the garbage collector. A lookup thread then deleted them, and Tcl waits one second per object for a main loop that is not running. Closing the window now drops those objects on the main thread.
 - Automatic search could stay on "Waiting for retry period (next artist in 5s)" and never send another FileSearch. Manual search and downloads already queued still worked. An artist with nothing to send — a wanted row with no albums or songs, a partial album with no missing tracks, or an album already imported — still looked ready. The short wait before the next artist started over, so the countdown never reached a search. That wait now runs only after a search was sent. When it reaches 0, the next artist who has something to search is searched. If every artist is actually waiting, the status names the earliest one and counts down the real time left. A cooldown saved by an older version under an "artist:" id is included in that time. A pass that sends no search does not mark the artist as visited.
 
 ## [1.9.3] — 2026-10-12
