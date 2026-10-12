@@ -67,6 +67,7 @@ This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs 
 ## What's new in 1.9.4
 
 - Search → Download all wanted no longer needs a selected user. It matches that artist's wanted albums and tracks across every result, keeps one complete folder when a user has it, and fills any missing tracks from other users. The status line reports how many matched, from how many users, and how many were not found. A selected user still limits the download to that user.
+- Automatic search no longer sits on "Waiting for retry period (next artist in 5s)" when the next artist has nothing to send. The countdown reaches a real search. If every artist is waiting, the status names the earliest one and the real time left.
 - Full changelog: [CHANGELOG.md](CHANGELOG.md)
 
 ## What's new in 1.9.3

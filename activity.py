@@ -25,6 +25,7 @@ class Step:
     username: str = ""
     retry_seconds: int = 0
     retry_kind: str = "pass"
+    retry_deadline: float = 0.0
     detail: str = ""
     started: float = 0.0
 
@@ -95,12 +96,18 @@ def describe_step(step: Step) -> str:
         return f"{head} · {who}" if who else head
     if step.kind == "retry":
         # "pass" is the short wait between ready artists (cycle_seconds).
-        # "artist" is the multi-day skip after a visit (artist_cooldown_days).
-        if step.retry_kind == "artist":
-            return f"Waiting for artist retry period (next artist in {format_span(step.retry_seconds)})"
-        if int(step.retry_seconds or 0) <= 0:
+        # "artist" is the multi-day skip after a visit, or the album retry.
+        # retry_seconds is the time still left, so the Status line counts down.
+        remaining = int(step.retry_seconds or 0)
+        who = step.artist or ""
+        if remaining <= 0:
+            if who:
+                return f"Starting the next artist ({who})"
             return "Starting the next artist"
-        return f"Waiting for retry period (next artist in {format_span(step.retry_seconds)})"
+        if step.retry_kind == "artist":
+            name = who or "the next artist"
+            return f"Waiting for artist retry period ({name} in {format_span(remaining)})"
+        return f"Waiting for retry period (next artist in {format_span(remaining)})"
     if step.kind == "preparing":
         return f"Choosing the next album · {who}" if who else "Choosing the next album"
     if step.kind == "connecting":
