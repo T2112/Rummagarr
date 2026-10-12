@@ -92,10 +92,12 @@ def test_synced_worker_searches_only_checked_albums_and_songs(tmp_path):
     seen_tracks: list[int] = []
 
     async def fake_album(row):
+        worker._cycle_attempted_search = True
         seen_albums.append(int(row["id"]))
         return False
 
     async def fake_track(row):
+        worker._cycle_attempted_search = True
         seen_tracks.append(int(row["track"]["id"]))
         return False
 
