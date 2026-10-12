@@ -253,6 +253,8 @@ def build_slsk_settings(cfg: Config) -> Settings:
 LOSSLESS_EXT = {".flac", ".wav", ".aiff", ".aif", ".wv", ".ape"}
 # Yield this often so a large share scan cannot freeze the loop that reads search replies.
 _SCAN_CHUNK = 25
+# How long to wait for the server to accept a FileSearch before moving on.
+_SEARCH_SEND_TIMEOUT = 20.0
 
 
 def install_responsive_share_scan(client) -> None:
@@ -621,6 +623,10 @@ def stage_album_folder(cfg: Config, artist: str, title: str, year: str | None, t
     return dest, removable
 
 
+class SearchNotSent(RuntimeError):
+    """The FileSearch was not accepted by the server in time."""
+
+
 class Worker:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -646,6 +652,9 @@ class Worker:
         self._active_keys: set[str] = set()
         self._key_lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop_beat = 0.0
+        self._heartbeat_task: asyncio.Task | None = None
+        self._cycle_attempted_search = False
         self.share_counts: tuple[int, int] = (0, 0)
         self._share_task: asyncio.Task | None = None
         self._housekeeping_task: asyncio.Task | None = None
@@ -772,8 +781,25 @@ class Worker:
         downloads, keep going so a manual search does not freeze the worker.
         """
         assert self.client is not None
-        async with self._search_slot():
-            return await self.client.searches.search(query)
+        self._cycle_attempted_search = True
+        log.info("Sending search %r. %s", query, self.search_diagnostics())
+        try:
+            async with self._search_slot():
+                return await asyncio.wait_for(
+                    self.client.searches.search(query),
+                    timeout=_SEARCH_SEND_TIMEOUT,
+                )
+        except TimeoutError:
+            detail = self.search_diagnostics()
+            log.warning(
+                "Search %r was not accepted within %.0fs. %s",
+                query,
+                _SEARCH_SEND_TIMEOUT,
+                detail,
+            )
+            raise SearchNotSent(
+                f"Soulseek did not accept the search within {int(_SEARCH_SEND_TIMEOUT)}s. {detail}"
+            ) from None
 
     async def begin_manual_search(self, query: str):
         if not await self.ensure_soulseek():
@@ -892,8 +918,11 @@ class Worker:
                 }
             )
         activity, elapsed, busy = self.activity_view()
+        responsive, connected_label = self.soulseek_link()
         return {
-            "logged_in": self.soulseek_logged_in(),
+            "logged_in": responsive,
+            "connected_label": connected_label,
+            "soulseek_detail": self.search_diagnostics(),
             "job": dict(self.job_info),
             "activity": activity,
             "elapsed": elapsed,
@@ -974,6 +1003,73 @@ class Worker:
     def soulseek_logged_in(self) -> bool:
         return bool(self.client and getattr(self.client, "session", None))
 
+    def loop_lag_seconds(self) -> float | None:
+        """Seconds since the worker loop last had a turn. None before it starts."""
+        if self._loop is None or not self._loop_beat:
+            return None
+        return max(0.0, time.monotonic() - self._loop_beat)
+
+    def _server_state(self) -> tuple[str, int]:
+        client = self.client
+        if client is None:
+            return "no client", 0
+        try:
+            from aioslsk.network.connection import ConnectionState
+
+            server = getattr(getattr(client, "network", None), "server_connection", None)
+            if server is None:
+                return "no server connection", 0
+            name = getattr(getattr(server, "state", None), "name", None) or str(getattr(server, "state", "unknown"))
+            if server.state != ConnectionState.CONNECTED:
+                port = 0
+            else:
+                ports = client.network.get_listening_ports()
+                port = int(ports[0] or 0)
+            return name, port
+        except Exception:
+            return "unreadable", 0
+
+    def soulseek_link(self) -> tuple[bool, str]:
+        """Whether the session can accept a search, and the Status label for that."""
+        lag = self.loop_lag_seconds()
+        if lag is not None and lag >= 5:
+            return False, f"Soulseek not responding (loop {int(lag)}s behind)"
+        if not self.soulseek_logged_in():
+            return False, "Soulseek offline"
+        state, _port = self._server_state()
+        if state != "CONNECTED":
+            return False, f"Soulseek session is down ({state})"
+        return True, "Soulseek connected"
+
+    def search_diagnostics(self) -> str:
+        """Connection, loop, and share-scan state. Safe to call off the worker loop."""
+        state, port = self._server_state()
+        lag = self.loop_lag_seconds()
+        lag_text = "not running" if lag is None else f"{lag:.1f}s"
+        scanning = self._share_task is not None and not self._share_task.done()
+        files = self.share_counts[1] if self.share_counts else 0
+        parent = "none"
+        client = self.client
+        if client is not None:
+            try:
+                parent_obj = getattr(getattr(client, "distributed_network", None), "parent", None)
+                parent = str(getattr(parent_obj, "username", "") or "none")
+            except Exception:
+                parent = "unreadable"
+        lock = "busy" if self._search_lock is not None and self._search_lock.locked() else "free"
+        logged = "yes" if self.soulseek_logged_in() else "no"
+        return (
+            f"login={logged} server={state} listen_port={port} loop_lag={lag_text} "
+            f"share_scan={'running' if scanning else 'idle'} share_files={files} "
+            f"parent={parent} search_lock={lock}"
+        )
+
+    async def _heartbeat(self) -> None:
+        while not self.control.is_stopped():
+            self._loop_beat = time.monotonic()
+            await asyncio.sleep(0.5)
+        self._loop_beat = time.monotonic()
+
     async def start_soulseek(self) -> None:
         self.client = SoulSeekClient(build_slsk_settings(self.cfg))
         # Install before login. The server reader starts at the end of login and
@@ -1032,6 +1128,8 @@ class Worker:
         if self.control.is_stopped():
             return
         self._loop = asyncio.get_running_loop()
+        self._loop_beat = time.monotonic()
+        self._heartbeat_task = asyncio.create_task(self._heartbeat())
         self.set_step(Step(kind="connecting"))
         try:
             status = self.lidarr.ping()
@@ -1043,14 +1141,23 @@ class Worker:
             if not self.soulseek_logged_in():
                 raise RuntimeError("Soulseek login returned but session is not active")
             while not self.control.is_stopped():
+                self._cycle_attempted_search = False
                 try:
                     await self.cycle()
                 except Exception:
-                    log.exception("Cycle failed")
+                    log.exception("Cycle failed. %s", self.search_diagnostics())
                 if self.control.is_stopped():
                     self.set_step(Step(kind="stopped"))
                     break
                 pause = self._note_between_passes()
+                if pause <= 0 and not self._cycle_attempted_search:
+                    log.warning(
+                        "No Soulseek search was sent on this pass. Waiting %ss before retrying. %s",
+                        IDLE_FLOOR_SECONDS,
+                        self.search_diagnostics(),
+                    )
+                    pause = IDLE_FLOOR_SECONDS
+                    self._apply_wait(pause, "pass")
                 signal = await self.control.gate(sleep=pause)
                 if signal == "stop":
                     break
@@ -1061,6 +1168,10 @@ class Worker:
                 self.control.stop()
             raise
         finally:
+            if self._heartbeat_task is not None and not self._heartbeat_task.done():
+                self._heartbeat_task.cancel()
+                await asyncio.gather(self._heartbeat_task, return_exceptions=True)
+            self._heartbeat_task = None
             try:
                 await self.stop_soulseek()
             except Exception:
@@ -1092,8 +1203,7 @@ class Worker:
         if current:
             log.info("Artist %s is on cooldown; picking the next one", current)
         if self.store.wanted_catalog_ready():
-            skip = {token for token in cooldowns if self._cooled(token, cooldowns, now)}
-            chosen = self.store.next_wanted_artist(skip)
+            chosen = self.store.next_wanted_artist(self._cooled_artist_keys())
             if not chosen:
                 self.store.set_focus_artist(None)
                 return None
@@ -1204,11 +1314,9 @@ class Worker:
     def _cooled_artist_keys(self) -> set[str]:
         now = datetime.now(timezone.utc)
         cooldowns = self.store.artist_cooldowns()
-        return {
-            "artist:" + name
-            for name in cooldowns
-            if self._cooled(name, cooldowns, now)
-        }
+        # wanted_artists.artist_key is the casefolded name. The "artist:" prefix
+        # is only the choice-row key, and using it here skips nobody.
+        return {name for name in cooldowns if self._cooled(name, cooldowns, now)}
 
     def _has_enabled_wanted(self) -> bool:
         if self.store.wanted_catalog_ready():
@@ -1502,7 +1610,11 @@ class Worker:
                     query_total=len(queries),
                 )
             )
-            request = await self._send_search(query)
+            try:
+                request = await self._send_search(query)
+            except SearchNotSent:
+                self.store.upsert_track(track_id, album_id, artist, title, "failed", "search was not sent")
+                return False
             signal = await self._await_results(
                 request, key, self.cfg.search_wait_seconds, artist, album_title, index, len(queries)
             )
@@ -1678,7 +1790,11 @@ class Worker:
             self.set_step(
                 Step(kind="searching", artist=artist, album=title, query_index=index, query_total=len(queries))
             )
-            request = await self._send_search(query)
+            try:
+                request = await self._send_search(query)
+            except SearchNotSent:
+                self.store.upsert(album_id, artist, title, "failed", "search was not sent")
+                return False
             signal = await self._await_results(
                 request, key, self.cfg.search_wait_seconds, artist, title, index, len(queries)
             )

@@ -151,7 +151,9 @@ def step_from_legacy(phase: str, artist: str = "", title: str = "") -> Step:
 def format_status_line(snapshot: dict) -> str:
     labels = {"running": "Running", "paused": "Paused", "stopped": "Stopped"}
     state = labels.get(snapshot.get("run_state") or "stopped", "Stopped")
-    connected = "Soulseek connected" if snapshot.get("logged_in") else "Soulseek offline"
+    connected = snapshot.get("connected_label") or (
+        "Soulseek connected" if snapshot.get("logged_in") else "Soulseek offline"
+    )
     if snapshot.get("activity"):
         activity = str(snapshot.get("activity"))
     else:

@@ -58,6 +58,140 @@ def test_zero_wait_starts_the_next_artist_without_the_five_minute_notice(tmp_pat
         worker.close()
 
 
+def test_cooled_artists_are_not_ready_when_the_wait_is_zero(tmp_path):
+    """A zero wait must not treat a cooled artist as the next one to search.
+
+    The saved list keys artists by the casefolded name. Skipping "artist:" plus
+    that name matches nobody, so a zero wait tight-loops and the FileSearch
+    never gets a turn on the event loop.
+    """
+    from wanted import sync_wanted_catalog
+
+    class Library:
+        def wanted_missing(self, page_size=250, start_page=1, max_pages=1, on_page=None, should_cancel=None):
+            return [album(1, "Ella Langley", "Hungover", files=0, total=4)], 1, True
+
+        def tracks_for_album(self, album_id: int):
+            return [{"id": 11, "title": "Blue", "monitored": True, "hasFile": False, "trackNumber": 1}]
+
+    worker = make_worker(tmp_path)
+    try:
+        worker.control.start()
+        sync_wanted_catalog(Library(), worker.store, max_pages=2)
+        worker.cfg.cycle_seconds = 0
+        assert worker.store.wanted_catalog_ready()
+        assert worker._next_ready_artist() == "Ella Langley"
+        worker.store.set_artist_cooldown("Ella Langley", 2)
+        assert worker._next_ready_artist() is None
+        seconds, kind = worker.between_pass_wait()
+        assert kind == "artist"
+        assert seconds >= 1
+        asyncio.run(worker.cycle())
+        text, _elapsed, _busy = worker.activity_view()
+        assert text.startswith("Waiting for artist retry period")
+        assert "Starting the next artist" not in text
+    finally:
+        worker.close()
+
+
+def test_zero_wait_lets_another_task_run(tmp_path):
+    worker = make_worker(tmp_path)
+
+    async def scenario():
+        worker.control.start()
+        ran = asyncio.Event()
+
+        async def other():
+            ran.set()
+
+        asyncio.create_task(other())
+        for _ in range(20):
+            await worker.control.gate(sleep=0)
+        await asyncio.wait_for(ran.wait(), timeout=1)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        worker.close()
+
+
+def test_search_send_timeout_reports_the_session(tmp_path, monkeypatch):
+    import time
+
+    from worker import SearchNotSent
+
+    worker = make_worker(tmp_path)
+
+    class Searches:
+        async def search(self, query):
+            await asyncio.sleep(30)
+
+    class Client:
+        session = object()
+        searches = Searches()
+
+    async def scenario():
+        worker.client = Client()
+        worker._loop = asyncio.get_running_loop()
+        worker._loop_beat = time.monotonic()
+        try:
+            await worker._send_search("nsync")
+        except SearchNotSent as exc:
+            return str(exc)
+        return ""
+
+    monkeypatch.setattr("worker._SEARCH_SEND_TIMEOUT", 0.05)
+    try:
+        text = asyncio.run(scenario())
+    finally:
+        worker.client = None
+        worker.close()
+    assert "did not accept" in text
+    assert "login=yes" in text
+    assert "loop_lag=" in text
+
+
+def test_connected_requires_a_live_server(tmp_path):
+    from aioslsk.network.connection import ConnectionState
+
+    worker = make_worker(tmp_path)
+
+    class Server:
+        def __init__(self, state):
+            self.state = state
+
+    class Network:
+        def __init__(self, state):
+            self.server_connection = Server(state)
+
+        def get_listening_ports(self):
+            return (2234, 2235)
+
+    class Client:
+        def __init__(self, state):
+            self.session = object()
+            self.network = Network(state)
+            self.distributed_network = None
+
+    try:
+        worker._loop = None
+        worker.client = Client(ConnectionState.CLOSED)
+        responsive, label = worker.soulseek_link()
+        assert responsive is False
+        assert "session is down" in label
+        snapshot = worker.ui_snapshot()
+        assert snapshot["logged_in"] is False
+        assert "login=yes" in snapshot["soulseek_detail"]
+        assert "server=CLOSED" in snapshot["soulseek_detail"]
+        worker.client = Client(ConnectionState.CONNECTED)
+        responsive, label = worker.soulseek_link()
+        assert responsive is True
+        assert label == "Soulseek connected"
+    finally:
+        worker.client = None
+        worker.close()
+
+
 def test_search_wait_is_not_reported_as_idle(tmp_path):
     worker = make_worker(tmp_path)
     try:
