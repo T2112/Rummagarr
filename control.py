@@ -111,6 +111,10 @@ class WorkerControl:
                     deadline[0] += loop.time() - started
                 continue
             if remaining <= 0:
+                # A zero wait must still yield. Otherwise a pass that sends no
+                # search runs the worker in a tight loop and the server reader
+                # never gets to send a FileSearch.
+                await asyncio.sleep(0)
                 return "ok"
             step = min(0.05, remaining)
             await asyncio.sleep(step)

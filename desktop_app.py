@@ -1357,6 +1357,8 @@ class DesktopApp(tk.Tk):
         self._pulse_on = False
         self.status_line = ttk.Label(status_row, text="Stopped · Soulseek offline · Stopped", style="Muted.TLabel")
         self.status_line.pack(side="left", fill="x", expand=True)
+        self.session_line = ttk.Label(parent, text="", style="Muted.TLabel", wraplength=920, justify="left")
+        self.session_line.pack(fill="x", pady=(2, 0))
         self.notice_line = ttk.Label(parent, textvariable=self.notice_var, style="Muted.TLabel")
         self.notice_line.pack(fill="x", pady=(2, 0))
 
@@ -1611,6 +1613,8 @@ class DesktopApp(tk.Tk):
         limit = normalize_recent_limit(self.limit_var.get())
         snapshot = self.worker.ui_snapshot(recent_limit=limit)
         self.status_line.configure(text=format_status_line(snapshot))
+        if getattr(self, "session_line", None) is not None:
+            self.session_line.configure(text=str(snapshot.get("soulseek_detail") or ""))
         self._paint_activity_dot(bool(snapshot.get("busy")))
         self._refresh_open_search_states()
         state = snapshot.get("run_state") or "stopped"
@@ -2402,10 +2406,16 @@ class DesktopApp(tk.Tk):
     def _search_failed(self, board: SearchBoard, exc: Exception) -> None:
         board.running = False
         if isinstance(exc, TimeoutError):
+            try:
+                detail = self.worker.search_diagnostics()
+            except Exception:
+                detail = ""
             text = (
                 "No results (0 peer replies). The search was not sent because "
                 "Soulseek did not respond in time."
             )
+            if detail:
+                text = f"{text} {detail}"
         else:
             text = str(exc).strip() or type(exc).__name__
         board.outcome = text

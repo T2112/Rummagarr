@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [1.9.3] — 2026-10-12
+
+### Fixed
+
+- A search was never sent, and the Status tab stayed on "Starting the next artist" while still saying Soulseek was connected. Wait before next artist set to 0 returns to the worker immediately. When every artist was already on the retry cooldown, the saved list still looked ready, so that return never slept and never gave the Soulseek connection a turn. The cooldown check now uses the same artist id as the saved list. A pass that does not send a search waits 30 seconds, writes the reason, and tries again. A FileSearch that the server does not accept within 20 seconds is logged and skipped.
+- The Status line says Soulseek is connected only while the server connection is up and the worker loop has had a turn in the last few seconds. Otherwise it says the session is down or the loop is behind. The line under it, and the log at each search, report login, server state, listen port, loop lag, share scan, share file count, distributed parent, and whether a search is already being sent.
+
 ## [1.9.2] — 2026-10-12
 
 ### Fixed

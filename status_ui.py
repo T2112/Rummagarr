@@ -55,6 +55,7 @@ select{background:#1c1c1c;color:#eee;border:1px solid #444;border-radius:4px;pad
 <button class="secondary" onclick="load()">Refresh</button>
 <button onclick="cancelAll()">Cancel all</button></div></header>
 <main><div id="job" class="meta">Loading…</div>
+<div id="detail" class="meta"></div>
 <table><thead><tr><th>File</th><th>User</th><th>Status</th><th>Progress</th><th></th></tr></thead><tbody id="rows"></tbody></table>
 <div class="recent-head"><h2>Recent completed</h2>
 <label class="recent-limit meta" for="recent-limit">Show
@@ -86,7 +87,10 @@ async function load(){
   const activity = d.activity || [job.phase||'idle',[job.artist,job.title].filter(Boolean).join(' \\u2014 ')].filter(Boolean).join(' \\u00b7 ');
   const elapsed = d.elapsed_text ? (' \\u00b7 ' + d.elapsed_text) : '';
   const mark = d.busy ? '\\u25cf ' : '\\u25cb ';
-  document.getElementById('job').textContent = mark + [d.logged_in?'Soulseek connected':'Soulseek offline', activity].filter(Boolean).join(' \\u00b7 ') + elapsed;
+  const link = d.connected_label || (d.logged_in ? 'Soulseek connected' : 'Soulseek offline');
+  document.getElementById('job').textContent = mark + [link, activity].filter(Boolean).join(' \\u00b7 ') + elapsed;
+  const detail = document.getElementById('detail');
+  if (detail) detail.textContent = d.soulseek_detail || '';
   const body=document.getElementById('rows'); body.innerHTML='';
   (d.transfers||[]).forEach((t,i)=>{
     const tr=document.createElement('tr');
