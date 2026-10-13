@@ -8,6 +8,7 @@ All notable changes to this project are documented here.
 
 - The desktop app, installer, Start menu shortcut, desktop shortcut, and Add/Remove Programs entry are named Rummagarr. The setup file is `Rummagarr-Setup-<version>.exe`. The GitHub repository name is unchanged.
 - Status has a checkbox, **Auto-import to Lidarr after each artist**. It is saved in `config.toml` and starts off. When it is on, and an artist queued downloads, Rummagarr asks Lidarr once — when that download queue is empty — to run DownloadedAlbumsScan on the download folder with import mode Move, then RenameFiles for that artist when Lidarr did not already rename on import. Leaving the queue empty does not scan again. The status line says `Importing <artist> into Lidarr...`, then that the import finished or failed. The scan runs beside the worker, so the next artist is not held up. Errors are written to the log.
+- The window uses a dark sidebar (Status, Wanted, Search, Shared, Settings) with flat cards and dense tables. Settings has a Dark / Light theme. Dark is the default. The choice applies immediately and is saved in `config.toml`. The app and installer use the teal R icon.
 
 ### Changed
 

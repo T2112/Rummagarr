@@ -72,6 +72,15 @@ class Config:
     share_dirs: list[str] = field(default_factory=list)
     pause_uploads: bool = False
     auto_import_after_artist: bool = False
+    theme: str = "dark"
+
+
+def normalize_theme(value) -> str:
+    """Dark is the default. Anything else unrecognized stays dark."""
+    text = str(value or "").strip().lower()
+    if text in {"dark", "light"}:
+        return text
+    return "dark"
 
 
 def app_data_dir() -> Path:
@@ -255,6 +264,7 @@ def default_config(**overrides) -> Config:
         share_dirs=list(overrides.pop("share_dirs", [])),
         pause_uploads=bool(overrides.pop("pause_uploads", False)),
         auto_import_after_artist=bool(overrides.pop("auto_import_after_artist", False)),
+        theme=normalize_theme(overrides.pop("theme", "dark")),
     )
     if overrides:
         cfg = replace(cfg, **overrides)
@@ -352,6 +362,9 @@ def save_config(path: Path, cfg: Config) -> None:
             f"share_dirs = [{share_dirs}]",
             f"pause_uploads = {_toml_bool(cfg.pause_uploads)}",
             "",
+            "[ui]",
+            f"theme = {_toml_str(normalize_theme(cfg.theme))}",
+            "",
         ]
     )
     path.write_text(text, encoding="utf-8")
@@ -389,6 +402,7 @@ def try_load_config(path: Path) -> Config:
         raise ConfigError(f"config.toml is missing a required section or value: {exc}") from exc
     runtime = raw.get("runtime", {})
     sharing = raw.get("sharing", {})
+    ui = raw.get("ui", {})
 
     base = path.parent
     download_dir = Path(paths["download_dir"])
@@ -464,4 +478,5 @@ def try_load_config(path: Path) -> Config:
         share_dirs=[str(item) for item in sharing.get("share_dirs", []) if str(item).strip()],
         pause_uploads=bool(sharing.get("pause_uploads", False)),
         auto_import_after_artist=bool(lidarr.get("auto_import_after_artist", False)),
+        theme=normalize_theme(ui.get("theme", "dark")),
     )

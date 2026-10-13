@@ -72,3 +72,7 @@ status_port = 8787
 start_on_launch = false
 # Installed app: look for a newer GitHub Release when the window opens.
 check_updates = true
+
+[ui]
+# Dark matches the sidebar. Light is the same layout with a light palette.
+theme = "dark"

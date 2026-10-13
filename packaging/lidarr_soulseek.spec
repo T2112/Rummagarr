@@ -17,6 +17,7 @@ datas = [
     (str(root / "config.example.toml"), "."),
     (str(root / "VERSION"), "."),
     (str(root / "LICENSE.txt"), "."),
+    (str(root / "packaging" / "rummagarr.png"), "packaging"),
 ]
 datas += collect_data_files("certifi")
 
@@ -45,6 +46,7 @@ exe = EXE(
     upx=False,
     console=False,
     disable_windowed_traceback=False,
+    icon=str(root / "packaging" / "rummagarr.ico"),
 )
 coll = COLLECT(
     exe,

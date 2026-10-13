@@ -1,8 +1,8 @@
 """Open the desktop window with sample library data and save screenshots.
 
-Run under a virtual display:
+Run under a virtual display large enough for device scale 2 (2560x1600):
 
-    xvfb-run -a -s "-screen 0 1280x800x24" python scripts/screenshot_gui.py
+    xvfb-run -a -s "-screen 0 2560x1600x24" python scripts/screenshot_gui.py /opt/cursor/artifacts
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from desktop_app import DesktopApp, SettingsForm, apply_theme  # noqa: E402
+from desktop_app import DesktopApp  # noqa: E402
 from tests.conftest import album, hole, make_worker  # noqa: E402
 from wanted import build_catalog, items_to_rows  # noqa: E402
 
@@ -29,18 +29,49 @@ class Transfer:
         self.state = type("State", (), {"name": state})()
 
 
-def grab(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    display = os.environ.get("DISPLAY", "")
+def grab(widget, path: Path) -> None:
+    """Lossless PNG of the window. No resize."""
     import subprocess
 
+    path.parent.mkdir(parents=True, exist_ok=True)
+    widget.update_idletasks()
+    widget.update()
+    width = int(widget.winfo_width())
+    height = int(widget.winfo_height())
+    origin_x = int(widget.winfo_rootx())
+    origin_y = int(widget.winfo_rooty())
+    display = os.environ.get("DISPLAY", ":0")
     subprocess.check_call(
-        ["import", "-window", "root", "-display", display, str(path)],
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "x11grab",
+            "-video_size",
+            f"{width}x{height}",
+            "-i",
+            f"{display}+{origin_x},{origin_y}",
+            "-frames:v",
+            "1",
+            str(path),
+        ]
     )
+
+
+def _shoot(app, path: Path) -> None:
+    app.update_idletasks()
+    app.update()
+    app.lift()
+    time.sleep(0.3)
+    grab(app, path)
+    print(path, app.winfo_width(), app.winfo_height(), flush=True)
 
 
 def main() -> None:
     stay = "--stay" in sys.argv
+    os.environ.setdefault("RUMMAGARR_UI_SCALE", "2")
     out = Path(next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "/tmp/lidarr-soulseek-shots"))
     data = Path("/tmp/lidarr-soulseek-shot-data")
     data.mkdir(parents=True, exist_ok=True)
@@ -82,45 +113,36 @@ def main() -> None:
         honor_start_on_launch=False,
         poll_ms=60_000,
     )
+    app.geometry(f"{app.px(1280)}x{app.px(800)}+0+0")
     app.limit_var.set("25")
     app.on_limit()
     app.notebook.select(app.status_tab)
     app.update_idletasks()
     app.update()
     app.lift()
-    app.attributes("-topmost", True)
-    app.after(800, lambda: app.attributes("-topmost", False))
     if stay:
         print("Rummagarr demo window is open", flush=True)
         app.mainloop()
         worker.close()
         return
-    time.sleep(0.4)
-    grab(out / "status_tab.png")
 
+    _shoot(app, out / "app-dark-status.png")
     app.notebook.select(app.wanted_tab)
-    app.update_idletasks()
+    _shoot(app, out / "app-dark-wanted.png")
+    app.notebook.select(app.settings_tab)
+    _shoot(app, out / "app-dark-settings.png")
+
+    form = app._settings_form
+    form.theme_var.set("light")
+    form._on_theme_choice()
     app.update()
-    time.sleep(0.4)
-    grab(out / "wanted_tab.png")
+    _shoot(app, out / "app-light-settings.png")
+    app.notebook.select(app.status_tab)
+    _shoot(app, out / "app-light-status.png")
+    app.notebook.select(app.wanted_tab)
+    _shoot(app, out / "app-light-wanted.png")
 
     app.destroy()
-
-    import tkinter as tk
-
-    setup = tk.Tk()
-    setup.title("Rummagarr setup")
-    setup.geometry("740x700")
-    apply_theme(setup)
-    form = SettingsForm(setup, Path("/tmp/unused-config.toml"), None, lambda _cfg: None, setup.destroy)
-    form.url_var.set("http://127.0.0.1:8686")
-    form.user_var.set("your-soulseek-user")
-    form.pack(fill="both", expand=True)
-    setup.update_idletasks()
-    setup.update()
-    time.sleep(0.3)
-    grab(out / "setup.png")
-    setup.destroy()
     worker.close()
     print(out)
 

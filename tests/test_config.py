@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from config_loader import ConfigError, _retarget_paths, default_config, migrate_app_data, save_config, try_load_config
+from config_loader import (
+    ConfigError,
+    _retarget_paths,
+    default_config,
+    migrate_app_data,
+    normalize_theme,
+    save_config,
+    try_load_config,
+)
 
 
 def test_round_trip_keeps_secrets_and_windows_paths(tmp_path: Path):
@@ -92,6 +100,26 @@ def test_auto_import_defaults_off_and_round_trips(tmp_path: Path):
         auto_import_after_artist=True,
     ))
     assert try_load_config(path).auto_import_after_artist is True
+
+
+def test_theme_defaults_to_dark_and_round_trips(tmp_path: Path):
+    assert normalize_theme("nope") == "dark"
+    assert default_config().theme == "dark"
+    cfg = default_config(
+        lidarr_api_key="abc123",
+        slsk_username="souluser",
+        slsk_password="soulpass",
+        download_dir=tmp_path / "in",
+        complete_dir=tmp_path / "out",
+        theme="light",
+    )
+    path = tmp_path / "config.toml"
+    save_config(path, cfg)
+    text = path.read_text(encoding="utf-8")
+    assert 'theme = "light"' in text
+    assert try_load_config(path).theme == "light"
+    path.write_text(text.replace("[ui]\ntheme = \"light\"\n", ""), encoding="utf-8")
+    assert try_load_config(path).theme == "dark"
 
 
 def test_migrate_app_data_copies_the_old_folder_once(tmp_path: Path):
