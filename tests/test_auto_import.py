@@ -21,13 +21,13 @@ def test_downloaded_albums_scan_moves_the_folder():
 
     client._post = post
     try:
-        client.scan_downloaded(r"D:\Music\Seekarr")
+        client.scan_downloaded(r"D:\Media\Incoming\Soulseek")
     finally:
         client.close()
     assert seen["path"] == "/command"
     assert seen["payload"] == {
         "name": "DownloadedAlbumsScan",
-        "path": r"D:\Music\Seekarr",
+        "path": r"D:\Media\Incoming\Soulseek",
         "importMode": "Move",
     }
 

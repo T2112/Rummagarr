@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from config_loader import ConfigError, _retarget_paths, default_config, migrate_app_data, save_config, try_load_config
+from config_loader import ConfigError, default_config, save_config, try_load_config
 
 
 def test_round_trip_keeps_secrets_and_windows_paths(tmp_path: Path):
@@ -92,46 +92,6 @@ def test_auto_import_defaults_off_and_round_trips(tmp_path: Path):
         auto_import_after_artist=True,
     ))
     assert try_load_config(path).auto_import_after_artist is True
-
-
-def test_migrate_app_data_copies_the_old_folder_once(tmp_path: Path):
-    source = tmp_path / "Lidarr Soulseek"
-    dest = tmp_path / "Seekarr"
-    source.mkdir()
-    (source / "state.sqlite3").write_bytes(b"db-bytes")
-    (source / "lidarr-soulseek.log").write_text("old log", encoding="utf-8")
-    db = str(source / "state.sqlite3")
-    (source / "config.toml").write_text(
-        "\n".join(
-            [
-                f'state_db = "{db}"',
-                f'log_file = "{source / "lidarr-soulseek.log"}"',
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    migrate_app_data(dest, source)
-    assert (dest / "state.sqlite3").read_bytes() == b"db-bytes"
-    assert (dest / "lidarr-soulseek.log").read_text(encoding="utf-8") == "old log"
-    copied = (dest / "config.toml").read_text(encoding="utf-8")
-    assert str(dest) in copied
-    assert str(source) not in copied
-    assert (source / "config.toml").exists()
-    (dest / "config.toml").write_text("kept", encoding="utf-8")
-    (source / "extra.txt").write_text("later", encoding="utf-8")
-    migrate_app_data(dest, source)
-    assert (dest / "config.toml").read_text(encoding="utf-8") == "kept"
-    assert not (dest / "extra.txt").exists()
-    windows_old = Path("C:/Users/a/AppData/Local/Lidarr Soulseek")
-    windows_new = Path("C:/Users/a/AppData/Local/Seekarr")
-    raw = 'state_db = "C:\\\\Users\\\\a\\\\AppData\\\\Local\\\\Lidarr Soulseek\\\\state.sqlite3"\n'
-    # POSIX keeps the backslashes in these Path strings, which is how a copied
-    # Windows config names the old folder.
-    if "\\" in str(windows_old):
-        rewritten = _retarget_paths(raw, windows_old, windows_new)
-        assert "Lidarr Soulseek" not in rewritten
-        assert "Seekarr" in rewritten
 
 
 def test_check_updates_defaults_on_when_the_key_is_missing(tmp_path: Path):

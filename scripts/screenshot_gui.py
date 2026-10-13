@@ -91,7 +91,7 @@ def main() -> None:
     app.attributes("-topmost", True)
     app.after(800, lambda: app.attributes("-topmost", False))
     if stay:
-        print("Seekarr demo window is open", flush=True)
+        print("Lidarr Soulseek demo window is open", flush=True)
         app.mainloop()
         worker.close()
         return
@@ -109,7 +109,7 @@ def main() -> None:
     import tkinter as tk
 
     setup = tk.Tk()
-    setup.title("Seekarr setup")
+    setup.title("Lidarr Soulseek setup")
     setup.geometry("740x700")
     apply_theme(setup)
     form = SettingsForm(setup, Path("/tmp/unused-config.toml"), None, lambda _cfg: None, setup.destroy)

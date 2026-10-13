@@ -78,7 +78,7 @@ def test_auto_import_checkbox_persists(desktop):
 
 
 def test_window_shows_version_and_update_actions(desktop):
-    assert desktop.title().startswith("Seekarr")
+    assert desktop.title().startswith("Lidarr Soulseek")
     assert app_version() in desktop.title()
     assert desktop.auto_import.cget("text") == "Auto-import to Lidarr after each artist"
     assert not desktop.auto_import_var.get()
