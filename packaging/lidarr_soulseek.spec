@@ -17,6 +17,7 @@ datas = [
     (str(root / "config.example.toml"), "."),
     (str(root / "VERSION"), "."),
     (str(root / "LICENSE.txt"), "."),
+    (str(root / "packaging" / "rummagarr.png"), "packaging"),
 ]
 datas += collect_data_files("certifi")
 
@@ -38,13 +39,14 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="LidarrSoulseek",
+    name="Rummagarr",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
     console=False,
     disable_windowed_traceback=False,
+    icon=str(root / "packaging" / "rummagarr.ico"),
 )
 coll = COLLECT(
     exe,
@@ -53,5 +55,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="LidarrSoulseek",
+    name="Rummagarr",
 )

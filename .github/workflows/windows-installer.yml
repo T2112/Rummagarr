@@ -34,8 +34,10 @@ jobs:
       - name: Upload the installer
         uses: actions/upload-artifact@v4
         with:
-          name: LidarrSoulseek-Setup
-          path: dist/LidarrSoulseek-Setup-*.exe
+          name: Rummagarr-Setup
+          path: |
+            dist/Rummagarr-Setup-*.exe
+            dist/LidarrSoulseek-Setup-*.exe
           if-no-files-found: error
 
   # contents: write is only on this job. Pull requests and ordinary pushes
@@ -53,7 +55,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: LidarrSoulseek-Setup
+          name: Rummagarr-Setup
           path: dist
       - name: Publish GitHub Release
         env:
@@ -71,31 +73,40 @@ jobs:
             echo "Tag ${{ github.ref_name }} does not match VERSION file (${tag})." >&2
             exit 1
           fi
-          asset="dist/LidarrSoulseek-Setup-${version}.exe"
-          checksum="dist/LidarrSoulseek-Setup-${version}.exe.sha256"
+          asset="dist/Rummagarr-Setup-${version}.exe"
+          legacy="dist/LidarrSoulseek-Setup-${version}.exe"
           if [ ! -f "$asset" ]; then
             echo "Installer not found: $asset" >&2
             ls -la dist >&2 || true
             exit 1
           fi
+          if [ ! -f "$legacy" ]; then
+            cp "$asset" "$legacy"
+          fi
           (
             cd dist
-            sha256sum "LidarrSoulseek-Setup-${version}.exe"
-          ) > "$checksum"
+            sha256sum "Rummagarr-Setup-${version}.exe" > "Rummagarr-Setup-${version}.exe.sha256"
+            sha256sum "LidarrSoulseek-Setup-${version}.exe" > "LidarrSoulseek-Setup-${version}.exe.sha256"
+          )
           notes=$(printf '%s\n' \
-            "Windows installer for Lidarr Soulseek ${version}." \
+            "Windows installer for Rummagarr ${version}." \
             "" \
-            "Download LidarrSoulseek-Setup-${version}.exe and run it. The first window asks for the Lidarr URL, API key, and Soulseek login." \
+            "Download Rummagarr-Setup-${version}.exe and run it. The first window asks for the Lidarr URL, API key, and Soulseek login." \
             "" \
-            "Installed copies of 1.4.0 and later can install this from Help → Check for updates. The .sha256 file is the installer checksum." \
+            "The same installer is also attached as LidarrSoulseek-Setup-${version}.exe so an installed copy of 1.9.4 can update from Help → Check for updates. Both .sha256 files are the installer checksum." \
             "" \
             "ffmpeg is separate if you want FLAC converted to MP3: winget install Gyan.FFmpeg.")
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "$asset" "$checksum" --clobber
+            gh release upload "$tag" \
+              "$asset" "${asset}.sha256" \
+              "$legacy" "${legacy}.sha256" \
+              --clobber
           else
-            gh release create "$tag" "$asset" "$checksum" \
-              --title "Lidarr Soulseek ${version}" \
+            gh release create "$tag" \
+              "$asset" "${asset}.sha256" \
+              "$legacy" "${legacy}.sha256" \
+              --title "Rummagarr ${version}" \
               --notes "$notes" \
               --target "${{ github.sha }}"
           fi
-          echo "Published ${asset} and ${checksum} on ${tag}"
+          echo "Published Rummagarr-Setup and LidarrSoulseek-Setup on ${tag}"

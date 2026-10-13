@@ -35,7 +35,7 @@ def _recent_options() -> str:
 
 
 _PAGE_TEMPLATE = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><title>Lidarr Soulseek</title>
+<html lang="en"><head><meta charset="utf-8"><title>Rummagarr</title>
 <style>
 :root{color-scheme:dark}body{font-family:Segoe UI,system-ui,sans-serif;margin:0;background:#111;color:#eee}
 header{padding:16px 20px;background:#1c1c1c;border-bottom:1px solid #333;display:flex;justify-content:space-between}
@@ -51,7 +51,7 @@ h2{font-size:15px;margin:28px 0 8px}
 label.recent-limit{display:flex;align-items:center;gap:8px}
 select{background:#1c1c1c;color:#eee;border:1px solid #444;border-radius:4px;padding:4px 8px;font-size:13px}
 </style></head><body>
-<header><h1>Lidarr Soulseek</h1><div>
+<header><h1>Rummagarr</h1><div>
 <button class="secondary" onclick="load()">Refresh</button>
 <button onclick="cancelAll()">Cancel all</button></div></header>
 <main><div id="job" class="meta">Loading…</div>

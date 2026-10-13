@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import logging
 import os
+import shutil
 import sys
 import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+
+log = logging.getLogger("lidarr_slsk")
+
+APP_NAME = "Rummagarr"
+LEGACY_WINDOWS_DIR = "Lidarr Soulseek"
+LEGACY_HOME_DIR = ".lidarr-soulseek"
 
 
 class ConfigError(Exception):
@@ -63,16 +71,106 @@ class Config:
     priority_users: set[str] = field(default_factory=set)
     share_dirs: list[str] = field(default_factory=list)
     pause_uploads: bool = False
+    auto_import_after_artist: bool = False
+    theme: str = "dark"
+
+
+def normalize_theme(value) -> str:
+    """Dark is the default. Anything else unrecognized stays dark."""
+    text = str(value or "").strip().lower()
+    if text in {"dark", "light"}:
+        return text
+    return "dark"
 
 
 def app_data_dir() -> Path:
+    """Settings, the database, and the log. An explicit home override is kept as-is."""
     if os.name == "nt":
         root = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-        return Path(root) / "Lidarr Soulseek"
+        return Path(root) / APP_NAME
     override = os.environ.get("LIDARR_SLSK_HOME")
     if override:
         return Path(override)
-    return Path.home() / ".lidarr-soulseek"
+    return Path.home() / ".rummagarr"
+
+
+def legacy_data_dir() -> Path | None:
+    """Previous data folder. None when the user already pointed at a folder."""
+    if os.environ.get("LIDARR_SLSK_HOME"):
+        return None
+    if os.name == "nt":
+        root = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(root) / LEGACY_WINDOWS_DIR
+    return Path.home() / LEGACY_HOME_DIR
+
+
+def _retarget_paths(text: str, source: Path, dest: Path) -> str:
+    """Point copied settings at the new folder when they named the old one."""
+    source_text = str(source)
+    dest_text = str(dest)
+    pairs = [
+        (source_text.replace("\\", "\\\\"), dest_text.replace("\\", "\\\\")),
+        (source_text.replace("/", "\\"), dest_text.replace("/", "\\")),
+        (source_text.replace("\\", "/"), dest_text.replace("\\", "/")),
+        (source_text, dest_text),
+    ]
+    pairs.sort(key=lambda item: len(item[0]), reverse=True)
+    seen: set[str] = set()
+    for old, new in pairs:
+        if not old or old == new or old in seen:
+            continue
+        seen.add(old)
+        text = text.replace(old, new)
+    return text
+
+
+def migrate_app_data(dest: Path | None = None, source: Path | None = None) -> Path:
+    """Copy settings and data from the old folder when this one has none yet.
+
+    The old folder is left in place so an older install can still read it.
+    Paths inside config.toml that pointed at the old folder are rewritten.
+    """
+    dest = dest or app_data_dir()
+    if source is None:
+        source = legacy_data_dir()
+    if source is None:
+        return dest
+    try:
+        if source.resolve() == dest.resolve():
+            return dest
+    except OSError:
+        return dest
+    if not source.is_dir():
+        return dest
+    if (dest / "config.toml").exists():
+        return dest
+    try:
+        names = list(source.iterdir())
+    except OSError:
+        log.exception("Could not read the previous data folder %s", source)
+        return dest
+    if not names:
+        return dest
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        for item in names:
+            target = dest / item.name
+            if target.exists():
+                continue
+            if item.is_dir():
+                shutil.copytree(item, target)
+            else:
+                shutil.copy2(item, target)
+        config = dest / "config.toml"
+        if config.exists():
+            text = config.read_text(encoding="utf-8")
+            rewritten = _retarget_paths(text, source, dest)
+            if rewritten != text:
+                config.write_text(rewritten, encoding="utf-8")
+        log.info("Copied settings and data from %s to %s", source, dest)
+    except OSError:
+        log.exception("Could not copy settings from %s to %s", source, dest)
+    return dest
 
 
 def bundled_root() -> Path:
@@ -98,6 +196,7 @@ def desktop_config_path() -> Path:
     if override:
         return Path(override)
     if getattr(sys, "frozen", False):
+        migrate_app_data()
         path = app_data_dir() / "config.toml"
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
@@ -105,7 +204,7 @@ def desktop_config_path() -> Path:
 
 
 def default_media_dirs() -> tuple[Path, Path]:
-    root = Path.home() / "Music" / "Lidarr Soulseek"
+    root = Path.home() / "Music" / APP_NAME
     return root / "Incomplete", root / "Complete"
 
 
@@ -164,6 +263,8 @@ def default_config(**overrides) -> Config:
         priority_users=set(overrides.pop("priority_users", set())),
         share_dirs=list(overrides.pop("share_dirs", [])),
         pause_uploads=bool(overrides.pop("pause_uploads", False)),
+        auto_import_after_artist=bool(overrides.pop("auto_import_after_artist", False)),
+        theme=normalize_theme(overrides.pop("theme", "dark")),
     )
     if overrides:
         cfg = replace(cfg, **overrides)
@@ -195,13 +296,14 @@ def save_config(path: Path, cfg: Config) -> None:
     share_dirs = ", ".join(_toml_str(item) for item in cfg.share_dirs)
     text = "\n".join(
         [
-            "# Written by Lidarr Soulseek. You can keep editing this file,",
+            "# Written by Rummagarr. You can keep editing this file,",
             "# or change the same settings from the app.",
             "",
             "[lidarr]",
             f"url = {_toml_str(cfg.lidarr_url)}",
             f"api_key = {_toml_str(cfg.lidarr_api_key)}",
             f"scan_path = {_toml_str(cfg.lidarr_scan_path)}",
+            f"auto_import_after_artist = {_toml_bool(cfg.auto_import_after_artist)}",
             "",
             "[soulseek]",
             f"username = {_toml_str(cfg.slsk_username)}",
@@ -260,6 +362,9 @@ def save_config(path: Path, cfg: Config) -> None:
             f"share_dirs = [{share_dirs}]",
             f"pause_uploads = {_toml_bool(cfg.pause_uploads)}",
             "",
+            "[ui]",
+            f"theme = {_toml_str(normalize_theme(cfg.theme))}",
+            "",
         ]
     )
     path.write_text(text, encoding="utf-8")
@@ -297,6 +402,7 @@ def try_load_config(path: Path) -> Config:
         raise ConfigError(f"config.toml is missing a required section or value: {exc}") from exc
     runtime = raw.get("runtime", {})
     sharing = raw.get("sharing", {})
+    ui = raw.get("ui", {})
 
     base = path.parent
     download_dir = Path(paths["download_dir"])
@@ -371,4 +477,6 @@ def try_load_config(path: Path) -> Config:
         priority_users={u.lower() for u in sharing.get("priority_users", []) if u},
         share_dirs=[str(item) for item in sharing.get("share_dirs", []) if str(item).strip()],
         pause_uploads=bool(sharing.get("pause_uploads", False)),
+        auto_import_after_artist=bool(lidarr.get("auto_import_after_artist", False)),
+        theme=normalize_theme(ui.get("theme", "dark")),
     )

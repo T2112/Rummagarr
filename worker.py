@@ -669,6 +669,15 @@ class Worker:
         self._recorded_uploads: set[tuple[str, str, str]] = set()
         self._auto_paused: set[str] = set()
         self._config_dirty = False
+        self._import_lock = threading.Lock()
+        self._import_artists: list[str] = []
+        self._import_armed = False
+        self._import_thread: threading.Thread | None = None
+        self._import_notice = ""
+        self._import_hold = False
+        self._import_epoch = 0
+        self._import_notice_epoch = 0
+        self._visit_had_download = False
 
     def close(self) -> None:
         if self._ui:
@@ -678,6 +687,104 @@ class Worker:
                 pass
         self.lidarr.close()
         self.store.close()
+
+    def _queue_busy(self) -> bool:
+        return bool(self.active_transfers or self.manual_transfers)
+
+    def arm_auto_import(self, artist: str) -> None:
+        """Remember an artist whose visit finished. One import runs when the queue is empty."""
+        name = (artist or "").strip()
+        if not name or not self.cfg.auto_import_after_artist:
+            return
+        with self._import_lock:
+            if name.casefold() not in {item.casefold() for item in self._import_artists}:
+                self._import_artists.append(name)
+            self._import_armed = True
+        self.maybe_auto_import()
+
+    def maybe_auto_import(self) -> None:
+        """Start one Lidarr import per time the queue is empty after an artist finishes.
+
+        A later call while the queue stays empty does nothing. The scan runs on
+        a side thread so the worker can search the next artist.
+        """
+        if not self.cfg.auto_import_after_artist:
+            return
+        if self._queue_busy():
+            return
+        with self._import_lock:
+            if not self._import_armed or not self._import_artists:
+                return
+            if self._import_thread is not None and self._import_thread.is_alive():
+                return
+            artists = list(self._import_artists)
+            self._import_artists.clear()
+            self._import_armed = False
+            thread = threading.Thread(
+                target=self._run_auto_import,
+                args=(artists,),
+                name="lidarr-import",
+                daemon=True,
+            )
+            self._import_thread = thread
+            thread.start()
+
+    def _publish_import(self, text: str, *, hold: bool) -> None:
+        self._import_notice = text
+        self._import_hold = hold
+        self._import_notice_epoch = self._import_epoch
+
+    def _import_folder(self) -> str:
+        folder = (self.cfg.lidarr_scan_path or "").strip()
+        if folder:
+            return folder
+        return str(self.cfg.complete_dir)
+
+    def _import_already_renamed(self, result) -> bool:
+        if isinstance(result, dict):
+            body = result.get("body") if isinstance(result.get("body"), dict) else {}
+            if result.get("renamed") or body.get("renamed"):
+                return True
+        checker = getattr(self.lidarr, "renames_on_import", None)
+        if not callable(checker):
+            return False
+        try:
+            flag = checker()
+        except Exception:
+            log.exception("Could not tell whether Lidarr already renamed on import")
+            return False
+        return bool(flag)
+
+    def _import_one_artist(self, artist: str, folder: str) -> None:
+        self._publish_import(f"Importing {artist} into Lidarr...", hold=True)
+        try:
+            result = self.lidarr.scan_downloaded(folder)
+            if not self._import_already_renamed(result):
+                artist_id = self.lidarr.artist_id_by_name(artist)
+                if not artist_id:
+                    raise RuntimeError(f"Lidarr has no artist named {artist}")
+                self.lidarr.rename_artist_files(int(artist_id))
+                log.info("Asked Lidarr to rename files for %s", artist)
+            else:
+                log.info("Lidarr already renames %s on import", artist)
+            log.info("Imported %s into Lidarr from %s", artist, folder)
+            self._publish_import(f"Imported {artist} into Lidarr", hold=False)
+        except Exception:
+            log.exception("Importing %s into Lidarr failed", artist)
+            self._publish_import(f"Importing {artist} into Lidarr failed", hold=False)
+
+    def _run_auto_import(self, artists: list[str]) -> None:
+        folder = self._import_folder()
+        try:
+            for artist in artists:
+                if not self.cfg.auto_import_after_artist:
+                    break
+                self._import_one_artist(artist, folder)
+        finally:
+            with self._import_lock:
+                if self._import_thread is threading.current_thread():
+                    self._import_thread = None
+            self.maybe_auto_import()
 
     def ask_lidarr_rename(self, album: dict) -> None:
         artist = album.get("artist") or {}
@@ -738,6 +845,9 @@ class Worker:
         self.step = step_from_legacy(phase, artist, title)
 
     def set_step(self, step: Step) -> None:
+        self._import_epoch += 1
+        if self._import_notice and not self._import_hold and self._import_epoch > self._import_notice_epoch:
+            self._import_notice = ""
         previous = self.step
         same = (
             previous.kind == step.kind
@@ -757,6 +867,8 @@ class Worker:
         self.job_info = {"phase": step.kind, "artist": step.artist, "title": title}
 
     def activity_view(self) -> tuple[str, int, bool]:
+        if self._import_notice:
+            return self._import_notice, 0, self._import_hold
         step = self.step
         elapsed = int(max(0.0, time.monotonic() - step.started)) if step.started else 0
         if self.control.is_stopped():
@@ -1704,6 +1816,9 @@ class Worker:
                 self.store.set_focus_artist(None)
         self.sweep_incomplete_folder()
         self._note_between_passes()
+        if self._visit_had_download:
+            self.arm_auto_import(focus)
+        self._visit_had_download = False
 
     async def cycle_tracks(self, holes: list[dict] | None = None) -> None:
         if holes is None:
@@ -1877,6 +1992,7 @@ class Worker:
             return False
         transfer = await self.client.transfers.download(best_user, best_item.filename)
         self.active_transfers = [transfer]
+        self._visit_had_download = True
         deadline = [asyncio.get_running_loop().time() + min(self.cfg.download_timeout_minutes, 30) * 60]
         while asyncio.get_running_loop().time() < deadline[0]:
             name = state_name(transfer)
@@ -1906,6 +2022,7 @@ class Worker:
 
         self.remember_completed([transfer], artist, title, "track")
         self.active_transfers = []
+        self.maybe_auto_import()
         if self.cancel_requested or state_name(transfer) != "COMPLETE":
             detail = "cancelled" if self.cancel_requested else (state_name(transfer) or "timeout")
             self.store.upsert_track(track_id, album_id, artist, title, "failed", detail)
@@ -2069,6 +2186,8 @@ class Worker:
             if self.cancel_requested:
                 break
         self.active_transfers = transfers
+        if transfers:
+            self._visit_had_download = True
         dest = album_dest_folder(self.cfg, artist, title, year)
         staged: set[int] = set()
         sources: list[Path] = []
@@ -2126,6 +2245,7 @@ class Worker:
         await stage_finished()
         self.remember_completed(transfers, artist, title, "album")
         self.active_transfers = []
+        self.maybe_auto_import()
         complete_transfers = [t for t in transfers if state_name(t) == "COMPLETE"]
         needed = max(1, len(best.files) - self.cfg.track_count_tolerance)
         if self.cancel_requested or len(complete_transfers) < needed:
@@ -2733,6 +2853,7 @@ class Worker:
                     log.exception("Lidarr scan failed for manual download %s", dest)
         finished = {id(item) for item in transfers}
         self.manual_transfers = [item for item in self.manual_transfers if id(item) not in finished or state_name(item) not in {"COMPLETE", "FAILED", "ABORTED"}]
+        self.maybe_auto_import()
         for file_id, transfer, _link in paired:
             self._set_manual_state(file_id, "downloaded" if state_name(transfer) == "COMPLETE" else "failed")
         if announce and self.step.kind in {"queued", "downloading", "converting"} and not self.control.is_stopped():

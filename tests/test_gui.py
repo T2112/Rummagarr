@@ -11,9 +11,11 @@ import pytest
 from dataclasses import replace
 
 from activity import Step
-from config_loader import app_version, default_config
+from config_loader import app_version, default_config, try_load_config
 from desktop_app import (
     DesktopApp,
+    LIGHT_MODE_HINT,
+    PageHost,
     SettingsForm,
     format_status_line,
     settings_apply_message,
@@ -67,8 +69,21 @@ def _row(app, **match):
     raise AssertionError(f"no wanted row matching {match}")
 
 
+def test_auto_import_checkbox_persists(desktop):
+    desktop.auto_import_var.set(1)
+    desktop.on_auto_import()
+    assert desktop.worker.cfg.auto_import_after_artist is True
+    assert try_load_config(desktop.config_path).auto_import_after_artist is True
+    desktop.auto_import_var.set(0)
+    desktop.on_auto_import()
+    assert try_load_config(desktop.config_path).auto_import_after_artist is False
+
+
 def test_window_shows_version_and_update_actions(desktop):
+    assert desktop.title().startswith("Rummagarr")
     assert app_version() in desktop.title()
+    assert desktop.auto_import.cget("text") == "Auto-import to Lidarr after each artist"
+    assert not desktop.auto_import_var.get()
     assert desktop.help_menu.entrycget(0, "label") == "Check for updates"
     assert desktop.help_menu.entrycget(1, "label") == "About"
     status = UpdateStatus(
@@ -102,6 +117,65 @@ def _buttons(widget):
             found.append(child)
         found.extend(_buttons(child))
     return found
+
+
+def test_sidebar_replaces_the_tab_strip(desktop):
+    assert isinstance(desktop.notebook, PageHost)
+    labels = [item._label.cget("text") for item in desktop._nav_items.values()]
+    assert labels == ["Status", "Wanted", "Search", "Shared", "Settings"]
+    assert desktop.notebook.select() == str(desktop.status_tab)
+    assert desktop.status_tab.winfo_ismapped()
+    desktop.notebook.select(desktop.wanted_tab)
+    desktop.update_idletasks()
+    assert desktop.notebook.select() == str(desktop.wanted_tab)
+    assert desktop.wanted_tab.winfo_ismapped()
+    assert not desktop.status_tab.winfo_ismapped()
+    desktop.notebook.select(desktop.settings_tab)
+    desktop.update()
+    form = desktop._settings_form
+    assert form is not None
+    assert form.heading == "Settings"
+    assert form.theme_var.get() == "dark"
+    assert _label_named(form, LIGHT_MODE_HINT)
+
+
+def test_theme_toggle_applies_live_and_persists(desktop):
+    from tkinter import ttk
+
+    desktop.notebook.select(desktop.settings_tab)
+    desktop.update()
+    form = desktop._settings_form
+    assert form is not None
+    form.theme_var.set("light")
+    form._on_theme_choice()
+    desktop.update()
+    assert desktop._theme_name == "light"
+    assert desktop.worker.cfg.theme == "light"
+    loaded = try_load_config(desktop.config_path)
+    assert loaded.theme == "light"
+    assert ttk.Style(desktop).lookup("TFrame", "background").lower() == "#e8eef3"
+    form.theme_var.set("dark")
+    form._on_theme_choice()
+    desktop.update()
+    assert desktop._theme_name == "dark"
+    assert try_load_config(desktop.config_path).theme == "dark"
+    assert ttk.Style(desktop).lookup("PageTitle.TLabel", "background").lower() == "#171b21"
+
+
+def test_icon_file_covers_16_through_256():
+    import struct
+
+    path = Path(__file__).resolve().parents[1] / "packaging" / "rummagarr.ico"
+    data = path.read_bytes()
+    reserved, kind, count = struct.unpack_from("<HHH", data, 0)
+    assert reserved == 0 and kind == 1
+    widths = []
+    for index in range(count):
+        width = data[6 + index * 16]
+        widths.append(256 if width == 0 else width)
+    assert widths == [16, 24, 32, 48, 64, 128, 256]
+    png = Path(__file__).resolve().parents[1] / "packaging" / "rummagarr.png"
+    assert png.is_file() and png.read_bytes().startswith(b"\x89PNG")
 
 
 def test_status_tab_shows_history_choices_and_controls(desktop):

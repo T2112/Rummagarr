@@ -20,9 +20,11 @@ from config_loader import (
     Config,
     ConfigError,
     app_version,
+    bundled_root,
     default_config,
     default_media_dirs,
     desktop_config_path,
+    normalize_theme,
     save_config,
     try_load_config,
 )
@@ -119,69 +121,405 @@ def hold_single_instance() -> None:
         log.exception("Could not create the single-instance mutex")
 
 
+LIGHT_MODE_HINT = "Light mode: for beginners and people who enjoy staring into the sun."
+
+
 def ui_font() -> str:
     families = set(tkfont.families())
-    for name in ("Segoe UI", "DejaVu Sans", "Liberation Sans"):
+    for name in ("Inter", "Segoe UI", "DejaVu Sans", "Liberation Sans"):
         if name in families:
             return name
     return "TkDefaultFont"
 
 
-def apply_theme(root: tk.Misc) -> None:
+def read_ui_scale() -> float:
+    raw = os.environ.get("RUMMAGARR_UI_SCALE", "")
+    try:
+        value = float(raw) if raw else 1.0
+    except ValueError:
+        value = 1.0
+    if value <= 0:
+        return 1.0
+    return value
+
+
+def icon_png_path() -> Path:
+    name = Path("packaging") / "rummagarr.png"
+    bundled = bundled_root() / name
+    if bundled.is_file():
+        return bundled
+    return Path(__file__).resolve().parent / name
+
+
+@dataclass(frozen=True)
+class Palette:
+    bg: str
+    sidebar: str
+    sidebar_border: str
+    main: str
+    card: str
+    card_border: str
+    fg: str
+    muted: str
+    faint: str
+    heading: str
+    field: str
+    field_border: str
+    button: str
+    button_fg: str
+    button_active: str
+    primary: str
+    primary_fg: str
+    primary_active: str
+    danger_fg: str
+    danger_border: str
+    nav: str
+    nav_on_bg: str
+    nav_on_fg: str
+    accent: str
+    tree_heading: str
+    ok: str
+    bad: str
+    check_off: str
+    check_on: str
+    check_border: str
+    check_glyph: str
+    glass: str
+    dot_busy: str
+    dot_idle: str
+    menu_bg: str
+    scale: float = 1.0
+
+
+_DARK = Palette(
+    bg="#121418",
+    sidebar="#1c2128",
+    sidebar_border="#2c333c",
+    main="#171b21",
+    card="#20262e",
+    card_border="#313842",
+    fg="#e7eaee",
+    muted="#8b97a3",
+    faint="#6e7b88",
+    heading="#9aa6b1",
+    field="#171b21",
+    field_border="#3c4550",
+    button="#2a313a",
+    button_fg="#e7eaee",
+    button_active="#323b46",
+    primary="#1493a8",
+    primary_fg="#041316",
+    primary_active="#1aa8bf",
+    danger_fg="#ffb4b4",
+    danger_border="#6a3b3b",
+    nav="#c5ced6",
+    nav_on_bg="#26343a",
+    nav_on_fg="#ffffff",
+    accent="#3dccb4",
+    tree_heading="#1a2129",
+    ok="#7dcea0",
+    bad="#e07a7a",
+    check_off="#171b21",
+    check_on="#1493a8",
+    check_border="#8b97a3",
+    check_glyph="#041316",
+    glass="#3dccb4",
+    dot_busy="#3dccb4",
+    dot_idle="#3a4652",
+    menu_bg="#1c2128",
+)
+_LIGHT = Palette(
+    bg="#f3f5f7",
+    sidebar="#ffffff",
+    sidebar_border="#d7dee5",
+    main="#e8eef3",
+    card="#ffffff",
+    card_border="#d5dde4",
+    fg="#1a1f24",
+    muted="#5c6b76",
+    faint="#6e7b88",
+    heading="#4d5b66",
+    field="#ffffff",
+    field_border="#c5d0d8",
+    button="#ffffff",
+    button_fg="#1a1f24",
+    button_active="#e7eef3",
+    primary="#0e7c8a",
+    primary_fg="#ffffff",
+    primary_active="#1493a8",
+    danger_fg="#9b2c2c",
+    danger_border="#e2b4b4",
+    nav="#314049",
+    nav_on_bg="#e5f4f6",
+    nav_on_fg="#0b3a40",
+    accent="#0e7c8a",
+    tree_heading="#f4f7f9",
+    ok="#1f7a45",
+    bad="#b42323",
+    check_off="#ffffff",
+    check_on="#0e7c8a",
+    check_border="#7d8b96",
+    check_glyph="#ffffff",
+    glass="#0e7c8a",
+    dot_busy="#0e7c8a",
+    dot_idle="#b7c3cc",
+    menu_bg="#ffffff",
+)
+THEMES = {"dark": _DARK, "light": _LIGHT}
+
+
+def _widget_chain(widget: tk.Misc):
+    current: tk.Misc | None = widget
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = getattr(current, "master", None)
+
+
+def _theme_name_of(widget: tk.Misc) -> str:
+    for current in _widget_chain(widget):
+        name = getattr(current, "_theme_name", None)
+        if name:
+            return normalize_theme(name)
+    return "dark"
+
+
+def _ui_scale_of(widget: tk.Misc) -> float:
+    for current in _widget_chain(widget):
+        scale = getattr(current, "ui_scale", None)
+        if scale:
+            return float(scale)
+    return read_ui_scale()
+
+
+def active_palette(widget: tk.Misc) -> Palette:
+    return replace(THEMES[_theme_name_of(widget)], scale=_ui_scale_of(widget))
+
+
+def _sized_font(palette: Palette, size: int, *, bold: bool = False):
+    points = max(8, int(round(size * palette.scale)))
+    if bold:
+        return (ui_font(), points, "bold")
+    return (ui_font(), points)
+
+
+def _paint_role(widget: tk.Misc, role: str, palette: Palette) -> None:
+    if role == "sidebar":
+        widget.configure(bg=palette.sidebar)
+    elif role == "sidebar_border":
+        widget.configure(bg=palette.sidebar_border)
+    elif role == "main":
+        widget.configure(bg=palette.main)
+    elif role == "card":
+        widget.configure(bg=palette.card, highlightbackground=palette.card_border, highlightcolor=palette.card_border)
+    elif role == "canvas":
+        widget.configure(background=palette.card)
+    elif role == "page":
+        widget.configure(background=palette.main)
+    elif role in {"field", "list"}:
+        if isinstance(widget, (tk.Listbox,)):
+            widget.configure(
+                bg=palette.field,
+                fg=palette.fg,
+                selectbackground=palette.nav_on_bg,
+                selectforeground=palette.nav_on_fg,
+            )
+        else:
+            widget.configure(bg=palette.field, highlightbackground=palette.field_border, highlightcolor=palette.field_border)
+    elif role == "group":
+        widget.configure(bg=palette.sidebar, fg=palette.faint, font=_sized_font(palette, 8, bold=True))
+    elif role == "brand":
+        widget.configure(bg=palette.sidebar, fg=palette.fg, font=_sized_font(palette, 11, bold=True))
+    elif role == "brand_muted":
+        widget.configure(bg=palette.sidebar, fg=palette.muted, font=_sized_font(palette, 9))
+    elif role == "foot":
+        widget.configure(bg=palette.sidebar, fg=palette.faint, font=_sized_font(palette, 9))
+    elif role == "menu" and isinstance(widget, tk.Menu):
+        widget.configure(
+            bg=palette.menu_bg,
+            fg=palette.fg,
+            activebackground=palette.nav_on_bg,
+            activeforeground=palette.nav_on_fg,
+        )
+
+
+def _paint_chrome(widget: tk.Misc, palette: Palette) -> None:
+    painter = getattr(widget, "_chrome_paint", None)
+    if callable(painter):
+        try:
+            painter(palette)
+        except tk.TclError:
+            pass
+    else:
+        role = getattr(widget, "_chrome_role", None)
+        if role:
+            try:
+                _paint_role(widget, role, palette)
+            except tk.TclError:
+                pass
+    try:
+        children = list(widget.winfo_children())
+    except tk.TclError:
+        return
+    for child in children:
+        _paint_chrome(child, palette)
+
+
+def apply_theme(root: tk.Misc, name: str | None = None) -> None:
+    name = normalize_theme(name or _theme_name_of(root))
+    root._theme_name = name
+    palette = replace(THEMES[name], scale=_ui_scale_of(root))
     style = ttk.Style(root)
     try:
         style.theme_use("clam")
     except tk.TclError:
         pass
-    font = ui_font()
-    bg = "#111111"
-    panel = "#1c1c1c"
-    fg = "#eeeeee"
-    muted = "#b5b5b5"
-    root.configure(background=bg)
-    style.configure(".", background=bg, foreground=fg, font=(font, 10))
+    bg = palette.main
+    fg = palette.fg
+    pad = (max(8, int(round(12 * palette.scale))), max(4, int(round(6 * palette.scale))))
+    root.configure(background=palette.bg)
+    style.configure(".", background=bg, foreground=fg, font=_sized_font(palette, 10))
     style.configure("TFrame", background=bg)
-    style.configure("TLabel", background=bg, foreground=fg, font=(font, 10))
-    style.configure("Muted.TLabel", background=bg, foreground=muted, font=(font, 10))
-    style.configure("Title.TLabel", background=bg, foreground=fg, font=(font, 16, "bold"))
-    style.configure("TButton", background="#333333", foreground=fg, borderwidth=0, padding=(12, 6))
-    style.map("TButton", background=[("active", "#4a4a4a"), ("disabled", "#242424")], foreground=[("disabled", "#888888")])
-    style.configure("Start.TButton", background="#1f6b3a", foreground="#ffffff", padding=(12, 6))
-    style.map("Start.TButton", background=[("active", "#27864a"), ("disabled", "#1a3d28")])
-    style.configure("Stop.TButton", background="#8b1e1e", foreground="#ffffff", padding=(12, 6))
-    style.map("Stop.TButton", background=[("active", "#a52828"), ("disabled", "#3a2424")])
+    style.configure("Main.TFrame", background=bg)
+    style.configure("Card.TFrame", background=palette.card)
+    style.configure("TLabel", background=bg, foreground=fg, font=_sized_font(palette, 10))
+    style.configure("Muted.TLabel", background=bg, foreground=palette.muted, font=_sized_font(palette, 10))
+    style.configure("Title.TLabel", background=bg, foreground=fg, font=_sized_font(palette, 16, bold=True))
+    style.configure("PageTitle.TLabel", background=bg, foreground=fg, font=_sized_font(palette, 20, bold=True))
+    style.configure("Card.TLabel", background=palette.card, foreground=fg, font=_sized_font(palette, 10))
+    style.configure("CardMuted.TLabel", background=palette.card, foreground=palette.muted, font=_sized_font(palette, 10))
+    style.configure("CardTitle.TLabel", background=palette.card, foreground=palette.heading, font=_sized_font(palette, 9, bold=True))
+    style.configure("Banner.TLabel", background=palette.card, foreground=fg, font=_sized_font(palette, 11, bold=True))
+    style.configure(
+        "TButton",
+        background=palette.button,
+        foreground=palette.button_fg,
+        borderwidth=1,
+        padding=pad,
+        bordercolor=palette.field_border,
+        lightcolor=palette.field_border,
+        darkcolor=palette.field_border,
+        focusthickness=0,
+        focuscolor=palette.field_border,
+    )
+    style.map(
+        "TButton",
+        background=[("active", palette.button_active), ("disabled", palette.button)],
+        foreground=[("disabled", palette.faint)],
+    )
+    style.configure(
+        "Start.TButton",
+        background=palette.primary,
+        foreground=palette.primary_fg,
+        bordercolor=palette.primary,
+        lightcolor=palette.primary,
+        darkcolor=palette.primary,
+        padding=pad,
+    )
+    style.map(
+        "Start.TButton",
+        background=[("active", palette.primary_active), ("disabled", palette.button)],
+        foreground=[("disabled", palette.faint)],
+    )
+    style.configure(
+        "Stop.TButton",
+        background=palette.button,
+        foreground=palette.danger_fg,
+        bordercolor=palette.danger_border,
+        lightcolor=palette.danger_border,
+        darkcolor=palette.danger_border,
+        padding=pad,
+    )
+    style.map(
+        "Stop.TButton",
+        background=[("active", palette.button_active), ("disabled", palette.button)],
+        foreground=[("disabled", palette.faint)],
+    )
     style.configure("TCheckbutton", background=bg, foreground=fg)
+    style.map("TCheckbutton", background=[("active", bg), ("disabled", bg)])
     style.configure("TRadiobutton", background=bg, foreground=fg)
+    style.map("TRadiobutton", background=[("active", bg)])
+    style.layout(
+        "Segment.TRadiobutton",
+        [("Radiobutton.padding", {"sticky": "nswe", "children": [("Radiobutton.label", {"sticky": "nswe"})]})],
+    )
+    style.configure(
+        "Segment.TRadiobutton",
+        background=palette.field,
+        foreground=palette.muted,
+        padding=(max(6, int(round(10 * palette.scale))), max(3, int(round(5 * palette.scale)))),
+        font=_sized_font(palette, 9),
+        borderwidth=0,
+    )
+    style.map(
+        "Segment.TRadiobutton",
+        background=[("selected", palette.nav_on_bg), ("active", palette.nav_on_bg)],
+        foreground=[("selected", palette.nav_on_fg)],
+    )
     style.configure("TNotebook", background=bg, borderwidth=0)
-    # Clam's selected-state expand eats padding, so the active tab looked smaller.
-    # Selected padding and font are larger. Unselected tabs stay compact.
-    # expand on the selected state is zero so Windows keeps that padding.
-    style.configure("TNotebook.Tab", background="#1a1a1a", foreground=muted, padding=(10, 4), font=(font, 9))
+    # Search results and Settings still use a notebook. Equal padding and a
+    # zero expand keep the selected tab from shrinking on Windows.
+    tab_pad = (max(8, int(round(12 * palette.scale))), max(4, int(round(6 * palette.scale))))
+    style.configure(
+        "TNotebook.Tab",
+        background=palette.sidebar,
+        foreground=palette.muted,
+        padding=tab_pad,
+        font=_sized_font(palette, 10),
+        borderwidth=0,
+    )
     style.map(
         "TNotebook.Tab",
-        background=[("selected", "#243044"), ("active", "#2a2a2a")],
-        foreground=[("selected", "#ffffff"), ("!selected", muted)],
-        padding=[("selected", (22, 12, 22, 10)), ("!selected", (10, 4))],
-        font=[("selected", (font, 12, "bold")), ("!selected", (font, 9))],
-        expand=[("selected", [0, 0, 0, 0]), ("!selected", [0, 0, 0, 2])],
+        background=[("selected", palette.nav_on_bg), ("active", palette.button_active)],
+        foreground=[("selected", palette.nav_on_fg), ("!selected", palette.muted)],
+        font=[("selected", _sized_font(palette, 10, bold=True)), ("!selected", _sized_font(palette, 10))],
+        expand=[("selected", [0, 0, 0, 0]), ("!selected", [0, 0, 0, 0])],
     )
     style.configure(
         "Treeview",
-        background=panel,
-        fieldbackground=panel,
+        background=palette.card,
+        fieldbackground=palette.card,
         foreground=fg,
         borderwidth=0,
-        rowheight=28,
-        font=(font, 10),
+        rowheight=max(18, int(round(22 * palette.scale))),
+        font=_sized_font(palette, 10),
     )
-    style.configure("Treeview.Heading", background="#242424", foreground=fg, relief="flat", font=(font, 10, "bold"))
-    style.map("Treeview", background=[("selected", "#243044")], foreground=[("selected", "#ffffff")])
-    style.configure("TEntry", fieldbackground=panel, foreground=fg, insertcolor=fg)
-    style.configure("TCombobox", fieldbackground=panel, background=panel, foreground=fg)
-    root.option_add("*TCombobox*Listbox.background", panel)
+    style.configure(
+        "Treeview.Heading",
+        background=palette.tree_heading,
+        foreground=palette.heading,
+        relief="flat",
+        font=_sized_font(palette, 9, bold=True),
+    )
+    style.map("Treeview", background=[("selected", palette.nav_on_bg)], foreground=[("selected", palette.nav_on_fg)])
+    style.map("Treeview.Heading", background=[("active", palette.tree_heading)])
+    style.configure(
+        "Vertical.TScrollbar",
+        background=palette.button,
+        troughcolor=palette.main,
+        borderwidth=0,
+        arrowcolor=palette.muted,
+    )
+    style.configure("TEntry", fieldbackground=palette.field, foreground=fg, insertcolor=fg, bordercolor=palette.field_border)
+    style.configure(
+        "TCombobox",
+        fieldbackground=palette.field,
+        background=palette.button,
+        foreground=fg,
+        arrowcolor=fg,
+        bordercolor=palette.field_border,
+    )
+    root.option_add("*TCombobox*Listbox.background", palette.field)
     root.option_add("*TCombobox*Listbox.foreground", fg)
-    root.option_add("*TCombobox*Listbox.selectBackground", "#243044")
-    root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+    root.option_add("*TCombobox*Listbox.selectBackground", palette.nav_on_bg)
+    root.option_add("*TCombobox*Listbox.selectForeground", palette.nav_on_fg)
+    _paint_chrome(root, palette)
+    for menu in getattr(root, "_theme_menus", ()) or ():
+        try:
+            _paint_role(menu, "menu", palette)
+        except tk.TclError:
+            pass
 
 
 def _merge_files(existing: list[SearchFile], extra: list[SearchFile]) -> list[SearchFile]:
@@ -227,8 +565,13 @@ def format_when(iso: str | None) -> str:
     return stamp.strftime("%Y-%m-%d %H:%M")
 
 
-def scrolled_tree(parent: tk.Misc, columns: tuple[tuple[str, str, int, bool], ...]) -> tuple[ttk.Frame, ttk.Treeview]:
-    frame = ttk.Frame(parent)
+def scrolled_tree(
+    parent: tk.Misc,
+    columns: tuple[tuple[str, str, int, bool], ...],
+    *,
+    frame_style: str = "TFrame",
+) -> tuple[ttk.Frame, ttk.Treeview]:
+    frame = ttk.Frame(parent, style=frame_style)
     names = [column[0] for column in columns]
     tree = ttk.Treeview(frame, columns=names, show="headings", selectmode="browse")
     scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
@@ -237,9 +580,10 @@ def scrolled_tree(parent: tk.Misc, columns: tuple[tuple[str, str, int, bool], ..
     scroll.grid(row=0, column=1, sticky="ns")
     frame.rowconfigure(0, weight=1)
     frame.columnconfigure(0, weight=1)
+    scale = _ui_scale_of(parent)
     for name, heading, width, stretch in columns:
         tree.heading(name, text=heading)
-        tree.column(name, width=width, minwidth=40, anchor="w", stretch=stretch)
+        tree.column(name, width=max(40, int(round(width * scale))), minwidth=40, anchor="w", stretch=stretch)
     return frame, tree
 
 
@@ -328,6 +672,7 @@ _RESTART_FIELDS = frozenset(
     }
 )
 _LAUNCH_FIELDS = frozenset({"start_on_launch", "check_updates"})
+_IMMEDIATE_FIELDS = frozenset({"theme"})
 _SHARE_LIVE_FIELDS = frozenset(
     {
         "upload_slots",
@@ -438,7 +783,7 @@ def settings_apply_message(old: Config, new: Config) -> str:
         parts.append("Upload limits apply immediately.")
     if changed & _SHARE_RESCAN_FIELDS:
         parts.append("Shared folders apply after Rescan, or the next time the worker logs in.")
-    if changed - _RESTART_FIELDS - _LAUNCH_FIELDS - _SHARE_LIVE_FIELDS - _SHARE_RESCAN_FIELDS:
+    if changed - _RESTART_FIELDS - _LAUNCH_FIELDS - _SHARE_LIVE_FIELDS - _SHARE_RESCAN_FIELDS - _IMMEDIATE_FIELDS:
         parts.append("Search and download settings apply on the next pass.")
     if changed & _LAUNCH_FIELDS:
         parts.append("The update check and start-on-launch apply the next time the app opens.")
@@ -457,6 +802,8 @@ class SettingsForm(ttk.Frame):
         on_cancel,
         store=None,
         worker=None,
+        on_theme=None,
+        heading: str = "Rummagarr setup",
     ) -> None:
         super().__init__(master, padding=16)
         self.config_path = config_path
@@ -465,6 +812,8 @@ class SettingsForm(ttk.Frame):
         self.on_cancel = on_cancel
         self.store = store
         self.worker = worker
+        self.on_theme = on_theme
+        self.heading = heading
         source = cfg if cfg is not None else default_config()
         download, complete = default_media_dirs()
         self.url_var = tk.StringVar(value=(cfg.lidarr_url if cfg else "http://127.0.0.1:8686"))
@@ -491,6 +840,7 @@ class SettingsForm(ttk.Frame):
             )
         else:
             self.history_var = None
+        self.theme_var = tk.StringVar(value=normalize_theme(getattr(source, "theme", "dark")))
         self.message_var = tk.StringVar(value="")
         self._behavior_canvas: tk.Canvas | None = None
         paths = []
@@ -533,15 +883,25 @@ class SettingsForm(ttk.Frame):
         variable.set("" if value is None else str(value))
 
     def _build(self) -> None:
-        ttk.Label(self, text="Lidarr Soulseek setup", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(self, text=self.heading, style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(
             self,
             text="Connection holds the login and folders. Behavior holds search and conversion. Sharing holds what other users can download.",
             style="Muted.TLabel",
             wraplength=900,
         ).grid(row=1, column=0, sticky="w", pady=(4, 8))
+        theme = ttk.Frame(self)
+        theme.grid(row=2, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(theme, text="Theme").pack(side="left")
+        ttk.Radiobutton(
+            theme, text="Dark", value="dark", variable=self.theme_var, command=self._on_theme_choice
+        ).pack(side="left", padx=(12, 0))
+        ttk.Radiobutton(
+            theme, text="Light", value="light", variable=self.theme_var, command=self._on_theme_choice
+        ).pack(side="left", padx=(12, 0))
+        ttk.Label(theme, text=LIGHT_MODE_HINT, style="Muted.TLabel").pack(side="left", padx=(8, 0))
         self.notebook = ttk.Notebook(self)
-        self.notebook.grid(row=2, column=0, sticky="nsew")
+        self.notebook.grid(row=3, column=0, sticky="nsew")
         connection = ttk.Frame(self.notebook, padding=12)
         behavior = ttk.Frame(self.notebook, padding=(4, 8, 4, 4))
         sharing = ttk.Frame(self.notebook, padding=12)
@@ -551,9 +911,9 @@ class SettingsForm(ttk.Frame):
         self._build_connection(connection)
         self._build_behavior(behavior)
         self._build_sharing(sharing)
-        ttk.Label(self, textvariable=self.message_var, wraplength=900).grid(row=3, column=0, sticky="w", pady=(8, 4))
+        ttk.Label(self, textvariable=self.message_var, wraplength=900).grid(row=4, column=0, sticky="w", pady=(8, 4))
         buttons = ttk.Frame(self)
-        buttons.grid(row=4, column=0, sticky="w")
+        buttons.grid(row=5, column=0, sticky="w")
         ttk.Button(buttons, text="Test Lidarr", command=self.test_lidarr).pack(side="left")
         ttk.Button(buttons, text="Save", style="Start.TButton", command=self.save).pack(side="left", padx=(8, 0))
         ttk.Button(buttons, text="Restore defaults", command=self.restore_defaults).pack(side="left", padx=(8, 0))
@@ -563,9 +923,17 @@ class SettingsForm(ttk.Frame):
             text="API key: Lidarr → Settings → General → Security. Restore defaults does not clear the login or save until you click Save.",
             style="Muted.TLabel",
             wraplength=900,
-        ).grid(row=5, column=0, sticky="w", pady=(12, 0))
+        ).grid(row=6, column=0, sticky="w", pady=(12, 0))
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
+        self.rowconfigure(3, weight=1)
+
+    def _on_theme_choice(self) -> None:
+        name = normalize_theme(self.theme_var.get())
+        self.theme_var.set(name)
+        if self.on_theme is not None:
+            self.on_theme(name)
+            return
+        apply_theme(self.winfo_toplevel(), name)
 
     def _build_connection(self, parent: ttk.Frame) -> None:
         rows = (
@@ -613,7 +981,8 @@ class SettingsForm(ttk.Frame):
             style="Muted.TLabel",
             wraplength=860,
         ).pack(anchor="w", pady=(0, 6))
-        canvas = tk.Canvas(parent, highlightthickness=0, background="#111111", borderwidth=0)
+        canvas = tk.Canvas(parent, highlightthickness=0, background=active_palette(self).main, borderwidth=0)
+        canvas._chrome_role = "page"
         self._behavior_canvas = canvas
         scroll = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         inner = ttk.Frame(canvas)
@@ -699,7 +1068,19 @@ class SettingsForm(ttk.Frame):
             )
             row += 1
         ttk.Label(side, text="Shared folders").pack(anchor="w")
-        folder_box = tk.Listbox(side, height=6, background="#1c1c1c", foreground="#eeeeee", selectmode="browse")
+        palette = active_palette(self)
+        folder_box = tk.Listbox(
+            side,
+            height=6,
+            background=palette.field,
+            foreground=palette.fg,
+            selectbackground=palette.nav_on_bg,
+            selectforeground=palette.nav_on_fg,
+            selectmode="browse",
+            highlightthickness=0,
+            bd=0,
+        )
+        folder_box._chrome_role = "list"
         folder_box.pack(fill="x", pady=(4, 0))
         self._folder_list = folder_box
         folder_buttons = ttk.Frame(side)
@@ -709,7 +1090,18 @@ class SettingsForm(ttk.Frame):
         ttk.Button(folder_buttons, text="Rescan", command=self._rescan_shares).pack(side="left", padx=(8, 0))
         ttk.Label(side, textvariable=self.share_count_var, style="Muted.TLabel", wraplength=420).pack(anchor="w", pady=(4, 8))
         ttk.Label(side, text="Ignored users").pack(anchor="w")
-        ban_box = tk.Listbox(side, height=5, background="#1c1c1c", foreground="#eeeeee", selectmode="browse")
+        ban_box = tk.Listbox(
+            side,
+            height=5,
+            background=palette.field,
+            foreground=palette.fg,
+            selectbackground=palette.nav_on_bg,
+            selectforeground=palette.nav_on_fg,
+            selectmode="browse",
+            highlightthickness=0,
+            bd=0,
+        )
+        ban_box._chrome_role = "list"
         ban_box.pack(fill="x", pady=(4, 0))
         self._ban_list = ban_box
         ban_buttons = ttk.Frame(side)
@@ -987,6 +1379,7 @@ class SettingsForm(ttk.Frame):
             download_dir=Path(download),
             complete_dir=Path(complete),
             start_on_launch=bool(self.launch_var.get()),
+            theme=normalize_theme(self.theme_var.get()),
             **self._behavior_values(),
             **self._sharing_values(),
         )
@@ -1043,7 +1436,7 @@ class UpdatePrompt(tk.Toplevel):
 
     def __init__(self, master: tk.Misc, status: UpdateStatus, on_install, on_skip, on_later) -> None:
         super().__init__(master)
-        self.title("Update Lidarr Soulseek")
+        self.title("Update Rummagarr")
         self.transient(master)
         self.resizable(True, True)
         self.minsize(480, 320)
@@ -1291,6 +1684,58 @@ class WantedPreview(tk.Toplevel):
             callback(picked)
 
 
+class PageHost:
+    """Sidebar pages with the select() calls the old main notebook used."""
+
+    def __init__(self, show) -> None:
+        self._show = show
+        self._current: tk.Misc | None = None
+
+    def select(self, page: tk.Misc | None = None):
+        if page is None:
+            return "" if self._current is None else str(self._current)
+        self._current = page
+        self._show(page)
+        return ""
+
+
+class NavItem(tk.Frame):
+    def __init__(self, master: tk.Misc, text: str, command, scale: float) -> None:
+        height = max(28, int(round(34 * scale)))
+        super().__init__(master, height=height, cursor="hand2", highlightthickness=0, bd=0)
+        self.pack_propagate(False)
+        self._selected = False
+        self._bar = tk.Frame(self, width=max(3, int(round(3 * scale))), highlightthickness=0, bd=0)
+        self._bar.pack(side="left", fill="y")
+        self._bar.pack_propagate(False)
+        self._label = tk.Label(
+            self,
+            text=text,
+            anchor="w",
+            padx=max(8, int(round(10 * scale))),
+            cursor="hand2",
+            bd=0,
+            highlightthickness=0,
+        )
+        self._label.pack(side="left", fill="both", expand=True)
+        for widget in (self, self._bar, self._label):
+            widget.bind("<Button-1>", lambda _event: command())
+        self._chrome_paint = self._paint
+        self._paint(active_palette(self))
+
+    def set_selected(self, selected: bool) -> None:
+        self._selected = selected
+        self._paint(active_palette(self))
+
+    def _paint(self, palette: Palette) -> None:
+        bg = palette.nav_on_bg if self._selected else palette.sidebar
+        fg = palette.nav_on_fg if self._selected else palette.nav
+        bar = palette.accent if self._selected else bg
+        self.configure(bg=bg)
+        self._bar.configure(bg=bar)
+        self._label.configure(bg=bg, fg=fg, font=_sized_font(palette, 10))
+
+
 class DesktopApp(tk.Tk):
     def __init__(
         self,
@@ -1331,10 +1776,21 @@ class DesktopApp(tk.Tk):
         self._choices_cache: dict[str, bool] | None = None
         self._choice_job = 0
         self._transfer_index: dict[str, int] = {}
-        self.title(f"Lidarr Soulseek {app_version()}")
-        self.geometry("1100x720")
-        self.minsize(860, 560)
-        apply_theme(self)
+        self.title(f"Rummagarr {app_version()}")
+        self.ui_scale = read_ui_scale()
+        if os.environ.get("RUMMAGARR_UI_SCALE"):
+            try:
+                self.tk.call("tk", "scaling", 1.0)
+            except tk.TclError:
+                pass
+        self.geometry(f"{self.px(1280)}x{self.px(800)}")
+        self.minsize(self.px(1024), self.px(640))
+        self._glyph_size = max(16, int(round(16 * self.ui_scale)))
+        self._settings_form: SettingsForm | None = None
+        self._settings_baseline: dict[str, Config] | None = None
+        self._nav_items: dict[str, NavItem] = {}
+        self._theme_menus: list[tk.Menu] = []
+        apply_theme(self, normalize_theme(getattr(worker.cfg, "theme", "dark")))
         saved_limit = worker.store.get_meta("gui_recent_limit")
         self.limit_var = tk.StringVar(value=str(normalize_recent_limit(saved_limit or DEFAULT_RECENT_LIMIT)))
         self.view_var = tk.StringVar(value=VIEW_EVERYTHING)
@@ -1356,30 +1812,111 @@ class DesktopApp(tk.Tk):
 
     def destroy(self) -> None:
         self._shutting_down = True
+        self._drop_tk_cycles()
         try:
             super().destroy()
         except tk.TclError:
             pass
         _release_tk_objects(self)
+        # Nav callbacks and icon images can sit in a cycle. Collect them here,
+        # on the thread that created them, so a later worker collection does not
+        # touch Tcl.
+        import gc
+
+        gc.collect()
+
+    def _drop_tk_cycles(self) -> None:
+        for item in list(getattr(self, "_nav_items", {}).values()):
+            for widget in (item, getattr(item, "_label", None), getattr(item, "_bar", None)):
+                if widget is None:
+                    continue
+                try:
+                    widget.unbind("<Button-1>")
+                except tk.TclError:
+                    pass
+        for label in list(getattr(self, "_finder_labels", []) or []):
+            try:
+                label.configure(image="")
+            except tk.TclError:
+                pass
+        brand = getattr(self, "_brand_mark", None)
+        if brand is not None:
+            try:
+                brand.configure(image="")
+            except tk.TclError:
+                pass
+        self._icon_image = None
+        self._brand_image = None
+        self._finder_image = None
+        self._check_images = {}
+        self._finder_labels = []
+        self._nav_items = {}
+
+    def px(self, value: int) -> int:
+        return max(1, int(round(value * self.ui_scale)))
 
     def _build(self) -> None:
         self._build_menu()
-        header = ttk.Frame(self, padding=(16, 12, 16, 0))
-        header.pack(fill="x")
-        ttk.Label(header, text="Lidarr Soulseek", style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text=app_version(), style="Muted.TLabel").pack(side="left", padx=(10, 0), pady=(4, 0))
-        ttk.Button(header, text="Settings", command=self.open_settings).pack(side="right")
+        shell = tk.Frame(self, highlightthickness=0, bd=0)
+        shell._chrome_role = "main"
+        shell.pack(fill="both", expand=True)
+        self.sidebar = tk.Frame(shell, width=self.px(232), highlightthickness=0, bd=0)
+        self.sidebar._chrome_role = "sidebar"
+        self.sidebar.pack(side="left", fill="y")
+        self.sidebar.pack_propagate(False)
+        border = tk.Frame(shell, width=1, highlightthickness=0, bd=0)
+        border._chrome_role = "sidebar_border"
+        border.pack(side="left", fill="y")
+        self.content = tk.Frame(shell, highlightthickness=0, bd=0)
+        self.content._chrome_role = "main"
+        self.content.pack(side="left", fill="both", expand=True)
 
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill="both", expand=True, padx=12, pady=12)
-        self.status_tab = ttk.Frame(self.notebook, padding=12)
-        self.wanted_tab = ttk.Frame(self.notebook, padding=12)
-        self.search_tab = ttk.Frame(self.notebook, padding=12)
-        self.shared_tab = ttk.Frame(self.notebook, padding=12)
-        self.notebook.add(self.status_tab, text="Status")
-        self.notebook.add(self.wanted_tab, text="Wanted")
-        self.notebook.add(self.search_tab, text="Search")
-        self.notebook.add(self.shared_tab, text="Shared")
+        brand = tk.Frame(self.sidebar, highlightthickness=0, bd=0)
+        brand._chrome_role = "sidebar"
+        brand.pack(fill="x", padx=self.px(12), pady=(self.px(16), self.px(8)))
+        self._load_window_icon()
+        if getattr(self, "_brand_image", None) is not None:
+            mark = tk.Label(brand, image=self._brand_image, bd=0, highlightthickness=0)
+            mark._chrome_role = "sidebar"
+            mark.pack(side="left")
+            self._brand_mark = mark
+        names = tk.Frame(brand, highlightthickness=0, bd=0)
+        names._chrome_role = "sidebar"
+        names.pack(side="left", padx=(self.px(10), 0))
+        title = tk.Label(names, text="Rummagarr", anchor="w", bd=0, highlightthickness=0)
+        title._chrome_role = "brand"
+        title.pack(anchor="w")
+        version = tk.Label(names, text=app_version(), anchor="w", bd=0, highlightthickness=0)
+        version._chrome_role = "brand_muted"
+        version.pack(anchor="w")
+
+        self._nav_group(self.sidebar, "LIBRARY")
+        pad = self.px(12)
+        self.status_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
+        self.wanted_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
+        self.search_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
+        self.shared_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
+        self.settings_tab = ttk.Frame(self.content, style="Main.TFrame")
+        self.notebook = PageHost(self._show_page)
+        self._add_nav(self.sidebar, "Status", self.status_tab)
+        self._add_nav(self.sidebar, "Wanted", self.wanted_tab)
+        self._add_nav(self.sidebar, "Search", self.search_tab)
+        self._add_nav(self.sidebar, "Shared", self.shared_tab)
+        self._nav_group(self.sidebar, "SYSTEM")
+        self._add_nav(self.sidebar, "Settings", self.settings_tab)
+
+        foot = tk.Frame(self.sidebar, highlightthickness=0, bd=0)
+        foot._chrome_role = "sidebar"
+        foot.pack(side="bottom", fill="x", padx=pad, pady=self.px(12))
+        updates = tk.Label(foot, text="Help · Check for updates", anchor="w", cursor="hand2", bd=0, highlightthickness=0)
+        updates._chrome_role = "foot"
+        updates.pack(anchor="w")
+        updates.bind("<Button-1>", lambda _event: self.check_for_updates(manual=True))
+        about = tk.Label(foot, text="About Rummagarr", anchor="w", cursor="hand2", bd=0, highlightthickness=0)
+        about._chrome_role = "foot"
+        about.pack(anchor="w")
+        about.bind("<Button-1>", lambda _event: self.show_about())
+
         self._boards: list[SearchBoard] = []
         self._search_menu: tk.Menu | None = None
         self._shared_rows: list[dict] = []
@@ -1387,6 +1924,122 @@ class DesktopApp(tk.Tk):
         self._build_wanted(self.wanted_tab)
         self._build_search(self.search_tab)
         self._build_shared(self.shared_tab)
+        apply_theme(self, self._theme_name)
+        self.notebook.select(self.status_tab)
+
+    def _nav_group(self, parent: tk.Misc, text: str) -> None:
+        label = tk.Label(parent, text=text, anchor="w", bd=0, highlightthickness=0, padx=self.px(18))
+        label._chrome_role = "group"
+        label.pack(fill="x", pady=(self.px(12), self.px(4)))
+
+    def _add_nav(self, parent: tk.Misc, text: str, page: ttk.Frame) -> None:
+        item = NavItem(parent, text, lambda page=page: self.notebook.select(page), self.ui_scale)
+        item.pack(fill="x", padx=self.px(8), pady=1)
+        self._nav_items[str(page)] = item
+
+    def _show_page(self, page: tk.Misc) -> None:
+        if page is self.settings_tab:
+            self._ensure_settings()
+        for frame in (self.status_tab, self.wanted_tab, self.search_tab, self.shared_tab, self.settings_tab):
+            if frame.winfo_manager():
+                frame.pack_forget()
+        page.pack(in_=self.content, fill="both", expand=True)
+        selected = str(page)
+        for key, item in self._nav_items.items():
+            item.set_selected(key == selected)
+
+    def _load_window_icon(self) -> None:
+        path = icon_png_path()
+        if not path.is_file():
+            return
+        try:
+            image = tk.PhotoImage(file=str(path))
+        except tk.TclError:
+            log.exception("Could not load the window icon")
+            return
+        self._icon_image = image
+        try:
+            self.iconphoto(True, image)
+        except tk.TclError:
+            log.exception("Could not set the window icon")
+        target = self.px(36)
+        factor = max(1, int(round(image.width() / target))) if image.width() else 1
+        self._brand_image = image.subsample(factor, factor) if factor > 1 else image
+
+    def _card(self, parent: tk.Misc, *, padding: tuple[int, int, int, int] | None = None) -> tk.Frame:
+        shell = tk.Frame(parent, highlightthickness=1, bd=0)
+        shell._chrome_role = "card"
+        if padding is None:
+            padding = (self.px(12), self.px(10), self.px(12), self.px(6))
+        inner = ttk.Frame(shell, style="Card.TFrame", padding=padding)
+        inner.pack(fill="both", expand=True)
+        shell.inner = inner
+        return shell
+
+    def _page_header(self, parent: ttk.Frame, title: str, subtitle: str) -> None:
+        head = ttk.Frame(parent, style="Main.TFrame")
+        head.pack(fill="x")
+        ttk.Label(head, text=title, style="PageTitle.TLabel").pack(anchor="w")
+        if subtitle:
+            ttk.Label(head, text=subtitle, style="Muted.TLabel", wraplength=self.px(900)).pack(
+                anchor="w", pady=(self.px(4), 0)
+            )
+
+    def _ensure_settings(self) -> None:
+        if self._settings_form is not None:
+            return
+        self._settings_baseline = {"cfg": self.worker.cfg}
+
+        def on_saved(cfg: Config) -> None:
+            baseline = self._settings_baseline or {"cfg": self.worker.cfg}
+            message = settings_apply_message(baseline["cfg"], cfg)
+            baseline["cfg"] = cfg
+            self._settings_baseline = baseline
+            self.worker.cfg = cfg
+            self.worker.apply_share_settings(scan=False)
+            saved_limit = self.worker.store.get_meta("gui_recent_limit")
+            if saved_limit:
+                self.limit_var.set(str(normalize_recent_limit(saved_limit)))
+            self.notice_var.set(message)
+            if self._settings_form is not None:
+                self._settings_form.base = cfg
+                self._settings_form.message_var.set(message)
+
+        def on_cancel() -> None:
+            form = self._settings_form
+            self._settings_form = None
+            self._settings_baseline = None
+            if form is not None:
+                form.destroy()
+            self.notebook.select(self.status_tab)
+
+        form = SettingsForm(
+            self.settings_tab,
+            self.config_path,
+            self.worker.cfg,
+            on_saved,
+            on_cancel,
+            store=self.worker.store,
+            worker=self.worker,
+            on_theme=self.apply_live_theme,
+            heading="Settings",
+        )
+        form.pack(fill="both", expand=True)
+        self._settings_form = form
+
+    def apply_live_theme(self, name: str) -> None:
+        name = normalize_theme(name)
+        apply_theme(self, name)
+        self._restyle_glyphs()
+        self.worker.cfg = replace(self.worker.cfg, theme=name)
+        if self._settings_form is not None:
+            self._settings_form.base = self.worker.cfg
+        if self._settings_baseline is not None:
+            self._settings_baseline["cfg"] = replace(self._settings_baseline["cfg"], theme=name)
+        try:
+            save_config(self.config_path, self.worker.cfg)
+        except OSError:
+            log.exception("Could not save the theme")
 
     def _build_menu(self) -> None:
         menu = tk.Menu(self, tearoff=0)
@@ -1396,19 +2049,22 @@ class DesktopApp(tk.Tk):
         menu.add_cascade(label="Help", menu=help_menu)
         self.configure(menu=menu)
         self.help_menu = help_menu
+        self._theme_menus.append(help_menu)
+        self._theme_menus.append(menu)
 
     def show_about(self) -> None:
         messagebox.showinfo(
-            "About Lidarr Soulseek",
-            f"Lidarr Soulseek {app_version()}\n\n"
+            "About Rummagarr",
+            f"Rummagarr {app_version()}\n\n"
             "Downloads missing music from Soulseek into Lidarr.\n"
             "Help → Check for updates looks for a newer release.",
             parent=self,
         )
 
     def _build_status(self, parent: ttk.Frame) -> None:
-        controls = ttk.Frame(parent)
-        controls.pack(fill="x")
+        self._page_header(parent, "Status", "Soulseek worker for Lidarr wanted music")
+        controls = ttk.Frame(parent, style="Main.TFrame")
+        controls.pack(fill="x", pady=(self.px(14), 0))
         self.start_btn = ttk.Button(controls, text="Start", style="Start.TButton", command=self.on_start)
         self.pause_btn = ttk.Button(controls, text="Pause", command=self.on_pause)
         self.stop_btn = ttk.Button(controls, text="Stop", style="Stop.TButton", command=self.on_stop)
@@ -1416,41 +2072,69 @@ class DesktopApp(tk.Tk):
         self.refresh_btn = ttk.Button(controls, text="Refresh", command=self.refresh_status)
         self.cancel_all_btn = ttk.Button(controls, text="Cancel all", command=self.on_cancel_all)
         for button in (self.start_btn, self.pause_btn, self.stop_btn, self.skip_btn):
-            button.pack(side="left", padx=(0, 8))
+            button.pack(side="left", padx=(0, self.px(8)))
         self.cancel_all_btn.pack(side="right")
-        self.refresh_btn.pack(side="right", padx=(0, 8))
+        self.refresh_btn.pack(side="right", padx=(0, self.px(8)))
 
-        status_row = ttk.Frame(parent)
-        status_row.pack(fill="x", pady=(10, 0))
-        self.activity_dot = tk.Canvas(status_row, width=14, height=14, highlightthickness=0, bg="#111111")
-        self.activity_dot.pack(side="left", padx=(0, 8))
+        banner = tk.Frame(parent, highlightthickness=1, bd=0)
+        banner._chrome_role = "card"
+        banner.pack(fill="x", pady=(self.px(12), 0))
+        status_row = tk.Frame(banner, highlightthickness=0, bd=0)
+        status_row._chrome_role = "card"
+        status_row.pack(fill="x", padx=self.px(12), pady=self.px(10))
+        dot = self.px(14)
+        self.activity_dot = tk.Canvas(status_row, width=dot, height=dot, highlightthickness=0, bd=0)
+        self.activity_dot._chrome_role = "canvas"
+        self.activity_dot.pack(side="left", padx=(0, self.px(8)))
         self._pulse_on = False
-        self.status_line = ttk.Label(status_row, text="Stopped · Soulseek offline · Stopped", style="Muted.TLabel")
-        self.status_line.pack(side="left", fill="x", expand=True)
-        self.session_line = ttk.Label(parent, text="", style="Muted.TLabel", wraplength=920, justify="left")
-        self.session_line.pack(fill="x", pady=(2, 0))
+        text_col = ttk.Frame(status_row, style="Card.TFrame")
+        text_col.pack(side="left", fill="x", expand=True)
+        self.status_line = ttk.Label(text_col, text="Stopped · Soulseek offline · Stopped", style="Banner.TLabel")
+        self.status_line.pack(anchor="w", fill="x")
+        self.session_line = ttk.Label(text_col, text="", style="CardMuted.TLabel", wraplength=self.px(980), justify="left")
+        self.session_line.pack(anchor="w", fill="x", pady=(self.px(2), 0))
         self.notice_line = ttk.Label(parent, textvariable=self.notice_var, style="Muted.TLabel")
-        self.notice_line.pack(fill="x", pady=(2, 0))
-
-        ttk.Label(parent, text="Downloads").pack(anchor="w", pady=(12, 4))
-        frame, self.transfers = scrolled_tree(
+        self.notice_line.pack(fill="x", pady=(self.px(6), 0))
+        self.auto_import_var = tk.BooleanVar(value=bool(self.worker.cfg.auto_import_after_artist))
+        self.auto_import = ttk.Checkbutton(
             parent,
+            text="Auto-import to Lidarr after each artist",
+            variable=self.auto_import_var,
+            command=self.on_auto_import,
+        )
+        self.auto_import.pack(anchor="w", pady=(self.px(8), 0))
+
+        grid = ttk.Frame(parent, style="Main.TFrame")
+        grid.pack(fill="both", expand=True, pady=(self.px(10), 0))
+        grid.columnconfigure(0, weight=3)
+        grid.columnconfigure(1, weight=2)
+        grid.rowconfigure(0, weight=1)
+        downloads = self._card(grid)
+        recent_card = self._card(grid)
+        downloads.grid(row=0, column=0, sticky="nsew", padx=(0, self.px(8)))
+        recent_card.grid(row=0, column=1, sticky="nsew")
+
+        ttk.Label(downloads.inner, text="DOWNLOADS", style="CardTitle.TLabel").pack(anchor="w", pady=(0, self.px(6)))
+        frame, self.transfers = scrolled_tree(
+            downloads.inner,
             (
-                ("file", "File", 340, True),
-                ("user", "User", 140, False),
+                ("file", "File", 280, True),
+                ("user", "User", 120, False),
                 ("state", "Status", 110, False),
-                ("progress", "Progress", 180, False),
-                ("action", "", 80, False),
+                ("progress", "Progress", 150, False),
+                ("action", "", 70, False),
             ),
+            frame_style="Card.TFrame",
         )
         frame.pack(fill="both", expand=True)
-        self.transfers.tag_configure("ok", foreground="#7dce7d")
-        self.transfers.tag_configure("bad", foreground="#e07a7a")
+        palette = active_palette(self)
+        self.transfers.tag_configure("ok", foreground=palette.ok)
+        self.transfers.tag_configure("bad", foreground=palette.bad)
         self.transfers.bind("<Button-1>", self.on_transfer_click)
 
-        recent_head = ttk.Frame(parent)
-        recent_head.pack(fill="x", pady=(12, 4))
-        ttk.Label(recent_head, text="Recent completed").pack(side="left")
+        recent_head = ttk.Frame(recent_card.inner, style="Card.TFrame")
+        recent_head.pack(fill="x", pady=(0, self.px(6)))
+        ttk.Label(recent_head, text="RECENT COMPLETED", style="CardTitle.TLabel").pack(side="left")
         self.limit_box = ttk.Combobox(
             recent_head,
             textvariable=self.limit_var,
@@ -1459,17 +2143,18 @@ class DesktopApp(tk.Tk):
             width=6,
         )
         self.limit_box.pack(side="right")
-        ttk.Label(recent_head, text="Show", style="Muted.TLabel").pack(side="right", padx=(0, 6))
+        ttk.Label(recent_head, text="Show", style="CardMuted.TLabel").pack(side="right", padx=(0, self.px(6)))
         self.limit_box.bind("<<ComboboxSelected>>", self.on_limit)
 
         frame, self.recent = scrolled_tree(
-            parent,
+            recent_card.inner,
             (
-                ("when", "When", 150, False),
-                ("album", "Artist / album", 280, True),
-                ("file", "File", 280, True),
-                ("user", "User", 140, False),
+                ("when", "When", 130, False),
+                ("album", "Artist / album", 180, True),
+                ("file", "File", 160, True),
+                ("user", "User", 100, False),
             ),
+            frame_style="Card.TFrame",
         )
         frame.pack(fill="both", expand=True)
         port = self.worker.cfg.status_port
@@ -1478,24 +2163,31 @@ class DesktopApp(tk.Tk):
             parent,
             text=f"The browser page stays at http://{host}:{port} while the worker is running.",
             style="Muted.TLabel",
-        ).pack(anchor="w", pady=(8, 0))
+        ).pack(anchor="w", pady=(self.px(8), 0))
 
     def _build_wanted(self, parent: ttk.Frame) -> None:
-        ttk.Label(
+        self._page_header(
             parent,
-            text="Checked rows are the only ones the worker searches. New rows from Sync start checked. The list is kept on this computer and opens without another Sync.",
-            style="Muted.TLabel",
-            wraplength=980,
-        ).pack(anchor="w")
-        toolbar = ttk.Frame(parent)
-        toolbar.pack(fill="x", pady=(8, 8))
-        self.sync_button = ttk.Button(toolbar, text="Sync", command=self.on_sync)
+            "Wanted",
+            "Checked rows are the only ones the worker searches. New rows from Sync start checked. The list is kept on this computer and opens without another Sync.",
+        )
+        toolbar = ttk.Frame(parent, style="Main.TFrame")
+        toolbar.pack(fill="x", pady=(self.px(14), self.px(8)))
+        self.sync_button = ttk.Button(toolbar, text="Sync", style="Start.TButton", command=self.on_sync)
         self.sync_button.pack(side="left")
-        ttk.Label(toolbar, text="View").pack(side="left", padx=(16, 6))
+        ttk.Label(toolbar, text="View", style="Muted.TLabel").pack(side="left", padx=(self.px(14), self.px(6)))
+        segments = tk.Frame(toolbar, highlightthickness=1, bd=0)
+        segments._chrome_role = "field"
+        segments.pack(side="left")
         for view in VIEWS:
-            ttk.Radiobutton(toolbar, text=view, value=view, variable=self.view_var, command=self.on_view).pack(
-                side="left", padx=(0, 8)
-            )
+            ttk.Radiobutton(
+                segments,
+                text=view,
+                value=view,
+                variable=self.view_var,
+                command=self.on_view,
+                style="Segment.TRadiobutton",
+            ).pack(side="left")
         self.select_all = ttk.Checkbutton(
             toolbar,
             text="Select all",
@@ -1503,15 +2195,17 @@ class DesktopApp(tk.Tk):
             command=self.on_select_all,
         )
         self.select_all.pack(side="right")
-        search_row = ttk.Frame(parent)
-        search_row.pack(fill="x", pady=(0, 6))
-        ttk.Label(search_row, text="Artist").pack(side="left")
+        search_row = ttk.Frame(parent, style="Main.TFrame")
+        search_row.pack(fill="x", pady=(0, self.px(6)))
+        ttk.Label(search_row, text="Artist", style="Muted.TLabel").pack(side="left")
         self.search_entry = ttk.Entry(search_row, textvariable=self.search_var)
-        self.search_entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self.search_entry.pack(side="left", fill="x", expand=True, padx=(self.px(8), 0))
         self.search_entry.bind("<KeyRelease>", lambda _event: self.on_search())
         self.count_label = ttk.Label(parent, textvariable=self.wanted_status, style="Muted.TLabel")
-        self.count_label.pack(anchor="w", pady=(0, 6))
-        frame = ttk.Frame(parent)
+        self.count_label.pack(anchor="w", pady=(0, self.px(6)))
+        card = self._card(parent, padding=(0, 0, 0, 0))
+        card.pack(fill="both", expand=True)
+        frame = card.inner
         columns = (
             ("kind", "Kind", 80, False),
             ("artist", "Artist", 180, True),
@@ -1530,16 +2224,16 @@ class DesktopApp(tk.Tk):
         self.wanted_scroll.grid(row=0, column=1, sticky="ns")
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
-        self.wanted.column("#0", width=44, minwidth=44, stretch=False, anchor="center")
+        self.wanted.column("#0", width=self.px(44), minwidth=self.px(36), stretch=False, anchor="center")
         self.wanted.heading("#0", text="")
         for name, heading, width, stretch in columns:
+            scaled = max(self.px(28), int(round(width * self.ui_scale)))
             if name == "find":
                 self.wanted.heading(name, text="")
-                self.wanted.column(name, width=width, minwidth=width, stretch=False, anchor="center")
+                self.wanted.column(name, width=scaled, minwidth=scaled, stretch=False, anchor="center")
                 continue
             self.wanted.heading(name, text=heading, command=lambda column=name: self.on_wanted_sort(column))
-            self.wanted.column(name, width=width, minwidth=40, anchor="w", stretch=stretch)
-        frame.pack(fill="both", expand=True)
+            self.wanted.column(name, width=scaled, minwidth=self.px(40), anchor="w", stretch=stretch)
         self.wanted.bind("<Button-1>", self.on_wanted_click)
         self.wanted.bind("<space>", self.on_wanted_space)
         self.wanted.bind("<MouseWheel>", self._wanted_wheel)
@@ -1577,33 +2271,7 @@ class DesktopApp(tk.Tk):
         self.destroy()
 
     def open_settings(self) -> None:
-        window = tk.Toplevel(self)
-        window.title("Lidarr Soulseek settings")
-        window.geometry("980x820")
-        window.minsize(760, 640)
-        window.transient(self)
-        apply_theme(window)
-        previous = self.worker.cfg
-
-        def on_saved(cfg: Config) -> None:
-            self.worker.cfg = cfg
-            self.worker.apply_share_settings(scan=False)
-            saved_limit = self.worker.store.get_meta("gui_recent_limit")
-            if saved_limit:
-                self.limit_var.set(str(normalize_recent_limit(saved_limit)))
-            self.notice_var.set(settings_apply_message(previous, cfg))
-            window.destroy()
-
-        form = SettingsForm(
-            window,
-            self.config_path,
-            self.worker.cfg,
-            on_saved,
-            window.destroy,
-            store=self.worker.store,
-            worker=self.worker,
-        )
-        form.pack(fill="both", expand=True)
+        self.notebook.select(self.settings_tab)
 
     def on_start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -1678,6 +2346,14 @@ class DesktopApp(tk.Tk):
 
     def _set_button(self, button: ttk.Button, enabled: bool) -> None:
         button.state(["!disabled"] if enabled else ["disabled"])
+
+    def on_auto_import(self) -> None:
+        enabled = bool(self.auto_import_var.get())
+        self.worker.cfg = replace(self.worker.cfg, auto_import_after_artist=enabled)
+        try:
+            save_config(self.config_path, self.worker.cfg)
+        except OSError:
+            log.exception("Could not save the auto-import setting")
 
     def refresh_status(self) -> None:
         limit = normalize_recent_limit(self.limit_var.get())
@@ -2116,29 +2792,33 @@ class DesktopApp(tk.Tk):
     def _paint_activity_dot(self, busy: bool) -> None:
         if not getattr(self, "activity_dot", None):
             return
+        palette = active_palette(self)
+        size = self.px(14)
+        pad = max(1, self.px(2))
+        self.activity_dot.configure(width=size, height=size, background=palette.card)
         self.activity_dot.delete("all")
         if busy:
             self._pulse_on = not self._pulse_on
-            color = "#3d8bfd" if self._pulse_on else "#8cbcff"
+            color = palette.dot_busy if self._pulse_on else palette.accent
         else:
             self._pulse_on = False
-            color = "#555555"
-        self.activity_dot.create_oval(2, 2, 12, 12, fill=color, outline=color)
+            color = palette.dot_idle
+        self.activity_dot.create_oval(pad, pad, size - pad, size - pad, fill=color, outline=color)
 
     def _magnifier_image(self) -> tk.PhotoImage:
         """A drawn glass, so the Wanted column does not depend on a Unicode font."""
-        size = 16
-        image = tk.PhotoImage(master=self, width=size, height=size)
-        image.put("#1c1c1c", to=(0, 0, size, size))
-        glass = "#d5d5d5"
-        for y in range(size):
-            for x in range(size):
+        palette = active_palette(self)
+        image = tk.PhotoImage(master=self, width=16, height=16)
+        image.put(palette.card, to=(0, 0, 16, 16))
+        glass = palette.glass
+        for y in range(16):
+            for x in range(16):
                 distance = (x - 6) ** 2 + (y - 6) ** 2
                 if 10 <= distance <= 18:
                     image.put(glass, to=(x, y, x + 1, y + 1))
         for offset in range(5):
             image.put(glass, to=(9 + offset, 9 + offset, 11 + offset, 11 + offset))
-        return image
+        return self._zoom_glyph(image)
 
     def _place_finders(self) -> None:
         """One magnifier per visible row. The catalog itself is not walked."""
@@ -2154,7 +2834,7 @@ class DesktopApp(tk.Tk):
             label = tk.Label(
                 self.wanted,
                 image=self._finder_image,
-                bg="#1c1c1c",
+                bg=active_palette(self).card,
                 bd=0,
                 cursor="hand2",
                 takefocus=0,
@@ -2168,7 +2848,8 @@ class DesktopApp(tk.Tk):
                 label.place_forget()
                 continue
             x, y, width, height = box
-            label.place(x=x + max(0, (width - 16) // 2), y=y + max(0, (height - 16) // 2), width=16, height=16)
+            size = self._glyph_size
+            label.place(x=x + max(0, (width - size) // 2), y=y + max(0, (height - size) // 2), width=size, height=size)
             label.bind("<Button-1>", lambda _event, row=iid: self._finder_clicked(row))
 
     def _finder_clicked(self, iid: str) -> None:
@@ -2184,28 +2865,26 @@ class DesktopApp(tk.Tk):
         self.open_manual_search(query, link_from_wanted(item))
 
     def _build_search(self, parent: ttk.Frame) -> None:
-        row = ttk.Frame(parent)
-        row.pack(fill="x")
+        self._page_header(
+            parent,
+            "Search",
+            "Uses the worker's Soulseek login. Pause stops the worker's own searches and leaves this page running. Download all wanted uses every result unless a user is selected.",
+        )
+        row = ttk.Frame(parent, style="Main.TFrame")
+        row.pack(fill="x", pady=(self.px(14), 0))
         self.query_var = tk.StringVar()
         self.query_entry = ttk.Entry(row, textvariable=self.query_var)
         self.query_entry.pack(side="left", fill="x", expand=True)
         self.query_entry.bind("<Return>", lambda _event: self.submit_search())
-        self.search_button = ttk.Button(row, text="Search", command=self.submit_search)
-        self.search_button.pack(side="left", padx=(8, 0))
-        hint = ttk.Label(
-            parent,
-            text=(
-                "Uses the worker's Soulseek login. Pause stops the worker's own searches and leaves this tab running. "
-                "Download all wanted uses every result unless a user is selected."
-            ),
-            style="Muted.TLabel",
-            wraplength=760,
-        )
-        hint.pack(anchor="w", pady=(6, 6))
-        self.searches = ttk.Notebook(parent)
+        self.search_button = ttk.Button(row, text="Search", style="Start.TButton", command=self.submit_search)
+        self.search_button.pack(side="left", padx=(self.px(8), 0))
+        card = self._card(parent, padding=(self.px(8), self.px(8), self.px(8), self.px(8)))
+        card.pack(fill="both", expand=True, pady=(self.px(10), 0))
+        self.searches = ttk.Notebook(card.inner)
         self.searches.pack(fill="both", expand=True)
         self.searches.bind("<Button-1>", self._on_search_tab_press)
         self._search_menu = tk.Menu(self, tearoff=0)
+        self._theme_menus.append(self._search_menu)
         self._search_menu.add_command(label="Download file(s)", command=self.download_selected_files)
         self._search_menu.add_command(label="Download folder", command=self.download_selected_folder)
         self._search_menu.add_command(label="Download all from this user", command=self.download_all_from_user)
@@ -2563,8 +3242,9 @@ class DesktopApp(tk.Tk):
         return file_ids, users
 
     def _build_shared(self, parent: ttk.Frame) -> None:
-        top = ttk.Frame(parent)
-        top.pack(fill="x")
+        self._page_header(parent, "Shared", "Uploads from other Soulseek users. Pause keeps sharing up. Stop closes it.")
+        top = ttk.Frame(parent, style="Main.TFrame")
+        top.pack(fill="x", pady=(self.px(14), 0))
         self.share_totals = tk.StringVar(value="")
         ttk.Label(top, textvariable=self.share_totals).pack(side="left")
         self.pause_uploads_var = tk.BooleanVar(value=bool(self.worker.cfg.pause_uploads))
@@ -2583,8 +3263,10 @@ class DesktopApp(tk.Tk):
             side="left", padx=(8, 0)
         )
         ttk.Button(actions, text="Ban user", command=lambda: self._upload_action("ban")).pack(side="left", padx=(8, 0))
+        card = self._card(parent, padding=(self.px(8), self.px(8), self.px(4), self.px(4)))
+        card.pack(fill="both", expand=True)
         frame, tree = scrolled_tree(
-            parent,
+            card.inner,
             (
                 ("user", "User", 140, False),
                 ("file", "File", 360, True),
@@ -2594,6 +3276,7 @@ class DesktopApp(tk.Tk):
                 ("status", "Status", 90, False),
                 ("when", "Time", 140, False),
             ),
+            frame_style="Card.TFrame",
         )
         frame.pack(fill="both", expand=True)
         self.shared_tree = tree
@@ -2945,28 +3628,56 @@ class DesktopApp(tk.Tk):
             self._search_menu.entryconfig(3, label=label)
             self._search_menu.tk_popup(event.x_root, event.y_root)
 
+    def _zoom_glyph(self, image: tk.PhotoImage) -> tk.PhotoImage:
+        factor = max(1, int(round(self._glyph_size / 16)))
+        if factor == 1:
+            return image
+        return image.zoom(factor, factor)
+
+    def _restyle_glyphs(self) -> None:
+        if not getattr(self, "wanted", None):
+            return
+        self._glyph_size = max(16, int(round(16 * self.ui_scale)))
+        self._check_images = {state: self._checkbox_image(state) for state in ("on", "off", "mixed")}
+        self._finder_image = self._magnifier_image()
+        palette = active_palette(self)
+        for iid, state in list(self._row_checks.items()):
+            try:
+                self.wanted.item(iid, image=self._check_images.get(state, self._check_images["on"]))
+            except tk.TclError:
+                pass
+        for label in self._finder_labels:
+            try:
+                label.configure(image=self._finder_image, bg=palette.card)
+            except tk.TclError:
+                pass
+        if getattr(self, "transfers", None) is not None:
+            self.transfers.tag_configure("ok", foreground=palette.ok)
+            self.transfers.tag_configure("bad", foreground=palette.bad)
+        self._place_finders()
+
     def _checkbox_image(self, state: str) -> tk.PhotoImage:
         """A drawn box, so the control does not depend on a Unicode font."""
-        size = 16
-        image = tk.PhotoImage(master=self, width=size, height=size)
-        border = "#d5d5d5"
+        palette = active_palette(self)
+        image = tk.PhotoImage(master=self, width=16, height=16)
+        border = palette.check_border
         if state == "off":
-            fill = "#2a2a2a"
+            fill = palette.check_off
             glyph = None
         else:
-            fill = "#3d8bfd"
-            glyph = "#ffffff"
-        image.put(border, to=(0, 0, size, size))
-        image.put(fill, to=(2, 2, size - 2, size - 2))
-        if state == "on":
+            fill = palette.check_on
+            glyph = palette.check_glyph
+        image.put(border, to=(0, 0, 16, 16))
+        image.put(fill, to=(2, 2, 14, 14))
+        if state == "on" and glyph:
             for x, y in (
                 (3, 8), (4, 9), (5, 10), (6, 11), (7, 10), (8, 9), (9, 8), (10, 7), (11, 6), (12, 5),
                 (4, 8), (5, 9), (6, 10), (7, 9), (8, 8), (9, 7), (10, 6), (11, 5),
             ):
                 image.put(glyph, to=(x, y, x + 1, y + 1))
-        elif state == "mixed":
+        elif state == "mixed" and glyph:
             image.put(glyph, to=(4, 7, 12, 10))
-        return image
+        return self._zoom_glyph(image)
 
     def _row_values(self, item: WantedItem) -> tuple:
         return (item.kind.title(), item.artist, item.album, item.song, item.detail, "")
@@ -3124,11 +3835,11 @@ class DesktopApp(tk.Tk):
                 message = f"You're on {status.current}. The latest published release is {status.latest}."
             else:
                 message = f"You're on {status.current}, which is the latest release."
-            messagebox.showinfo("Lidarr Soulseek", message, parent=self)
+            messagebox.showinfo("Rummagarr", message, parent=self)
             return
         if kind == "error":
             self.notice_var.set(status.error or "Could not check for updates.")
-            messagebox.showerror("Lidarr Soulseek", status.error or "Could not check for updates.", parent=self)
+            messagebox.showerror("Rummagarr", status.error or "Could not check for updates.", parent=self)
             return
         self.notice_var.set("")
         self._show_update_prompt(status)
@@ -3192,7 +3903,7 @@ class DesktopApp(tk.Tk):
         def work() -> None:
             try:
                 folder = Path(tempfile.mkdtemp(prefix="lidarr-soulseek-update-"))
-                dest = folder / (status.asset_name or "LidarrSoulseek-Setup.exe")
+                dest = folder / (status.asset_name or "Rummagarr-Setup.exe")
                 download_verified(status, dest, on_progress=on_progress)
             except Exception as exc:
                 log.exception("Update download failed")
@@ -3218,7 +3929,7 @@ class DesktopApp(tk.Tk):
             return
         message = str(exc) or "Could not download the update."
         self.notice_var.set(message)
-        messagebox.showerror("Lidarr Soulseek", message, parent=self)
+        messagebox.showerror("Rummagarr", message, parent=self)
 
     def _download_ready(self, dest: Path) -> None:
         if self._shutting_down:
@@ -3246,7 +3957,7 @@ class DesktopApp(tk.Tk):
             log.exception("Could not start the installer")
             self._shutting_down = False
             self._close_progress()
-            messagebox.showerror("Lidarr Soulseek", f"Could not start the installer: {exc}", parent=self)
+            messagebox.showerror("Rummagarr", f"Could not start the installer: {exc}", parent=self)
             return
         try:
             if self._thread is None or not self._thread.is_alive():
@@ -3259,7 +3970,7 @@ class DesktopApp(tk.Tk):
 
 def run_setup(config_path: Path) -> Config | None:
     root = tk.Tk()
-    root.title("Lidarr Soulseek setup")
+    root.title("Rummagarr setup")
     root.geometry("980x820")
     apply_theme(root)
     saved: dict[str, Config] = {}

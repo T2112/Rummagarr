@@ -16,7 +16,7 @@ $listen = Get-TomlInt $toml "listen_port" 2234
 $obfs = Get-TomlInt $toml "obfuscated_port" 2235
 
 foreach ($port in @($listen, $obfs)) {
-    $name = "Lidarr Soulseek TCP $port"
+    $name = "Rummagarr TCP $port"
     netsh advfirewall firewall delete rule name=$name | Out-Null
     netsh advfirewall firewall add rule name=$name dir=in action=allow protocol=TCP localport=$port
     Write-Host "Allowed inbound TCP $port"

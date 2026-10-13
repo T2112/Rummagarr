@@ -74,6 +74,37 @@ def _payload(tag: str = "v1.5.0", *, with_installer: bool = True, size: int = 11
     }
 
 
+def test_rummagarr_installer_is_preferred_and_the_old_name_still_installs():
+    from updater import installer_name_for
+
+    assert installer_name_for("1.10.0") == "Rummagarr-Setup-1.10.0.exe"
+    assert is_newer("1.10.0", "1.9.4")
+    both = _payload()
+    both["assets"].insert(
+        0,
+        {
+            "name": "Rummagarr-Setup-1.5.0.exe",
+            "browser_download_url": "https://example.test/Rummagarr-Setup-1.5.0.exe",
+            "size": 11,
+        },
+    )
+    both["assets"].append(
+        {
+            "name": "Rummagarr-Setup-1.5.0.exe.sha256",
+            "browser_download_url": "https://example.test/Rummagarr-Setup-1.5.0.exe.sha256",
+            "size": 80,
+        }
+    )
+    status = parse_release(both, current="1.4.0", skipped=None, installed=True, platform="nt")
+    assert status.asset_name == "Rummagarr-Setup-1.5.0.exe"
+    assert status.can_install
+    assert status.checksum_url.endswith("Rummagarr-Setup-1.5.0.exe.sha256")
+    legacy = parse_release(_payload(), current="1.4.0", skipped=None, installed=True, platform="nt")
+    assert legacy.newer
+    assert legacy.asset_name == "LidarrSoulseek-Setup-1.5.0.exe"
+    assert legacy.can_install
+
+
 def test_release_parsing_finds_the_installer_and_checksum():
     status = parse_release(_payload(), current="1.4.0", skipped=None, installed=True, platform="nt")
     assert status.latest == "1.5.0"
@@ -100,7 +131,8 @@ def test_release_parsing_finds_the_installer_and_checksum():
     missing = parse_release(_payload(with_installer=False), current="1.4.0", skipped=None, installed=True, platform="nt")
     assert missing.newer
     assert not missing.can_install
-    assert "no LidarrSoulseek-Setup-1.5.0.exe" in (missing.error or "")
+    assert "Rummagarr-Setup-1.5.0.exe" in (missing.error or "")
+    assert "LidarrSoulseek-Setup-1.5.0.exe" in (missing.error or "")
 
 
 def test_skip_version_is_remembered_until_a_newer_release(tmp_path):
