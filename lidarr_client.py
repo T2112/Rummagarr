@@ -193,6 +193,20 @@ class LidarrClient:
             {"name": "DownloadedAlbumsScan", "path": path, "importMode": "Move"},
         )
 
+    def renames_on_import(self) -> bool | None:
+        """True when Lidarr's own import already renames tracks.
+
+        None means the media-management setting could not be read.
+        """
+        try:
+            payload = self._get("/config/mediamanagement")
+        except Exception:
+            log.exception("Could not read Lidarr's rename-on-import setting")
+            return None
+        if not isinstance(payload, dict) or "renameTracks" not in payload:
+            return None
+        return bool(payload.get("renameTracks"))
+
     def rename_artist_files(self, artist_id: int) -> Any:
         files = self._get("/trackFile", params={"artistId": artist_id}) or []
         ids = [int(f["id"]) for f in files if f.get("id")]

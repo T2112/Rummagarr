@@ -10,6 +10,8 @@ api_key = "CHANGEME"
 # If Lidarr runs as a Windows service on this same PC, this is the same
 # as [paths].complete_dir below.
 scan_path = "D:\\Media\\Incoming\\Soulseek"
+# When on, an empty download queue after an artist asks Lidarr to import that folder.
+auto_import_after_artist = false
 
 [soulseek]
 username = "CHANGEME"

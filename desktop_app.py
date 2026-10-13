@@ -533,7 +533,7 @@ class SettingsForm(ttk.Frame):
         variable.set("" if value is None else str(value))
 
     def _build(self) -> None:
-        ttk.Label(self, text="Lidarr Soulseek setup", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(self, text="Seekarr setup", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(
             self,
             text="Connection holds the login and folders. Behavior holds search and conversion. Sharing holds what other users can download.",
@@ -1043,7 +1043,7 @@ class UpdatePrompt(tk.Toplevel):
 
     def __init__(self, master: tk.Misc, status: UpdateStatus, on_install, on_skip, on_later) -> None:
         super().__init__(master)
-        self.title("Update Lidarr Soulseek")
+        self.title("Update Seekarr")
         self.transient(master)
         self.resizable(True, True)
         self.minsize(480, 320)
@@ -1331,7 +1331,7 @@ class DesktopApp(tk.Tk):
         self._choices_cache: dict[str, bool] | None = None
         self._choice_job = 0
         self._transfer_index: dict[str, int] = {}
-        self.title(f"Lidarr Soulseek {app_version()}")
+        self.title(f"Seekarr {app_version()}")
         self.geometry("1100x720")
         self.minsize(860, 560)
         apply_theme(self)
@@ -1366,7 +1366,7 @@ class DesktopApp(tk.Tk):
         self._build_menu()
         header = ttk.Frame(self, padding=(16, 12, 16, 0))
         header.pack(fill="x")
-        ttk.Label(header, text="Lidarr Soulseek", style="Title.TLabel").pack(side="left")
+        ttk.Label(header, text="Seekarr", style="Title.TLabel").pack(side="left")
         ttk.Label(header, text=app_version(), style="Muted.TLabel").pack(side="left", padx=(10, 0), pady=(4, 0))
         ttk.Button(header, text="Settings", command=self.open_settings).pack(side="right")
 
@@ -1399,8 +1399,8 @@ class DesktopApp(tk.Tk):
 
     def show_about(self) -> None:
         messagebox.showinfo(
-            "About Lidarr Soulseek",
-            f"Lidarr Soulseek {app_version()}\n\n"
+            "About Seekarr",
+            f"Seekarr {app_version()}\n\n"
             "Downloads missing music from Soulseek into Lidarr.\n"
             "Help → Check for updates looks for a newer release.",
             parent=self,
@@ -1431,6 +1431,14 @@ class DesktopApp(tk.Tk):
         self.session_line.pack(fill="x", pady=(2, 0))
         self.notice_line = ttk.Label(parent, textvariable=self.notice_var, style="Muted.TLabel")
         self.notice_line.pack(fill="x", pady=(2, 0))
+        self.auto_import_var = tk.BooleanVar(value=bool(self.worker.cfg.auto_import_after_artist))
+        self.auto_import = ttk.Checkbutton(
+            parent,
+            text="Auto-import to Lidarr after each artist",
+            variable=self.auto_import_var,
+            command=self.on_auto_import,
+        )
+        self.auto_import.pack(anchor="w", pady=(8, 0))
 
         ttk.Label(parent, text="Downloads").pack(anchor="w", pady=(12, 4))
         frame, self.transfers = scrolled_tree(
@@ -1578,7 +1586,7 @@ class DesktopApp(tk.Tk):
 
     def open_settings(self) -> None:
         window = tk.Toplevel(self)
-        window.title("Lidarr Soulseek settings")
+        window.title("Seekarr settings")
         window.geometry("980x820")
         window.minsize(760, 640)
         window.transient(self)
@@ -1678,6 +1686,14 @@ class DesktopApp(tk.Tk):
 
     def _set_button(self, button: ttk.Button, enabled: bool) -> None:
         button.state(["!disabled"] if enabled else ["disabled"])
+
+    def on_auto_import(self) -> None:
+        enabled = bool(self.auto_import_var.get())
+        self.worker.cfg = replace(self.worker.cfg, auto_import_after_artist=enabled)
+        try:
+            save_config(self.config_path, self.worker.cfg)
+        except OSError:
+            log.exception("Could not save the auto-import setting")
 
     def refresh_status(self) -> None:
         limit = normalize_recent_limit(self.limit_var.get())
@@ -3124,11 +3140,11 @@ class DesktopApp(tk.Tk):
                 message = f"You're on {status.current}. The latest published release is {status.latest}."
             else:
                 message = f"You're on {status.current}, which is the latest release."
-            messagebox.showinfo("Lidarr Soulseek", message, parent=self)
+            messagebox.showinfo("Seekarr", message, parent=self)
             return
         if kind == "error":
             self.notice_var.set(status.error or "Could not check for updates.")
-            messagebox.showerror("Lidarr Soulseek", status.error or "Could not check for updates.", parent=self)
+            messagebox.showerror("Seekarr", status.error or "Could not check for updates.", parent=self)
             return
         self.notice_var.set("")
         self._show_update_prompt(status)
@@ -3192,7 +3208,7 @@ class DesktopApp(tk.Tk):
         def work() -> None:
             try:
                 folder = Path(tempfile.mkdtemp(prefix="lidarr-soulseek-update-"))
-                dest = folder / (status.asset_name or "LidarrSoulseek-Setup.exe")
+                dest = folder / (status.asset_name or "Seekarr-Setup.exe")
                 download_verified(status, dest, on_progress=on_progress)
             except Exception as exc:
                 log.exception("Update download failed")
@@ -3218,7 +3234,7 @@ class DesktopApp(tk.Tk):
             return
         message = str(exc) or "Could not download the update."
         self.notice_var.set(message)
-        messagebox.showerror("Lidarr Soulseek", message, parent=self)
+        messagebox.showerror("Seekarr", message, parent=self)
 
     def _download_ready(self, dest: Path) -> None:
         if self._shutting_down:
@@ -3246,7 +3262,7 @@ class DesktopApp(tk.Tk):
             log.exception("Could not start the installer")
             self._shutting_down = False
             self._close_progress()
-            messagebox.showerror("Lidarr Soulseek", f"Could not start the installer: {exc}", parent=self)
+            messagebox.showerror("Seekarr", f"Could not start the installer: {exc}", parent=self)
             return
         try:
             if self._thread is None or not self._thread.is_alive():
@@ -3259,7 +3275,7 @@ class DesktopApp(tk.Tk):
 
 def run_setup(config_path: Path) -> Config | None:
     root = tk.Tk()
-    root.title("Lidarr Soulseek setup")
+    root.title("Seekarr setup")
     root.geometry("980x820")
     apply_theme(root)
     saved: dict[str, Config] = {}

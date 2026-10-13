@@ -11,7 +11,7 @@ import pytest
 from dataclasses import replace
 
 from activity import Step
-from config_loader import app_version, default_config
+from config_loader import app_version, default_config, try_load_config
 from desktop_app import (
     DesktopApp,
     SettingsForm,
@@ -67,8 +67,21 @@ def _row(app, **match):
     raise AssertionError(f"no wanted row matching {match}")
 
 
+def test_auto_import_checkbox_persists(desktop):
+    desktop.auto_import_var.set(1)
+    desktop.on_auto_import()
+    assert desktop.worker.cfg.auto_import_after_artist is True
+    assert try_load_config(desktop.config_path).auto_import_after_artist is True
+    desktop.auto_import_var.set(0)
+    desktop.on_auto_import()
+    assert try_load_config(desktop.config_path).auto_import_after_artist is False
+
+
 def test_window_shows_version_and_update_actions(desktop):
+    assert desktop.title().startswith("Seekarr")
     assert app_version() in desktop.title()
+    assert desktop.auto_import.cget("text") == "Auto-import to Lidarr after each artist"
+    assert not desktop.auto_import_var.get()
     assert desktop.help_menu.entrycget(0, "label") == "Check for updates"
     assert desktop.help_menu.entrycget(1, "label") == "About"
     status = UpdateStatus(
