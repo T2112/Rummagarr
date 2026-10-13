@@ -20,7 +20,10 @@ from config_loader import app_version
 LATEST_RELEASE_URL = "https://api.github.com/repos/T2112/lidarr-soulseek/releases/latest"
 RELEASES_PAGE_URL = "https://github.com/T2112/lidarr-soulseek/releases/latest"
 SKIPPED_UPDATE_META = "skipped_update_version"
-INSTALLER_PREFIX = "LidarrSoulseek-Setup-"
+# Rummagarr-Setup is the name new releases publish. LidarrSoulseek-Setup is the
+# name 1.9.4 and earlier ask GitHub for, so a release keeps that file too.
+INSTALLER_PREFIXES = ("Rummagarr-Setup-", "LidarrSoulseek-Setup-")
+INSTALLER_PREFIX = INSTALLER_PREFIXES[0]
 
 
 class UpdateError(Exception):
@@ -94,8 +97,13 @@ def versions_equal(left: str, right: str) -> bool:
         return False
 
 
+def installer_names_for(version: str) -> tuple[str, ...]:
+    text = version_text(version)
+    return tuple(f"{prefix}{text}.exe" for prefix in INSTALLER_PREFIXES)
+
+
 def installer_name_for(version: str) -> str:
-    return f"{INSTALLER_PREFIX}{version_text(version)}.exe"
+    return installer_names_for(version)[0]
 
 
 def checksum_name_for(installer_name: str) -> str:
@@ -110,7 +118,7 @@ def running_installed() -> bool:
 def github_headers() -> dict[str, str]:
     return {
         "Accept": "application/vnd.github+json",
-        "User-Agent": f"LidarrSoulseek/{app_version()}",
+        "User-Agent": f"Rummagarr/{app_version()}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
@@ -195,9 +203,16 @@ def parse_release(
     page = str(payload.get("html_url") or f"https://github.com/T2112/lidarr-soulseek/releases/tag/{tag}")
     notes = str(payload.get("body") or "").strip()
     assets = _asset_map(payload)
-    name = installer_name_for(published)
-    installer = assets.get(name)
-    checksum = assets.get(checksum_name_for(name))
+    names = installer_names_for(published)
+    name = names[0]
+    installer = None
+    for candidate in names:
+        found = assets.get(candidate)
+        if found:
+            installer = found
+            name = candidate
+            break
+    checksum = assets.get(checksum_name_for(name)) if installer else None
     newer = latest_version > current_version
     skipped_this = False
     if skipped and newer:
@@ -212,7 +227,7 @@ def parse_release(
     can_install = bool(installed and system == "nt" and installer and asset_url and asset_size is not None)
     if installed and newer and not can_install:
         if installer is None:
-            error = f"Release {tag} has no {name} to install."
+            error = f"Release {tag} has no {' or '.join(names)} to install."
         elif not asset_url or asset_size is None:
             error = f"Release {tag} is missing the download size for {name}."
         elif system != "nt":

@@ -6,7 +6,13 @@ All notable changes to this project are documented here.
 
 ### Added
 
-- Status has a checkbox, **Auto-import to Lidarr after each artist**. It is saved in `config.toml` and starts off. When it is on, and an artist queued downloads, the app asks Lidarr once — when that download queue is empty — to run DownloadedAlbumsScan on the download folder with import mode Move, then RenameFiles for that artist when Lidarr did not already rename on import. Leaving the queue empty does not scan again. The status line says `Importing <artist> into Lidarr...`, then that the import finished or failed. The scan runs beside the worker, so the next artist is not held up. Errors are written to the log.
+- The desktop app, installer, Start menu shortcut, desktop shortcut, and Add/Remove Programs entry are named Rummagarr. The setup file is `Rummagarr-Setup-<version>.exe`. The GitHub repository name is unchanged.
+- Status has a checkbox, **Auto-import to Lidarr after each artist**. It is saved in `config.toml` and starts off. When it is on, and an artist queued downloads, Rummagarr asks Lidarr once — when that download queue is empty — to run DownloadedAlbumsScan on the download folder with import mode Move, then RenameFiles for that artist when Lidarr did not already rename on import. Leaving the queue empty does not scan again. The status line says `Importing <artist> into Lidarr...`, then that the import finished or failed. The scan runs beside the worker, so the next artist is not held up. Errors are written to the log.
+
+### Changed
+
+- An upgrade from Lidarr Soulseek uses the same installer id, so the new setup replaces the old one. The program mutex is unchanged, so a running 1.9.4 closes for the upgrade. The first launch copies `config.toml`, the database, and the log from `%LOCALAPPDATA%\Lidarr Soulseek` (or `~/.lidarr-soulseek`) into the Rummagarr folder when that folder has no config yet.
+- Help → Check for updates accepts `Rummagarr-Setup-<version>.exe` and, if that file is not on the release, `LidarrSoulseek-Setup-<version>.exe`. A published release includes both names, so 1.9.4 can download `LidarrSoulseek-Setup-1.10.0.exe` and install this version.
 
 ## [1.9.4] — 2026-10-12
 

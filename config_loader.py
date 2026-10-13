@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import logging
 import os
+import shutil
 import sys
 import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+
+log = logging.getLogger("lidarr_slsk")
+
+APP_NAME = "Rummagarr"
+LEGACY_WINDOWS_DIR = "Lidarr Soulseek"
+LEGACY_HOME_DIR = ".lidarr-soulseek"
 
 
 class ConfigError(Exception):
@@ -67,13 +75,93 @@ class Config:
 
 
 def app_data_dir() -> Path:
+    """Settings, the database, and the log. An explicit home override is kept as-is."""
     if os.name == "nt":
         root = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-        return Path(root) / "Lidarr Soulseek"
+        return Path(root) / APP_NAME
     override = os.environ.get("LIDARR_SLSK_HOME")
     if override:
         return Path(override)
-    return Path.home() / ".lidarr-soulseek"
+    return Path.home() / ".rummagarr"
+
+
+def legacy_data_dir() -> Path | None:
+    """Previous data folder. None when the user already pointed at a folder."""
+    if os.environ.get("LIDARR_SLSK_HOME"):
+        return None
+    if os.name == "nt":
+        root = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(root) / LEGACY_WINDOWS_DIR
+    return Path.home() / LEGACY_HOME_DIR
+
+
+def _retarget_paths(text: str, source: Path, dest: Path) -> str:
+    """Point copied settings at the new folder when they named the old one."""
+    source_text = str(source)
+    dest_text = str(dest)
+    pairs = [
+        (source_text.replace("\\", "\\\\"), dest_text.replace("\\", "\\\\")),
+        (source_text.replace("/", "\\"), dest_text.replace("/", "\\")),
+        (source_text.replace("\\", "/"), dest_text.replace("\\", "/")),
+        (source_text, dest_text),
+    ]
+    pairs.sort(key=lambda item: len(item[0]), reverse=True)
+    seen: set[str] = set()
+    for old, new in pairs:
+        if not old or old == new or old in seen:
+            continue
+        seen.add(old)
+        text = text.replace(old, new)
+    return text
+
+
+def migrate_app_data(dest: Path | None = None, source: Path | None = None) -> Path:
+    """Copy settings and data from the old folder when this one has none yet.
+
+    The old folder is left in place so an older install can still read it.
+    Paths inside config.toml that pointed at the old folder are rewritten.
+    """
+    dest = dest or app_data_dir()
+    if source is None:
+        source = legacy_data_dir()
+    if source is None:
+        return dest
+    try:
+        if source.resolve() == dest.resolve():
+            return dest
+    except OSError:
+        return dest
+    if not source.is_dir():
+        return dest
+    if (dest / "config.toml").exists():
+        return dest
+    try:
+        names = list(source.iterdir())
+    except OSError:
+        log.exception("Could not read the previous data folder %s", source)
+        return dest
+    if not names:
+        return dest
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        for item in names:
+            target = dest / item.name
+            if target.exists():
+                continue
+            if item.is_dir():
+                shutil.copytree(item, target)
+            else:
+                shutil.copy2(item, target)
+        config = dest / "config.toml"
+        if config.exists():
+            text = config.read_text(encoding="utf-8")
+            rewritten = _retarget_paths(text, source, dest)
+            if rewritten != text:
+                config.write_text(rewritten, encoding="utf-8")
+        log.info("Copied settings and data from %s to %s", source, dest)
+    except OSError:
+        log.exception("Could not copy settings from %s to %s", source, dest)
+    return dest
 
 
 def bundled_root() -> Path:
@@ -99,6 +187,7 @@ def desktop_config_path() -> Path:
     if override:
         return Path(override)
     if getattr(sys, "frozen", False):
+        migrate_app_data()
         path = app_data_dir() / "config.toml"
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
@@ -106,7 +195,7 @@ def desktop_config_path() -> Path:
 
 
 def default_media_dirs() -> tuple[Path, Path]:
-    root = Path.home() / "Music" / "Lidarr Soulseek"
+    root = Path.home() / "Music" / APP_NAME
     return root / "Incomplete", root / "Complete"
 
 
@@ -197,7 +286,7 @@ def save_config(path: Path, cfg: Config) -> None:
     share_dirs = ", ".join(_toml_str(item) for item in cfg.share_dirs)
     text = "\n".join(
         [
-            "# Written by Lidarr Soulseek. You can keep editing this file,",
+            "# Written by Rummagarr. You can keep editing this file,",
             "# or change the same settings from the app.",
             "",
             "[lidarr]",
