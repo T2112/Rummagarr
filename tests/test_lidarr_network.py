@@ -161,3 +161,53 @@ def test_album_at_a_time_baseline_requests_one_track_per_album(tmp_path):
         client.close()
         store.close()
         server.close()
+
+
+def test_a_dead_host_is_lidarr_unreachable(monkeypatch):
+    from lidarr_client import LidarrUnreachable
+
+    monkeypatch.setattr("lidarr_client.time.sleep", lambda _seconds: None)
+    client = LidarrClient("http://127.0.0.1:9", "test", timeout=1)
+    try:
+        try:
+            client.ping()
+        except LidarrUnreachable as exc:
+            assert str(exc) == "Lidarr unreachable"
+        else:
+            raise AssertionError("expected Lidarr unreachable")
+    finally:
+        client.close()
+
+
+def test_artist_id_uses_lookup_and_queue_failures_are_named():
+    client = LidarrClient("http://127.0.0.1:9", "test", timeout=1)
+    seen = {}
+
+    def get(path, params=None):
+        seen["path"] = path
+        return [{"artist": {"id": 4, "artistName": "Ella Langley"}}]
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {
+                "records": [
+                    {
+                        "title": "Ella Langley - Hungover",
+                        "trackedDownloadStatus": "warning",
+                        "statusMessages": [{"messages": ["Found a release but the track count does not match"]}],
+                    }
+                ]
+            }
+
+    client._get = get
+    client._client.get = lambda *args, **kwargs: Response()
+    try:
+        assert client.artist_id_by_name("Ella Langley") == 4
+        assert seen["path"] == "/search"
+        failures = client.import_failures("Ella Langley")
+        assert failures
+        assert "track count" in failures[0].casefold()
+    finally:
+        client.close()

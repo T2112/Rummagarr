@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 
 from activity import Step, describe_step, format_status_line
 from tests.conftest import album, make_worker
@@ -196,6 +198,92 @@ def test_connected_requires_a_live_server(tmp_path):
         assert label == "Soulseek connected"
     finally:
         _disarm(worker)
+
+
+def test_downloads_are_not_labeled_soulseek_offline():
+    line = format_status_line(
+        {
+            "run_state": "running",
+            "connected_label": "Soulseek offline",
+            "logged_in": False,
+            "activity": "Downloading 1 of 8 · Ella Langley – Hungover",
+            "transfers": [{"state": "DOWNLOADING", "filename": "01.flac"}],
+            "elapsed": 3,
+        }
+    )
+    assert "Soulseek offline" not in line
+    assert "Downloading" in line
+    idle = format_status_line(
+        {
+            "run_state": "stopped",
+            "connected_label": "Soulseek offline",
+            "logged_in": False,
+            "activity": "Stopped",
+            "transfers": [],
+            "elapsed": 0,
+        }
+    )
+    assert "Soulseek offline" in idle
+
+
+def test_a_free_slot_match_does_not_wait_out_the_search(tmp_path):
+    worker = make_worker(tmp_path)
+    try:
+        started = time.monotonic()
+        signal = asyncio.run(
+            worker._await_results(object(), None, 30, "Ella Langley", "Hungover", 1, 1, ready=lambda: True)
+        )
+        assert signal == "ok"
+        assert time.monotonic() - started < 1
+    finally:
+        worker.close()
+
+
+def test_an_unsent_search_is_not_cooled_and_can_be_retried(tmp_path):
+    worker = make_worker(tmp_path)
+    try:
+        worker.store.upsert(7, "Ella Langley", "Hungover", "not_sent", "search was not sent")
+        assert worker.store.should_skip(7, 12) is False
+        worker._cycle_unsent_search = True
+        worker._cycle_attempted_search = True
+        worker._close_focus("Ella Langley")
+        assert worker.store.artist_on_cooldown("Ella Langley") is False
+    finally:
+        worker.close()
+
+
+def test_recent_monitored_artists_come_first_and_a_tag_can_filter(tmp_path):
+    worker = make_worker(tmp_path)
+    store = worker.store
+    try:
+        def add(key, name, added, monitored, tags):
+            store._db.execute(
+                """
+                INSERT INTO wanted_artists(
+                    artist_key, artist, sort_artist, albums, songs,
+                    disabled_albums, disabled_songs, disabled_children, enabled
+                ) VALUES (?, ?, ?, 1, 0, 0, 0, 0, 1)
+                """,
+                (key, name, key),
+            )
+            payload = json.dumps({"added": added, "monitored": monitored, "tags": tags, "title": "Album"})
+            store._db.execute(
+                """
+                INSERT INTO wanted_rows(
+                    key, kind, artist, artist_key, album, enabled, sort_artist, kind_rank, content_hash, payload
+                ) VALUES (?, 'album', ?, ?, 'Album', 1, ?, 1, 'hash', ?)
+                """,
+                (f"album:{key}", name, key, key, payload),
+            )
+
+        add("aaa", "Aaa Old", "2020-01-01", True, ["night"])
+        add("zzz", "Zzz New", "2024-08-01", True, ["day"])
+        store._db.commit()
+        assert store.next_wanted_artist() == "Zzz New"
+        assert store.next_wanted_artist(tag="night") == "Aaa Old"
+        assert store.next_wanted_artist(tag="missing") is None
+    finally:
+        worker.close()
 
 
 def test_search_wait_is_not_reported_as_idle(tmp_path):

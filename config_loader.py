@@ -73,6 +73,8 @@ class Config:
     pause_uploads: bool = False
     auto_import_after_artist: bool = False
     theme: str = "dark"
+    max_albums_per_run: int = 40
+    wanted_tag: str = ""
 
 
 def normalize_theme(value) -> str:
@@ -265,6 +267,8 @@ def default_config(**overrides) -> Config:
         pause_uploads=bool(overrides.pop("pause_uploads", False)),
         auto_import_after_artist=bool(overrides.pop("auto_import_after_artist", False)),
         theme=normalize_theme(overrides.pop("theme", "dark")),
+        max_albums_per_run=int(overrides.pop("max_albums_per_run", 40)),
+        wanted_tag=str(overrides.pop("wanted_tag", "")),
     )
     if overrides:
         cfg = replace(cfg, **overrides)
@@ -322,6 +326,8 @@ def save_config(path: Path, cfg: Config) -> None:
             "[search]",
             f"search_wait_seconds = {cfg.search_wait_seconds}",
             f"max_albums_per_cycle = {int(cfg.max_albums_per_cycle)}",
+            f"max_albums_per_run = {int(cfg.max_albums_per_run)}",
+            f"wanted_tag = {_toml_str(cfg.wanted_tag)}",
             f"focus_one_artist = {_toml_bool(cfg.focus_one_artist)}",
             f"artist_cooldown_days = {cfg.artist_cooldown_days}",
             f"max_missing_pages = {int(cfg.max_missing_pages)}",
@@ -441,6 +447,8 @@ def try_load_config(path: Path) -> Config:
         log_file=log_file,
         search_wait_seconds=float(search.get("search_wait_seconds", 12)),
         max_albums_per_cycle=int(search.get("max_albums_per_cycle", 3)),
+        max_albums_per_run=int(search.get("max_albums_per_run", 40)),
+        wanted_tag=str(search.get("wanted_tag", "") or ""),
         max_tracks_per_cycle=int(search.get("max_tracks_per_cycle", 5)),
         fill_missing_tracks=bool(search.get("fill_missing_tracks", True)),
         focus_one_artist=bool(search.get("focus_one_artist", True)),

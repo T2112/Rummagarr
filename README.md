@@ -1,6 +1,6 @@
 # Rummagarr
 
-**Version 1.10.0** — Windows desktop app. No Docker. No slskd. The GitHub repository is still [T2112/lidarr-soulseek](https://github.com/T2112/lidarr-soulseek).
+**Version 1.11.0** — Windows desktop app. No Docker. No slskd. The GitHub repository is still [T2112/lidarr-soulseek](https://github.com/T2112/lidarr-soulseek).
 
 The worker reads Lidarr **Wanted → Missing**, searches Soulseek, downloads matching albums or individual missing tracks, converts FLAC/WAV to MP3 when needed, asks Lidarr to import and rename, then cleans leftover files.
 
@@ -53,7 +53,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 That installs the Python dependencies and PyInstaller, freezes `desktop_app.py`, and compiles `packaging\LidarrSoulseek.iss` with Inno Setup 6. If Inno Setup is not already installed, the script downloads it. The setup program is written to:
 
 ```text
-dist\Rummagarr-Setup-1.10.0.exe
+dist\Rummagarr-Setup-1.11.0.exe
 ```
 
 The same steps run in GitHub Actions (`.github/workflows/windows-installer.yml`) on `windows-latest`. Pull requests and pushes to `main` upload the installer as a workflow artifact.
@@ -63,6 +63,13 @@ To publish a public download, push a tag `v<version>` that matches the `VERSION`
 This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs on, and Inno Setup is a Windows program. Push the branch and let that workflow produce the `.exe`.
 
 `python main.py` still runs the worker without the window, for the original script install below.
+
+## What's new in 1.11.0
+
+- An album is grabbed in one format, from one user, inside that album's Lidarr quality profile. Results below the cutoff are skipped. Duration helps the match, and a studio cut beats a live or remix cut unless the title asks for it.
+- Soulseek can start a download as soon as a free-slot match arrives. A search that never went out is retried when Soulseek reconnects, without the multi-day artist cooldown.
+- Status no longer says Soulseek is offline while a download is running. The login and server line is behind Details. The last auto-import result, including a Lidarr error, stays until the next artist finishes. A failed import (track count or an unmatched release) is flagged, moved to a Review folder, and the next try uses another user.
+- A large wanted list can be capped per run, with monitored and recently added artists first, and an optional Lidarr tag. Lidarr calls retry on a slow link and say Lidarr unreachable instead of sitting still. Behavior leads with formats, cooldown, wait, and conversion.
 
 ## What's new in 1.10.0
 

@@ -74,6 +74,8 @@ def test_auto_import_waits_for_an_empty_queue_and_runs_once(tmp_path):
         assert worker.activity_view()[0] == "Imported Beyoncé into Lidarr"
         worker.control.start()
         worker.set_step(Step(kind="searching", artist="Next", album="Album"))
+        assert worker.activity_view()[0] == "Imported Beyoncé into Lidarr"
+        worker._finish_artist_visit("Next")
         assert worker.activity_view()[0].startswith("Searching Soulseek")
     finally:
         worker.close()
@@ -127,6 +129,34 @@ def test_auto_import_does_not_block_and_skips_rename_when_lidarr_already_renames
         worker.close()
 
 
+def test_a_failed_import_is_kept_and_moved_aside_for_review(tmp_path):
+    worker = make_worker(tmp_path)
+    scanned: list[str] = []
+    renamed: list[int] = []
+    _wire(worker, scanned, renamed, rename=True)
+    worker.lidarr.import_failures = lambda artist: ["track count mismatch"]
+    folder = worker.cfg.complete_dir / "Adele - 21"
+    folder.mkdir()
+    (folder / "01.flac").write_bytes(b"flac")
+    worker.store.add_completed_download("Adele", "21", "01.flac", "vinylqueen", "album")
+    worker.store.upsert(4, "Adele", "21", "imported", str(folder))
+    try:
+        worker.arm_auto_import("Adele")
+        assert worker._import_thread is not None
+        worker._import_thread.join(2)
+        notice = worker.activity_view()[0]
+        assert notice == "Importing Adele into Lidarr failed: track count mismatch"
+        assert not folder.exists()
+        assert (worker.cfg.complete_dir / "Review" / "Adele - 21" / "01.flac").is_file()
+        assert "vinylqueen" in worker.store.rejected_usernames(artist="Adele")
+        assert worker.store.should_skip(4, 12) is False
+        assert worker.store.get(4)["status"] == "import_failed"
+        worker.set_step(Step(kind="searching", artist="Next", album="Later"))
+        assert worker.activity_view()[0] == notice
+    finally:
+        worker.close()
+
+
 def test_auto_import_failure_is_logged_and_shown(tmp_path, caplog):
     worker = make_worker(tmp_path)
     scanned: list[str] = []
@@ -137,7 +167,7 @@ def test_auto_import_failure_is_logged_and_shown(tmp_path, caplog):
             worker.arm_auto_import("Adele")
             assert worker._import_thread is not None
             worker._import_thread.join(2)
-        assert worker.activity_view()[0] == "Importing Adele into Lidarr failed"
+        assert worker.activity_view()[0] == "Importing Adele into Lidarr failed: lidarr down"
         assert "lidarr down" in caplog.text
         assert renamed == []
     finally:

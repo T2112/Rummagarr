@@ -397,6 +397,13 @@ def test_wait_before_next_artist_is_visible_and_the_behavior_tab_scrolls(tmp_pat
     assert form.save() is True
     assert saved["cfg"].cycle_seconds == 0
 
+    hidden = _label_named(form, "Albums at once")
+    assert hidden.winfo_ismapped() == 0
+    form.advanced_var.set(True)
+    form._toggle_advanced()
+    root.update()
+    assert hidden.winfo_ismapped() == 1
+
     bbox = canvas.bbox("all")
     assert bbox is not None and bbox[3] > canvas.winfo_height()
     canvas.yview_moveto(0)

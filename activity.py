@@ -114,6 +114,8 @@ def describe_step(step: Step) -> str:
         return "Connecting to Soulseek"
     if step.kind == "stopped":
         return "Stopped"
+    if step.kind == "limit":
+        return step.detail or "Album cap for this run reached"
     if step.kind == "error":
         return step.detail or step.title or "Error"
     if step.kind == "paused":
@@ -155,12 +157,29 @@ def step_from_legacy(phase: str, artist: str = "", title: str = "") -> Step:
     )
 
 
+_TERMINAL_TRANSFER = {"COMPLETE", "FAILED", "ABORTED"}
+_DOWN_WORDS = ("offline", "session is down", "not responding")
+
+
+def _downloads_are_running(snapshot: dict) -> bool:
+    for item in snapshot.get("transfers") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("state") or "") not in _TERMINAL_TRANSFER:
+            return True
+    activity = str(snapshot.get("activity") or "").casefold()
+    return activity.startswith("downloading")
+
+
 def format_status_line(snapshot: dict) -> str:
     labels = {"running": "Running", "paused": "Paused", "stopped": "Stopped"}
     state = labels.get(snapshot.get("run_state") or "stopped", "Stopped")
     connected = snapshot.get("connected_label") or (
         "Soulseek connected" if snapshot.get("logged_in") else "Soulseek offline"
     )
+    # A transfer already in progress is not "Soulseek offline".
+    if _downloads_are_running(snapshot) and any(word in connected.casefold() for word in _DOWN_WORDS):
+        connected = ""
     if snapshot.get("activity"):
         activity = str(snapshot.get("activity"))
     else:

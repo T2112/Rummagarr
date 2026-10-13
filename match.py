@@ -10,7 +10,12 @@ from pathlib import Path
 from aioslsk.protocol.primitives import AttributeKey
 
 AUDIO_EXT = {".flac", ".mp3", ".wav", ".aiff", ".aif", ".ogg", ".opus", ".m4a", ".ape", ".wv"}
+LOSSLESS_EXT = frozenset({"flac", "wav", "aiff", "aif", "ape", "wv", "alac"})
+_LOSSY_EXT = frozenset({"mp3", "m4a", "aac", "ogg", "opus"})
 _MAX_ALIASES = 3
+# A Lidarr duration at or above this is milliseconds. Soulseek reports seconds.
+_MS_DURATION = 10000
+_EDITION = re.compile(r"\b(live|remix|remixed|rmx|concert)\b", re.IGNORECASE)
 
 # Quotes and dashes that should compare equal before the rest of the punctuation is dropped.
 _PUNCT = str.maketrans(
@@ -93,6 +98,226 @@ def bitrate_of(item) -> int:
         return 0
 
 
+def duration_of(item) -> float:
+    """Soulseek duration in seconds. 0 when the result does not say."""
+    try:
+        attrs = item.get_attribute_map()
+        raw = float(attrs.get(AttributeKey.DURATION) or 0)
+    except Exception:
+        return 0.0
+    if raw >= _MS_DURATION:
+        return raw / 1000.0
+    return raw if raw > 0 else 0.0
+
+
+def seconds_from_lidarr(value) -> float:
+    """Lidarr track length. Values of 10000 or more are milliseconds."""
+    try:
+        raw = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if raw >= _MS_DURATION:
+        return raw / 1000.0
+    return raw if raw > 0 else 0.0
+
+
+def _bitrate_rank(bitrate: int) -> int:
+    if bitrate >= 320:
+        return 60
+    if bitrate >= 256:
+        return 50
+    if bitrate >= 192:
+        return 40
+    if bitrate >= 160:
+        return 30
+    if bitrate >= 128:
+        return 20
+    if bitrate > 0:
+        return 10
+    return 0
+
+
+def rank_from_quality_name(name: str) -> int:
+    text = (name or "").casefold().replace(" ", "").replace("_", "")
+    if any(word in text for word in ("flac", "alac", "wav", "aiff", "ape")):
+        return 100
+    if "320" in text or text.endswith("v0"):
+        return 60
+    if "256" in text or "v2" in text:
+        return 50
+    if "192" in text:
+        return 40
+    if "160" in text:
+        return 30
+    if "128" in text:
+        return 20
+    if "96" in text or "096" in text:
+        return 10
+    return 0
+
+
+def file_quality_rank(item) -> int | None:
+    """Rank of a file. None when an MP3 did not report a bitrate."""
+    ext = extension(getattr(item, "filename", "") or "")
+    if ext in LOSSLESS_EXT:
+        return 100
+    if ext == "mp3":
+        rate = bitrate_of(item)
+        if rate <= 0:
+            return None
+        return _bitrate_rank(rate)
+    if ext in _LOSSY_EXT:
+        return 40
+    return 0
+
+
+@dataclass(frozen=True)
+class QualityGate:
+    """Which files an album's Lidarr profile still allows."""
+
+    name: str
+    extensions: frozenset[str]
+    cutoff_rank: int
+
+
+def gate_from_profile(profile: dict | None, preferred: list[str], min_mp3_bitrate: int) -> QualityGate:
+    """Any, Lossless, or Standard. Other profile names follow the cutoff.
+
+    ``preferred`` is the user's format order. It picks the one format inside
+    the extensions this profile still allows.
+    """
+    name = str((profile or {}).get("name") or "Any").strip()
+    folded = name.casefold() or "any"
+    audio = frozenset(ext.lstrip(".") for ext in AUDIO_EXT)
+    cutoff = _cutoff_rank(profile)
+    if folded == "lossless":
+        extensions = LOSSLESS_EXT
+        cutoff = max(cutoff, 100)
+    elif folded == "standard":
+        extensions = _LOSSY_EXT
+        cutoff = max(cutoff, _bitrate_rank(int(min_mp3_bitrate or 0)) or 60)
+    else:
+        extensions = audio
+        folded = "any"
+    if cutoff >= 100:
+        extensions = frozenset(ext for ext in extensions if ext in LOSSLESS_EXT) or LOSSLESS_EXT
+    if not preferred and not extensions:
+        extensions = audio
+    return QualityGate(name=folded, extensions=extensions, cutoff_rank=cutoff)
+
+
+def _cutoff_rank(profile: dict | None) -> int:
+    if not isinstance(profile, dict):
+        return 0
+    cutoff_id = profile.get("cutoff")
+    for item in profile.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        quality = item.get("quality") if isinstance(item.get("quality"), dict) else {}
+        if cutoff_id is not None and quality.get("id") == cutoff_id:
+            return rank_from_quality_name(str(quality.get("name") or ""))
+    return 0
+
+
+def file_allowed(item, gate: QualityGate | None) -> bool:
+    if gate is None:
+        return True
+    ext = extension(getattr(item, "filename", "") or "")
+    if ext not in gate.extensions:
+        return False
+    rank = file_quality_rank(item)
+    if gate.cutoff_rank <= 0:
+        return True
+    if rank is None:
+        # An MP3 with no bitrate is below a lossless cutoff, and otherwise kept
+        # for the bitrate check the caller already applies.
+        return gate.cutoff_rank < 100
+    return rank >= gate.cutoff_rank
+
+
+def choose_one_format(files: list, preferred: list[str]) -> list:
+    """One extension for the album. Preferred order, then the largest group."""
+    grouped: dict[str, list] = defaultdict(list)
+    for item in files:
+        grouped[extension(getattr(item, "filename", "") or "")].append(item)
+    if not grouped:
+        return []
+    for pref in preferred:
+        token = pref.lower().lstrip(".")
+        if grouped.get(token):
+            return grouped[token]
+    return max(grouped.values(), key=len)
+
+
+def tag_labels(record: dict | None) -> list[str]:
+    labels: list[str] = []
+    if not isinstance(record, dict):
+        return labels
+    sources = [record.get("tags")]
+    artist = record.get("artist")
+    if isinstance(artist, dict):
+        sources.append(artist.get("tags"))
+    for source in sources:
+        if isinstance(source, str):
+            source = [source]
+        if not isinstance(source, list):
+            continue
+        for item in source:
+            if isinstance(item, str) and item.strip():
+                labels.append(item.strip())
+            elif isinstance(item, dict):
+                label = str(item.get("label") or item.get("name") or "").strip()
+                if label:
+                    labels.append(label)
+    return labels
+
+
+def album_has_tag(album: dict, tag: str) -> bool:
+    wanted = (tag or "").casefold().strip()
+    if not wanted:
+        return True
+    return wanted in {label.casefold() for label in tag_labels(album)}
+
+
+def album_priority_key(album: dict) -> tuple:
+    """Monitored albums first, then the most recently added, then the name."""
+    added = str(album.get("added") or "")
+    inverted = "".join(chr(ord("9") - ord(ch)) if ch.isdigit() else ch for ch in added) if added else "~"
+    artist = ""
+    nested = album.get("artist")
+    if isinstance(nested, dict):
+        artist = str(nested.get("artistName") or "")
+    artist = artist or str(album.get("artistName") or "")
+    return (
+        0 if album.get("monitored", True) else 1,
+        inverted,
+        artist.casefold(),
+        str(album.get("title") or "").casefold(),
+    )
+
+
+def _duration_bonus(files: list, expected: list[float] | None) -> float:
+    wanted = [seconds for seconds in (expected or []) if seconds and seconds > 0]
+    if not wanted:
+        return 0.0
+    got = [duration_of(item) for item in files]
+    got = [seconds for seconds in got if seconds > 0]
+    if not got:
+        return 0.0
+    hits = 0
+    for seconds in wanted:
+        slack = max(8.0, seconds * 0.12)
+        if any(abs(have - seconds) <= slack for have in got):
+            hits += 1
+    return 6.0 * hits / len(wanted)
+
+
+def _studio_penalty(blob: str, wanted: str) -> float:
+    if _EDITION.search(blob or "") and not _EDITION.search(wanted or ""):
+        return 14.0
+    return 0.0
+
+
 @dataclass
 class FolderCandidate:
     username: str
@@ -100,6 +325,7 @@ class FolderCandidate:
     files: list = field(default_factory=list)
     score: float = 0.0
     reason: str = ""
+    free_slot: bool = False
 
 
 def aliases_from_album(album: dict | None) -> list[str]:
@@ -193,29 +419,49 @@ def score_folder(
     min_filename_ratio: float,
     track_count_tolerance: int,
     min_mp3_bitrate: int,
+    *,
+    durations: list[float] | None = None,
+    gate: QualityGate | None = None,
 ) -> FolderCandidate:
-    audio = [f for f in candidate.files if extension(f.filename) in AUDIO_EXT or extension(f.filename) in preferred_extensions]
+    prefs = [item.lower().lstrip(".") for item in preferred_extensions]
+    known_audio = {item.lstrip(".") for item in AUDIO_EXT}
+    audio = [item for item in candidate.files if extension(item.filename) in known_audio or extension(item.filename) in prefs]
     if not audio:
         candidate.reason = "no audio"
+        candidate.score = 0
         return candidate
+    if gate is None:
+        allowed = [item for item in audio if extension(item.filename) in prefs] if prefs else audio
+        rejected_reason = f"unwanted types {sorted({extension(item.filename) for item in audio})}"
+    else:
+        allowed = [item for item in audio if file_allowed(item, gate)]
+        rejected_reason = "below quality cutoff"
+    if not allowed:
+        candidate.reason = rejected_reason
+        candidate.score = 0
+        return candidate
+    # One user already owns this folder. Keep one format so MP3 and FLAC are not mixed.
+    audio = choose_one_format(allowed, prefs)
     exts = {extension(f.filename) for f in audio}
     ext_rank = 0
     for i, pref in enumerate(preferred_extensions):
-        if pref in exts:
+        if pref.lower().lstrip(".") in exts:
             ext_rank = len(preferred_extensions) - i
             break
-    if ext_rank == 0:
-        candidate.reason = f"unwanted types {sorted(exts)}"
-        return candidate
-    if "mp3" in exts and "flac" not in exts:
+    if ext_rank == 0 and preferred_extensions:
+        # The profile allowed a type the user did not list. Still take that one format.
+        ext_rank = 1
+    if "mp3" in exts:
         rates = [bitrate_of(f) for f in audio if extension(f.filename) == "mp3"]
         rates = [r for r in rates if r > 0]
         if rates and max(rates) < min_mp3_bitrate:
             candidate.reason = f"mp3 bitrate {max(rates)} < {min_mp3_bitrate}"
+            candidate.score = 0
             return candidate
     expected = len(track_titles) or 0
     if expected and abs(len(audio) - expected) > track_count_tolerance:
         candidate.reason = f"track count {len(audio)} vs {expected}"
+        candidate.score = 0
         return candidate
     names = [Path(basename(f.filename)).stem for f in audio]
     if track_titles:
@@ -226,6 +472,7 @@ def score_folder(
         title_score = hits / max(len(track_titles), 1)
         if title_score < 0.4:
             candidate.reason = f"title match {title_score:.2f}"
+            candidate.score = 0
             return candidate
     else:
         title_score = 0.5
@@ -234,9 +481,18 @@ def score_folder(
     artist_hit = similarity(artist, folder_blob)
     if album_hit < 0.25 and artist_hit < 0.2 and title_score < 0.7:
         candidate.reason = "folder does not look like the album"
+        candidate.score = 0
         return candidate
+    wanted = " ".join([album, *track_titles])
+    blob = " ".join([candidate.remote_dir, *names])
+    penalty = _studio_penalty(blob, wanted)
+    bonus = _duration_bonus(audio, durations)
+    free = 4.0 if candidate.free_slot else 0.0
     candidate.files = audio
-    candidate.score = ext_rank * 10 + title_score * 8 + album_hit * 3 + artist_hit * 2 + min(len(audio), expected or len(audio)) * 0.1
+    candidate.score = max(
+        1.0,
+        ext_rank * 10 + title_score * 8 + album_hit * 3 + artist_hit * 2 + min(len(audio), expected or len(audio)) * 0.1 + bonus + free - penalty,
+    )
     candidate.reason = "ok"
     return candidate
 
@@ -279,13 +535,18 @@ def build_track_queries(
 def score_track_item(
     item, username: str, artist: str, album: str, track: str,
     preferred_extensions: list[str], min_filename_ratio: float, min_mp3_bitrate: int,
+    *,
+    expected_duration: float = 0.0,
+    gate: QualityGate | None = None,
 ) -> tuple[float, str]:
     filename = getattr(item, "filename", "") or ""
     ext = extension(filename).lstrip(".")
     audio = {item.lstrip(".") for item in AUDIO_EXT}
     if ext not in audio:
         return 0.0, "not audio"
-    if preferred_extensions and ext not in preferred_extensions:
+    if gate is not None and not file_allowed(item, gate):
+        return 0.0, "below quality cutoff"
+    if gate is None and preferred_extensions and ext not in preferred_extensions:
         return 0.0, f"unwanted type {ext}"
     name = Path(basename(filename)).stem
     title_hit = similarity(track, name)
@@ -300,10 +561,23 @@ def score_track_item(
             return 0.0, f"mp3 bitrate {rate} < {min_mp3_bitrate}"
     ext_rank = 0
     for i, pref in enumerate(preferred_extensions):
-        if pref == ext:
+        if pref.lower().lstrip(".") == ext:
             ext_rank = len(preferred_extensions) - i
             break
-    return ext_rank * 10 + title_hit * 12 + album_hit * 3 + artist_hit * 2, "ok"
+    if ext_rank == 0 and gate is not None:
+        ext_rank = 1
+    duration_bonus = 0.0
+    if expected_duration and expected_duration > 0:
+        got = duration_of(item)
+        if got > 0:
+            slack = max(8.0, expected_duration * 0.12)
+            if abs(got - expected_duration) <= slack:
+                duration_bonus = 6.0
+            else:
+                duration_bonus = -4.0
+    penalty = _studio_penalty(f"{filename} {name}", f"{album} {track}")
+    score = max(1.0, ext_rank * 10 + title_hit * 12 + album_hit * 3 + artist_hit * 2 + duration_bonus - penalty)
+    return score, "ok"
 
 
 def group_results(results, ignored_users: set[str]) -> list[FolderCandidate]:
@@ -319,9 +593,12 @@ def group_results(results, ignored_users: set[str]) -> list[FolderCandidate]:
             if not filename:
                 continue
             by_dir[parent_dir(filename)].append(item)
+        free = bool(getattr(result, "has_free_slots", False) or getattr(result, "free_slot", False))
         for remote_dir, files in by_dir.items():
             key = (username, remote_dir)
             if key not in buckets:
                 buckets[key] = FolderCandidate(username=username, remote_dir=remote_dir, files=[])
             buckets[key].files.extend(files)
+            if free or any(getattr(item, "free_slot", False) for item in files):
+                buckets[key].free_slot = True
     return list(buckets.values())

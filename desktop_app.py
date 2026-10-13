@@ -600,7 +600,7 @@ class BehaviorField:
 
 
 BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
-    BehaviorField("focus_one_artist", "One artist at a time", "bool", "", "Stay on a single artist, then move on."),
+    BehaviorField("preferred_extensions", "Formats, in order", "csv", "", "Tried in this order. One format is used per album. Example: mp3, flac, wav."),
     BehaviorField(
         "artist_cooldown_days",
         "Artist retry period",
@@ -619,6 +619,25 @@ BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
         0,
         7200,
     ),
+    BehaviorField("convert_to_mp3", "Convert to MP3", "bool", "", "Convert FLAC and WAV to MP3 with ffmpeg before Lidarr imports them."),
+    BehaviorField("convert_bitrate", "Convert bitrate", "int", "kbps", "Bitrate ffmpeg uses for the MP3.", 128, 320),
+    BehaviorField(
+        "max_albums_per_run",
+        "Albums per run",
+        "int",
+        "albums",
+        "Stop starting new album searches after this many since Start. 0 does not cap the run. Recently added and monitored albums go first.",
+        0,
+        5000,
+    ),
+    BehaviorField(
+        "wanted_tag",
+        "Only this Lidarr tag",
+        "text",
+        "",
+        "Leave blank to search every wanted artist. Otherwise only artists with this tag are searched. Sync Wanted again after changing tags in Lidarr.",
+    ),
+    BehaviorField("focus_one_artist", "One artist at a time", "bool", "", "Stay on a single artist, then move on."),
     BehaviorField("concurrent_albums", "Albums at once", "int", "", "How many albums to search or download together. 1 is one after another.", 1, 8),
     BehaviorField(
         "lidarr_track_concurrency",
@@ -637,10 +656,7 @@ BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
     BehaviorField("retry_hours", "Retry a miss after", "int", "hours", "How long to wait before searching again for an album or song that did not match.", 0, 168),
     BehaviorField("min_filename_ratio", "Filename match", "float", "0–1", "How close a filename must be to the Lidarr title. Higher is stricter.", 0.2, 0.95),
     BehaviorField("track_count_tolerance", "Track count slack", "int", "tracks", "How many extra or missing files an album folder may have.", 0, 15),
-    BehaviorField("preferred_extensions", "Formats, in order", "csv", "", "Tried in this order. Example: mp3, flac, wav."),
     BehaviorField("min_mp3_bitrate", "Minimum MP3 bitrate", "int", "kbps", "Reject MP3s below this bitrate when Soulseek reports one.", 96, 320),
-    BehaviorField("convert_to_mp3", "Convert to MP3", "bool", "", "Convert FLAC and WAV to MP3 with ffmpeg before Lidarr imports them."),
-    BehaviorField("convert_bitrate", "Convert bitrate", "int", "kbps", "Bitrate ffmpeg uses for the MP3.", 128, 320),
     BehaviorField("delete_sources_after_import", "Delete source after import", "bool", "", "Remove the original FLAC or WAV from Incomplete after Lidarr is asked to import the MP3."),
     BehaviorField("clean_incomplete_on_fail", "Clean up failed downloads", "bool", "", "Delete leftover files in Incomplete when a download fails or is cancelled."),
     BehaviorField("incomplete_max_age_hours", "Delete old Incomplete files", "float", "hours", "Also delete Incomplete files older than this. 0 turns the sweep off.", 0, 168),
@@ -652,6 +668,17 @@ BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
     BehaviorField("state_db", "Database file", "text", "", "SQLite file for progress and wanted checkboxes. Restart to apply.", restore=False),
     BehaviorField("log_file", "Log file", "text", "", "Where the worker writes its log. Restart to apply.", restore=False),
 )
+
+_PRIMARY_BEHAVIOR = frozenset(
+    {
+        "preferred_extensions",
+        "artist_cooldown_days",
+        "cycle_seconds",
+        "convert_to_mp3",
+        "convert_bitrate",
+    }
+)
+
 
 _RESTART_FIELDS = frozenset(
     {
@@ -968,7 +995,7 @@ class SettingsForm(ttk.Frame):
         )
         ttk.Label(
             parent,
-            text="Search limits, conversion, the status page, and the update check are on the Behavior tab. Uploads are on Sharing.",
+            text="Formats, the artist retry period, the wait before the next artist, and conversion are at the top of Behavior. Everything else is under Advanced. Uploads are on Sharing.",
             style="Muted.TLabel",
             wraplength=760,
         ).grid(row=13, column=0, columnspan=3, sticky="w", pady=(12, 0))
@@ -1016,9 +1043,27 @@ class SettingsForm(ttk.Frame):
                 wraplength=720,
             ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8))
             row += 1
-        for spec in BEHAVIOR_FIELDS:
+        primary = [spec for spec in BEHAVIOR_FIELDS if spec.key in _PRIMARY_BEHAVIOR]
+        advanced = [spec for spec in BEHAVIOR_FIELDS if spec.key not in _PRIMARY_BEHAVIOR]
+        for spec in primary:
             self._behavior_row(inner, row, spec)
             row += 2
+        self.advanced_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            inner,
+            text="Advanced",
+            variable=self.advanced_var,
+            command=self._toggle_advanced,
+        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(12, 4))
+        row += 1
+        self._advanced_frame = ttk.Frame(inner)
+        self._advanced_frame.grid(row=row, column=0, columnspan=3, sticky="ew")
+        advanced_row = 0
+        for spec in advanced:
+            self._behavior_row(self._advanced_frame, advanced_row, spec)
+            advanced_row += 2
+        self._advanced_frame.columnconfigure(1, weight=1)
+        self._advanced_frame.grid_remove()
         inner.columnconfigure(1, weight=1)
         # Bind the wheel on every field. Enter/Leave on the canvas unbinds as
         # soon as the pointer moves onto this inner frame, which is the whole
@@ -1230,6 +1275,18 @@ class SettingsForm(ttk.Frame):
         ttk.Label(parent, text=spec.help, style="Muted.TLabel", wraplength=720).grid(
             row=row + 1, column=0, columnspan=3, sticky="w", pady=(0, 2)
         )
+
+    def _toggle_advanced(self) -> None:
+        frame = getattr(self, "_advanced_frame", None)
+        if frame is None:
+            return
+        if self.advanced_var.get():
+            frame.grid()
+        else:
+            frame.grid_remove()
+        canvas = self._behavior_canvas
+        if canvas is not None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
 
     def _bind_behavior_wheel(self, widget: tk.Misc) -> None:
         if isinstance(widget, (tk.Scrollbar, ttk.Scrollbar)):
@@ -2091,6 +2148,13 @@ class DesktopApp(tk.Tk):
         text_col.pack(side="left", fill="x", expand=True)
         self.status_line = ttk.Label(text_col, text="Stopped · Soulseek offline · Stopped", style="Banner.TLabel")
         self.status_line.pack(anchor="w", fill="x")
+        self.details_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            status_row,
+            text="Details",
+            variable=self.details_var,
+            command=self.refresh_status,
+        ).pack(side="right")
         self.session_line = ttk.Label(text_col, text="", style="CardMuted.TLabel", wraplength=self.px(980), justify="left")
         self.session_line.pack(anchor="w", fill="x", pady=(self.px(2), 0))
         self.notice_line = ttk.Label(parent, textvariable=self.notice_var, style="Muted.TLabel")
@@ -2360,7 +2424,10 @@ class DesktopApp(tk.Tk):
         snapshot = self.worker.ui_snapshot(recent_limit=limit)
         self.status_line.configure(text=format_status_line(snapshot))
         if getattr(self, "session_line", None) is not None:
-            self.session_line.configure(text=str(snapshot.get("soulseek_detail") or ""))
+            detail = ""
+            if getattr(self, "details_var", None) is not None and self.details_var.get():
+                detail = str(snapshot.get("soulseek_detail") or "")
+            self.session_line.configure(text=detail)
         self._paint_activity_dot(bool(snapshot.get("busy")))
         self._refresh_open_search_states()
         state = snapshot.get("run_state") or "stopped"

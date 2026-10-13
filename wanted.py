@@ -589,7 +589,10 @@ def slim_album(album: dict) -> dict:
     aliases = artist.get("aliases")
     if aliases:
         slim_artist["aliases"] = aliases
-    return {
+    tags = _tag_labels(album.get("tags")) + _tag_labels(artist.get("tags"))
+    if tags:
+        slim_artist["tags"] = tags
+    slim = {
         "id": album.get("id"),
         "title": album.get("title"),
         "artistId": album.get("artistId") or slim_artist.get("id"),
@@ -597,11 +600,33 @@ def slim_album(album: dict) -> dict:
         "releaseDate": album.get("releaseDate"),
         "statistics": album.get("statistics") if isinstance(album.get("statistics"), dict) else {},
         "monitored": album.get("monitored", True),
+        "added": album.get("added") or "",
     }
+    if album.get("qualityProfileId") is not None:
+        slim["qualityProfileId"] = album.get("qualityProfileId")
+    if tags:
+        slim["tags"] = tags
+    return slim
+
+
+def _tag_labels(source) -> list[str]:
+    if isinstance(source, str):
+        source = [source]
+    if not isinstance(source, list):
+        return []
+    labels: list[str] = []
+    for item in source:
+        if isinstance(item, str) and item.strip():
+            labels.append(item.strip())
+        elif isinstance(item, dict):
+            label = str(item.get("label") or item.get("name") or "").strip()
+            if label:
+                labels.append(label)
+    return labels
 
 
 def slim_track(track: dict) -> dict:
-    return {
+    slim = {
         "id": track.get("id"),
         "title": track.get("title"),
         "trackNumber": track.get("trackNumber"),
@@ -609,6 +634,9 @@ def slim_track(track: dict) -> dict:
         "monitored": track.get("monitored", True),
         "hasFile": bool(track.get("hasFile")),
     }
+    if track.get("duration"):
+        slim["duration"] = track.get("duration")
+    return slim
 
 
 def _sort_position(value, *, empty_last: bool = True) -> str:
