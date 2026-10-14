@@ -232,20 +232,27 @@ def test_import_resyncs_that_artist_before_the_next_search(tmp_path):
         worker.close()
 
 
-def test_the_worker_waits_for_the_import_resync_before_moving_on(tmp_path):
+def test_the_worker_searches_during_the_scan_and_waits_for_the_resync(tmp_path):
     import asyncio
 
     worker = make_worker(tmp_path)
     started = threading.Event()
     release = threading.Event()
+    resync_started = threading.Event()
+    release_resync = threading.Event()
     worker.cfg = replace(worker.cfg, auto_import_after_artist=True)
-    worker.lidarr.artist_library = lambda name: {"artist_id": 9, "albums": [], "tracks": []}
+
+    def library(name):
+        resync_started.set()
+        assert release_resync.wait(2)
+        return {"artist_id": 9, "albums": [], "tracks": []}
 
     def scan(path):
         started.set()
         assert release.wait(2)
         return {"name": "DownloadedAlbumsScan"}
 
+    worker.lidarr.artist_library = library
     worker.lidarr.scan_downloaded = scan
     worker.lidarr.renames_on_import = lambda: True
     worker.control.start()
@@ -253,17 +260,26 @@ def test_the_worker_waits_for_the_import_resync_before_moving_on(tmp_path):
         worker.arm_auto_import("Adele")
         assert started.wait(1)
 
-        async def wait() -> None:
+        async def during_scan() -> None:
             task = asyncio.create_task(worker._wait_for_import())
-            await asyncio.sleep(0.3)
+            await asyncio.wait_for(task, 1)
+
+        asyncio.run(during_scan())
+        release.set()
+        assert resync_started.wait(2)
+
+        async def during_resync() -> None:
+            task = asyncio.create_task(worker._wait_for_import())
+            await asyncio.sleep(0.2)
             assert not task.done()
-            release.set()
+            release_resync.set()
             await asyncio.wait_for(task, 2)
 
-        asyncio.run(wait())
+        asyncio.run(during_resync())
         assert worker._import_thread is None or not worker._import_thread.is_alive()
     finally:
         release.set()
+        release_resync.set()
         worker.close()
 
 

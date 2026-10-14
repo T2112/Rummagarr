@@ -1,2 +1,3 @@
 aioslsk>=1.6.3
 httpx>=0.27.0
+mutagen>=1.47.0

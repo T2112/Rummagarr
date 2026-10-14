@@ -104,10 +104,17 @@ def describe_step(step: Step) -> str:
             if who:
                 return f"Starting the next artist ({who})"
             return "Starting the next artist"
+        if step.retry_kind == "day":
+            cap = step.detail or "Album cap reached"
+            return f"{cap}. Next search in {format_span(remaining)}"
         if step.retry_kind == "artist":
             name = who or "the next artist"
-            return f"Waiting for artist retry period ({name} in {format_span(remaining)})"
-        return f"Waiting for retry period (next artist in {format_span(remaining)})"
+            text = f"Waiting for artist retry period ({name} in {format_span(remaining)})"
+        else:
+            text = f"Waiting for retry period (next artist in {format_span(remaining)})"
+        if step.detail and step.retry_kind != "day":
+            return f"{text} · {step.detail}"
+        return text
     if step.kind == "preparing":
         return f"Choosing the next album · {who}" if who else "Choosing the next album"
     if step.kind == "connecting":
@@ -115,7 +122,9 @@ def describe_step(step: Step) -> str:
     if step.kind == "stopped":
         return "Stopped"
     if step.kind == "limit":
-        return step.detail or "Album cap for this run reached"
+        return step.detail or "Album cap reached. Next search is tomorrow."
+    if step.kind == "skip":
+        return step.detail or (f"Skipped {who}" if who else "Skipped")
     if step.kind == "error":
         return step.detail or step.title or "Error"
     if step.kind == "paused":

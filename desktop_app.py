@@ -16,6 +16,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from activity import format_status_line
+from changelog_notes import ChangelogError, changelog_section
 from config_loader import (
     Config,
     ConfigError,
@@ -656,7 +657,7 @@ BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
         "Albums per run",
         "int",
         "albums",
-        "Stop starting new album searches after this many since Start. 0 does not cap the run. Recently added and monitored albums go first.",
+        "Pause new album searches after this many real searches, until the next day. 0 does not cap the run. Skipped albums are not counted.",
         0,
         5000,
     ),
@@ -697,6 +698,17 @@ BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
     BehaviorField("check_updates", "Check for updates on launch", "bool", "", "Look for a newer GitHub Release when the app opens."),
     BehaviorField("state_db", "Database file", "text", "", "SQLite file for progress and wanted checkboxes. Restart to apply.", restore=False),
     BehaviorField("log_file", "Log file", "text", "", "Where the worker writes its log. Restart to apply.", restore=False),
+    BehaviorField(
+        "follow_metadata_profile",
+        "Follow Lidarr metadata profile",
+        "bool",
+        "",
+        "When this is on, a live, compilation, single, or bootleg album is searched when that artist's Lidarr metadata profile allows it.",
+    ),
+    BehaviorField("allow_live", "Include live albums", "bool", "", "Search live albums even when the metadata profile does not list them."),
+    BehaviorField("allow_compilation", "Include compilations", "bool", "", "Search compilation albums even when the metadata profile does not list them."),
+    BehaviorField("allow_single", "Include singles", "bool", "", "Search singles even when the metadata profile does not list them."),
+    BehaviorField("allow_bootleg", "Include bootlegs", "bool", "", "Search bootlegs even when the metadata profile does not list them."),
 )
 
 _PRIMARY_BEHAVIOR = frozenset(
@@ -963,12 +975,15 @@ class SettingsForm(ttk.Frame):
         connection = ttk.Frame(self.notebook, padding=12)
         behavior = ttk.Frame(self.notebook, padding=(4, 8, 4, 4))
         sharing = ttk.Frame(self.notebook, padding=12)
+        blocked = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(connection, text="Connection")
         self.notebook.add(behavior, text="Behavior")
         self.notebook.add(sharing, text="Sharing")
+        self.notebook.add(blocked, text="Blocklist")
         self._build_connection(connection)
         self._build_behavior(behavior)
         self._build_sharing(sharing)
+        self._build_blocklist(blocked)
         ttk.Label(self, textvariable=self.message_var, wraplength=900).grid(row=4, column=0, sticky="w", pady=(8, 4))
         buttons = ttk.Frame(self)
         buttons.grid(row=5, column=0, sticky="w")
@@ -1107,6 +1122,66 @@ class SettingsForm(ttk.Frame):
             return "File counts appear after a rescan while the worker is running."
         folders, files = getattr(worker, "share_counts", (0, 0))
         return f"Indexed {folders} folders and {files} files. Rescan after changing the list."
+
+    def _build_blocklist(self, parent: ttk.Frame) -> None:
+        ttk.Label(
+            parent,
+            text="Users and folders that failed, timed out, or looked like a fake FLAC. They are skipped on the next search.",
+            style="Muted.TLabel",
+            wraplength=860,
+        ).pack(anchor="w")
+        frame = ttk.Frame(parent)
+        frame.pack(fill="both", expand=True, pady=(8, 0))
+        columns = ("user", "folder", "reason", "when")
+        self.block_tree = ttk.Treeview(frame, columns=columns, show="headings", height=12)
+        for key, heading, width in (
+            ("user", "User", 160),
+            ("folder", "Folder", 280),
+            ("reason", "Reason", 280),
+            ("when", "When", 180),
+        ):
+            self.block_tree.heading(key, text=heading)
+            self.block_tree.column(key, width=width, anchor="w")
+        self.block_tree.pack(side="left", fill="both", expand=True)
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.block_tree.yview)
+        scroll.pack(side="right", fill="y")
+        self.block_tree.configure(yscrollcommand=scroll.set)
+        buttons = ttk.Frame(parent)
+        buttons.pack(anchor="w", pady=(8, 0))
+        ttk.Button(buttons, text="Remove selected", command=self._remove_block).pack(side="left")
+        ttk.Button(buttons, text="Clear blocklist", command=self._clear_blocklist).pack(side="left", padx=(8, 0))
+        self._fill_blocklist()
+
+    def _fill_blocklist(self) -> None:
+        tree = getattr(self, "block_tree", None)
+        if tree is None or self.store is None:
+            return
+        tree.delete(*tree.get_children())
+        for row in self.store.blocklist_rows():
+            tree.insert(
+                "",
+                "end",
+                iid=str(row["id"]),
+                values=(row["username"], row["folder"], row["reason"], row["created_at"]),
+            )
+
+    def _remove_block(self) -> None:
+        if self.store is None or not getattr(self, "block_tree", None):
+            return
+        for item in self.block_tree.selection():
+            try:
+                self.store.clear_block(int(item))
+            except ValueError:
+                continue
+        self._fill_blocklist()
+
+    def _clear_blocklist(self) -> None:
+        if self.store is None:
+            return
+        if not messagebox.askyesno("Clear blocklist", "Remove every blocked user and folder?", parent=self):
+            return
+        self.store.clear_blocklist()
+        self._fill_blocklist()
 
     def _build_sharing(self, parent: ttk.Frame) -> None:
         ttk.Label(
@@ -1519,6 +1594,24 @@ class SettingsForm(ttk.Frame):
         return True
 
 
+def _update_notes(status: UpdateStatus) -> str:
+    """The changelog section for this release, without the installer instructions that follow it."""
+    raw = (status.notes or "").strip()
+    section = raw
+    if status.latest and raw:
+        try:
+            section = changelog_section(raw, status.latest)
+        except ChangelogError:
+            section = raw
+    kept = []
+    for line in section.splitlines():
+        if line.startswith("Windows installer for Rummagarr"):
+            break
+        kept.append(line)
+    shown = "\n".join(kept).strip()
+    return shown or "No release notes were published."
+
+
 class UpdatePrompt(tk.Toplevel):
     """Newer release: install it, ask again later, or skip this version."""
 
@@ -1544,18 +1637,20 @@ class UpdatePrompt(tk.Toplevel):
                 "Open the release page to download it."
             )
         ttk.Label(frame, text=detail, style="Muted.TLabel", wraplength=490).pack(anchor="w", pady=(6, 8))
+        ttk.Label(frame, text="What's new").pack(anchor="w")
+        palette = active_palette(self)
         notes = tk.Text(
             frame,
             height=8,
             wrap="word",
             relief="flat",
-            background="#1c1c1c",
-            foreground="#eeeeee",
-            insertbackground="#eeeeee",
+            background=palette.field,
+            foreground=palette.fg,
+            insertbackground=palette.fg,
             highlightthickness=0,
         )
-        notes.pack(fill="both", expand=True)
-        notes.insert("1.0", status.notes or "No release notes were published.")
+        notes.pack(fill="both", expand=True, pady=(4, 0))
+        notes.insert("1.0", _update_notes(status))
         notes.configure(state="disabled")
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=(12, 0))
@@ -2197,6 +2292,9 @@ class DesktopApp(tk.Tk):
         self.session_line.pack(anchor="w", fill="x", pady=(self.px(2), 0))
         self.notice_line = ttk.Label(parent, textvariable=self.notice_var, style="Muted.TLabel")
         self.notice_line.pack(fill="x", pady=(self.px(6), 0))
+        self.summary_var = tk.StringVar(value="")
+        self.summary_line = ttk.Label(parent, textvariable=self.summary_var, style="Muted.TLabel")
+        self.summary_line.pack(fill="x", pady=(self.px(2), 0))
         self.auto_import_var = tk.BooleanVar(value=bool(self.worker.cfg.auto_import_after_artist))
         self.auto_import = ttk.Checkbutton(
             parent,
@@ -2469,6 +2567,8 @@ class DesktopApp(tk.Tk):
             if getattr(self, "details_var", None) is not None and self.details_var.get():
                 detail = str(snapshot.get("soulseek_detail") or "")
             self.session_line.configure(text=detail)
+        if getattr(self, "summary_var", None) is not None:
+            self.summary_var.set(str(snapshot.get("run_summary") or ""))
         self._paint_activity_dot(bool(snapshot.get("busy")))
         self._refresh_open_search_states()
         state = snapshot.get("run_state") or "stopped"

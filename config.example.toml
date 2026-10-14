@@ -34,8 +34,14 @@ log_file = "lidarr-soulseek.log"
 [search]
 search_wait_seconds = 12
 max_albums_per_cycle = 1
-# Stop starting new album searches after this many since the worker was started. 0 does not cap the run.
+# Pause new album searches after this many real searches, until the next day. 0 does not cap the run.
 max_albums_per_run = 40
+# Skip live, compilation, single, and bootleg unless the Lidarr metadata profile allows them.
+follow_metadata_profile = true
+allow_live = false
+allow_compilation = false
+allow_single = false
+allow_bootleg = false
 # Leave blank to search every wanted artist. Otherwise only artists with this Lidarr tag.
 wanted_tag = ""
 # Stay on one artist, then skip them for this many days.

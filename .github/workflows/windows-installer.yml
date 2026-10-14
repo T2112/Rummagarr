@@ -88,25 +88,20 @@ jobs:
             sha256sum "Rummagarr-Setup-${version}.exe" > "Rummagarr-Setup-${version}.exe.sha256"
             sha256sum "LidarrSoulseek-Setup-${version}.exe" > "LidarrSoulseek-Setup-${version}.exe.sha256"
           )
-          notes=$(printf '%s\n' \
-            "Windows installer for Rummagarr ${version}." \
-            "" \
-            "Download Rummagarr-Setup-${version}.exe and run it. The first window asks for the Lidarr URL, API key, and Soulseek login." \
-            "" \
-            "The same installer is also attached as LidarrSoulseek-Setup-${version}.exe so an installed copy of 1.9.4 can update from Help → Check for updates. Both .sha256 files are the installer checksum." \
-            "" \
-            "ffmpeg is separate if you want FLAC converted to MP3: winget install Gyan.FFmpeg.")
+          notes_file=$(mktemp)
+          python3 scripts/release_notes.py --version "$version" > "$notes_file"
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" \
               "$asset" "${asset}.sha256" \
               "$legacy" "${legacy}.sha256" \
               --clobber
+            gh release edit "$tag" --notes-file "$notes_file"
           else
             gh release create "$tag" \
               "$asset" "${asset}.sha256" \
               "$legacy" "${legacy}.sha256" \
               --title "Rummagarr ${version}" \
-              --notes "$notes" \
+              --notes-file "$notes_file" \
               --target "${{ github.sha }}"
           fi
           echo "Published Rummagarr-Setup and LidarrSoulseek-Setup on ${tag}"

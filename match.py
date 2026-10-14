@@ -4,6 +4,7 @@ import re
 import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -16,6 +17,11 @@ _MAX_ALIASES = 3
 # A Lidarr duration at or above this is milliseconds. Soulseek reports seconds.
 _MS_DURATION = 10000
 _EDITION = re.compile(r"\b(live|remix|remixed|rmx|concert)\b", re.IGNORECASE)
+_RELEASE_WORDS = re.compile(
+    r"\b(deluxe|expanded|anniversary|remaster(?:ed)?|bonus|instrumental|commentary)\b",
+    re.IGNORECASE,
+)
+_SKIP_KINDS = ("live", "compilation", "single", "bootleg")
 
 # Quotes and dashes that should compare equal before the rest of the punctuation is dropped.
 _PUNCT = str.maketrans(
@@ -376,7 +382,7 @@ def build_queries(
     artist_q = normalize(artist)
     album_q = normalize(album)
     year_text = str(year) if year else ""
-    use_year = bool(year_text.isdigit() and not year_text.startswith("2026"))
+    use_year = _include_year(year_text)
     artist_raw = _plain(artist)
     album_raw = _plain(album)
     seen: set[str] = set()
@@ -410,6 +416,130 @@ def build_queries(
     return out
 
 
+def _include_year(year_text: str) -> bool:
+    """Keep a real release year. A year after this one is Lidarr's placeholder."""
+    if not year_text.isdigit() or len(year_text) != 4:
+        return False
+    year = int(year_text)
+    return 1900 <= year <= datetime.now().year
+
+
+def _edition_penalty(blob: str, wanted: str) -> float:
+    """Deluxe, remaster, and the other edition words, unless the Lidarr title uses them."""
+    wanted_cf = (wanted or "").casefold()
+    penalty = 0.0
+    seen: set[str] = set()
+    for match in _RELEASE_WORDS.finditer(blob or ""):
+        word = match.group(0).casefold()
+        if word in seen or word in wanted_cf:
+            continue
+        seen.add(word)
+        penalty += 12.0
+    return penalty
+
+
+def fill_uncovered_titles(primary: list, allowed: list, titles: list[str], min_ratio: float) -> list:
+    """Keep the preferred format, and take a missing title from another format in the same folder."""
+    if not titles or not allowed:
+        return primary
+    chosen = list(primary)
+    used = {id(item) for item in chosen}
+    names = [Path(basename(getattr(item, "filename", "") or "")).stem for item in chosen]
+
+    def covered(title: str) -> bool:
+        return any(similarity(title, name) >= min_ratio for name in names)
+
+    for title in titles:
+        if covered(title):
+            continue
+        for item in allowed:
+            if id(item) in used:
+                continue
+            stem = Path(basename(getattr(item, "filename", "") or "")).stem
+            if similarity(title, stem) < min_ratio:
+                continue
+            chosen.append(item)
+            used.add(id(item))
+            names.append(stem)
+            break
+    return chosen
+
+
+def album_release_kinds(album: dict | None) -> set[str]:
+    """Live, compilation, single, or bootleg when the album says so."""
+    kinds: set[str] = set()
+    if not isinstance(album, dict):
+        return kinds
+    blobs = [str(album.get("albumType") or "")]
+    secondary = album.get("secondaryTypes") or []
+    if isinstance(secondary, str):
+        secondary = [secondary]
+    if isinstance(secondary, list):
+        for item in secondary:
+            if isinstance(item, dict):
+                blobs.append(str(item.get("name") or item.get("albumType") or ""))
+            else:
+                blobs.append(str(item))
+    for blob in blobs:
+        token = blob.casefold()
+        if "live" in token:
+            kinds.add("live")
+        if "compilation" in token:
+            kinds.add("compilation")
+        if "single" in token:
+            kinds.add("single")
+        if "bootleg" in token:
+            kinds.add("bootleg")
+    return kinds
+
+
+def _profile_type_allowed(profile: dict | None, kind: str) -> bool:
+    if not isinstance(profile, dict):
+        return False
+    groups = ("secondaryAlbumTypes", "primaryAlbumTypes")
+    if kind == "single":
+        groups = ("primaryAlbumTypes", "secondaryAlbumTypes")
+    for group in groups:
+        for item in profile.get(group) or []:
+            if not isinstance(item, dict):
+                continue
+            album_type = item.get("albumType") if isinstance(item.get("albumType"), dict) else {}
+            name = str(album_type.get("name") or item.get("name") or "").casefold()
+            if kind in name and item.get("allowed"):
+                return True
+    return False
+
+
+def release_skip_reason(album: dict | None, cfg, profiles: dict | None = None) -> str:
+    """Why this album is not a studio release we should search, or an empty string.
+
+    Live, compilation, single, and bootleg are skipped unless Settings allows
+    that type, or Follow Lidarr metadata profile is on and the profile allows it.
+    """
+    kinds = album_release_kinds(album) & set(_SKIP_KINDS)
+    if not kinds:
+        return ""
+    profile = None
+    if getattr(cfg, "follow_metadata_profile", True) and isinstance(album, dict):
+        artist = album.get("artist") if isinstance(album.get("artist"), dict) else {}
+        raw = album.get("metadataProfileId") or artist.get("metadataProfileId")
+        try:
+            profile_id = int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            profile_id = None
+        if profile_id is not None and isinstance(profiles, dict):
+            profile = profiles.get(profile_id)
+    for kind in _SKIP_KINDS:
+        if kind not in kinds:
+            continue
+        if getattr(cfg, f"allow_{kind}", False):
+            continue
+        if _profile_type_allowed(profile, kind):
+            continue
+        return f"skipped {kind} release"
+    return ""
+
+
 def score_folder(
     candidate: FolderCandidate,
     artist: str,
@@ -440,8 +570,10 @@ def score_folder(
         candidate.reason = rejected_reason
         candidate.score = 0
         return candidate
-    # One user already owns this folder. Keep one format so MP3 and FLAC are not mixed.
+    # One user already owns this folder. Prefer one format, then fill a missing title
+    # from another format in the same folder when that is the only complete copy.
     audio = choose_one_format(allowed, prefs)
+    audio = fill_uncovered_titles(audio, allowed, track_titles, min_filename_ratio)
     exts = {extension(f.filename) for f in audio}
     ext_rank = 0
     for i, pref in enumerate(preferred_extensions):
@@ -485,8 +617,10 @@ def score_folder(
         return candidate
     wanted = " ".join([album, *track_titles])
     blob = " ".join([candidate.remote_dir, *names])
-    penalty = _studio_penalty(blob, wanted)
+    penalty = _studio_penalty(blob, wanted) + _edition_penalty(blob, wanted)
     bonus = _duration_bonus(audio, durations)
+    if expected and len(audio) == expected:
+        bonus += 5.0
     free = 4.0 if candidate.free_slot else 0.0
     candidate.files = audio
     candidate.score = max(
@@ -587,10 +721,16 @@ def group_results(results, ignored_users: set[str]) -> list[FolderCandidate]:
         if username.lower() in ignored_users:
             continue
         items = list(getattr(result, "shared_items", None) or [])
+        locked_names = {
+            getattr(item, "filename", "") or ""
+            for item in (getattr(result, "locked_results", None) or [])
+        }
         by_dir: dict[str, list] = defaultdict(list)
         for item in items:
             filename = getattr(item, "filename", "")
-            if not filename:
+            if not filename or filename in locked_names:
+                continue
+            if getattr(item, "locked", False) or getattr(item, "is_locked", False):
                 continue
             by_dir[parent_dir(filename)].append(item)
         free = bool(getattr(result, "has_free_slots", False) or getattr(result, "free_slot", False))

@@ -32,6 +32,8 @@ from aioslsk.shares.model import DirectoryShareMode
 from aioslsk.user.model import BlockingFlag
 
 from activity import Step, describe_step, format_elapsed, step_from_legacy
+from audio_check import folder_fake_reason
+from audio_tags import tag_album_folder
 from config_loader import Config
 from control import WorkerControl
 from lidarr_client import LidarrClient, LidarrUnreachable
@@ -67,12 +69,14 @@ from match import (
     build_track_queries,
     gate_from_profile,
     group_results,
+    release_skip_reason,
     normalize,
     score_folder,
     score_track_item,
     seconds_from_lidarr,
 )
 from process_launch import run_hidden
+from run_summary import RunSummary
 from sharing import (
     IDLE_FLOOR_SECONDS,
     Decision,
@@ -266,6 +270,9 @@ LOSSLESS_EXT = {".flac", ".wav", ".aiff", ".aif", ".wv", ".ape"}
 _SCAN_CHUNK = 25
 # How long to wait for the server to accept a FileSearch before moving on.
 _SEARCH_SEND_TIMEOUT = 20.0
+_FREE_SLOT_GRACE = 3.0
+_DOWNLOAD_ATTEMPTS = 3
+_COMMAND_FAILED = {"failed", "aborted", "cancelled", "canceled", "timeout"}
 
 
 def install_responsive_share_scan(client) -> None:
@@ -688,6 +695,14 @@ class Worker:
         self._import_epoch = 0
         self._import_notice_epoch = 0
         self._visit_had_download = False
+        self._import_phase = ""
+        self._importing_artist = ""
+        self._free_slot_grace = _FREE_SLOT_GRACE
+        self._cap_until: datetime | None = None
+        self._pass_note = ""
+        self._metadata_profiles: dict[int, dict] | None = None
+        self.run_summary = RunSummary()
+        self._summary_path: Path | None = None
 
     def close(self) -> None:
         if self._ui:
@@ -716,8 +731,8 @@ class Worker:
         """Start one Lidarr import per time the queue is empty after an artist finishes.
 
         A later call while the queue stays empty does nothing. The scan runs on
-        a side thread so the window stays responsive. The worker waits for that
-        thread, including the wanted resync, before it picks the next artist.
+        a side thread so the window stays responsive. The worker can search the
+        next artist while Lidarr is still scanning, and waits only for the resync.
         """
         if not self.cfg.auto_import_after_artist:
             return
@@ -766,36 +781,69 @@ class Worker:
             return False
         return bool(flag)
 
+    def _finish_lidarr_command(self, result):
+        finisher = getattr(self.lidarr, "finish_command", None)
+        if not callable(finisher):
+            return result if isinstance(result, dict) else {}
+        try:
+            return finisher(result)
+        except Exception:
+            log.exception("Could not wait for a Lidarr command")
+            return {"status": "failed"}
+
+    def _command_failed(self, result) -> bool:
+        if not isinstance(result, dict):
+            return False
+        return str(result.get("status") or "").casefold() in _COMMAND_FAILED
+
     def _import_one_artist(self, artist: str, folder: str) -> None:
         self._publish_import(f"Importing {artist} into Lidarr...", hold=True)
+        self._import_phase = "scan"
+        self._importing_artist = artist
         scanned = False
         try:
             result = self.lidarr.scan_downloaded(folder)
             scanned = True
+            waited = self._finish_lidarr_command(result)
+            if self._command_failed(waited):
+                detail = f"Lidarr scan {waited.get('status') or 'failed'}"
+                self._park_failed_import(artist, detail)
+                log.error("Importing %s into Lidarr failed: %s", artist, detail)
+                self._publish_import(f"Importing {artist} into Lidarr failed: {detail}", hold=False)
+                self._summary_review(artist, detail)
+                return
             problems = self._import_problems(artist)
             if problems:
                 detail = "; ".join(problems)
                 self._park_failed_import(artist, detail)
                 log.error("Importing %s into Lidarr failed: %s", artist, detail)
                 self._publish_import(f"Importing {artist} into Lidarr failed: {detail}", hold=False)
+                self._summary_review(artist, detail)
                 return
-            if not self._import_already_renamed(result):
+            if not self._import_already_renamed(waited or result):
                 artist_id = self.lidarr.artist_id_by_name(artist)
                 if not artist_id:
                     raise RuntimeError(f"Lidarr has no artist named {artist}")
-                self.lidarr.rename_artist_files(int(artist_id))
+                renamed = self.lidarr.rename_artist_files(int(artist_id))
+                self._finish_lidarr_command(renamed)
                 log.info("Asked Lidarr to rename files for %s", artist)
             else:
                 log.info("Lidarr already renames %s on import", artist)
             log.info("Imported %s into Lidarr from %s", artist, folder)
             self._publish_import(f"Imported {artist} into Lidarr", hold=False)
+            self._summary_imported(artist)
         except Exception as exc:
             detail = str(exc).strip() or exc.__class__.__name__
             log.exception("Importing %s into Lidarr failed", artist)
             self._publish_import(f"Importing {artist} into Lidarr failed: {detail}", hold=False)
+            self._summary_failed(artist, detail)
         finally:
             if scanned:
+                self._import_phase = "resync"
                 self.resync_artist_from_lidarr(artist)
+                self._release_unimported(artist)
+            self._import_phase = ""
+            self._importing_artist = ""
 
     def _import_problems(self, artist: str) -> list[str]:
         checker = getattr(self.lidarr, "import_failures", None)
@@ -862,13 +910,14 @@ class Worker:
             self.maybe_auto_import()
 
     async def _wait_for_import(self) -> None:
-        """Let a finished import resync that artist before the next search."""
+        """Wait for the wanted resync. A scan that is still running does not block the next search."""
         while not self.control.is_stopped():
             self.maybe_auto_import()
             with self._import_lock:
                 thread = self._import_thread
+                phase = self._import_phase
                 pending = bool(self._import_armed and self._import_artists)
-            if thread is not None and thread.is_alive():
+            if thread is not None and thread.is_alive() and phase == "resync":
                 await asyncio.sleep(0.2)
                 continue
             if pending and not self._queue_busy() and self.cfg.auto_import_after_artist:
@@ -914,6 +963,58 @@ class Worker:
             sum(1 for item in items if item.kind != "artist"),
             len(imported_albums),
         )
+
+    def _release_unimported(self, artist: str) -> None:
+        """A staged album Lidarr still does not list is failed, not imported."""
+        token = (artist or "").casefold().strip()
+        if not token:
+            return
+        with self.store._lock:
+            rows = self.store._db.execute(
+                "SELECT album_id, artist, title, status FROM jobs WHERE lower(artist) = ?",
+                (token,),
+            ).fetchall()
+        for album_id, name, title, status in rows:
+            if status != "staged":
+                continue
+            self.store.upsert(
+                int(album_id),
+                name,
+                title,
+                "import_failed",
+                "Lidarr did not show the files after the scan",
+            )
+            self._summary_failed(f"{name} – {title}", "Lidarr did not show the files after the scan")
+
+    def _summary_dir(self) -> Path:
+        return Path(self.cfg.log_file).resolve().parent
+
+    def _write_summary(self) -> None:
+        try:
+            self._summary_path = self.run_summary.write(self._summary_dir())
+        except Exception:
+            log.exception("Could not write the run summary")
+
+    def _summary_grabbed(self, label: str) -> None:
+        self.run_summary.note_grabbed(label)
+        self._write_summary()
+
+    def _summary_imported(self, label: str) -> None:
+        self.run_summary.note_imported(label)
+        self._write_summary()
+
+    def _summary_review(self, label: str, reason: str) -> None:
+        self.run_summary.note_review(label, reason)
+        self._write_summary()
+
+    def _summary_failed(self, label: str, reason: str) -> None:
+        self.run_summary.note_failed(label, reason)
+        self._write_summary()
+
+    def _note_skip(self, artist: str, album: str, reason: str) -> None:
+        text = f"{artist} – {album}: {reason}" if album else f"{artist}: {reason}"
+        self._pass_note = text
+        log.info("Skip %s", text)
 
     def requeue_block(self, artist: str, title: str, year: str | None = None) -> str:
         """Why this album must not be queued again, or an empty string."""
@@ -1062,7 +1163,8 @@ class Worker:
         if not artist_id:
             return
         try:
-            self.lidarr.rename_artist_files(int(artist_id))
+            renamed = self.lidarr.rename_artist_files(int(artist_id))
+            self._finish_lidarr_command(renamed)
             log.info("Asked Lidarr to rename files for artist id %s", artist_id)
         except Exception:
             log.exception("Lidarr rename command failed for artist id %s", artist_id)
@@ -1275,14 +1377,27 @@ class Worker:
         query_index: int,
         query_total: int,
         ready=None,
+        grace: float = 0.0,
     ) -> str:
         started = time.monotonic()
+        ready_at: float | None = None
         while True:
             if ready is not None:
                 try:
                     if ready():
-                        log.info("A free-slot match is already in for %s – %s; scoring now", artist, album)
-                        return "ok"
+                        if grace <= 0:
+                            log.info("A free-slot match is already in for %s – %s; scoring now", artist, album)
+                            return "ok"
+                        if ready_at is None:
+                            ready_at = time.monotonic()
+                            log.info(
+                                "A free-slot match is in for %s – %s; waiting %.0fs for a stronger folder",
+                                artist,
+                                album,
+                                grace,
+                            )
+                        elif time.monotonic() - ready_at >= grace:
+                            return "ok"
                 except Exception:
                     log.debug("Could not score results early", exc_info=True)
             waited = int(time.monotonic() - started)
@@ -1337,6 +1452,8 @@ class Worker:
             "cancel_requested": self.cancel_requested,
             "run_state": self.control.state,
             "current_key": self.current_key or "",
+            "run_summary": self.run_summary.line(),
+            "run_summary_path": str(self._summary_path or ""),
         }
 
     def _mark_album(self, album_id: int, artist: str, title: str, signal: str) -> None:
@@ -1534,6 +1651,8 @@ class Worker:
         self._loop = asyncio.get_running_loop()
         self._loop_beat = time.monotonic()
         self._heartbeat_task = asyncio.create_task(self._heartbeat())
+        self.run_summary = RunSummary()
+        self._write_summary()
         self.set_step(Step(kind="connecting"))
         try:
             status = self.lidarr.ping()
@@ -1568,6 +1687,7 @@ class Worker:
                 self.control.stop()
             raise
         finally:
+            self._write_summary()
             if self._heartbeat_task is not None and not self._heartbeat_task.done():
                 self._heartbeat_task.cancel()
                 await asyncio.gather(self._heartbeat_task, return_exceptions=True)
@@ -1709,6 +1829,9 @@ class Worker:
         for token, until in self._not_ready_until.items():
             if until > now:
                 blocked.add(token)
+        importing = self._artist_token(self._importing_artist)
+        if importing:
+            blocked.add(importing)
         return blocked
 
     def _searchable_now(self, artist: str) -> bool:
@@ -1852,6 +1975,20 @@ class Worker:
         if not (self.store.wanted_catalog_ready() or self.catalog.synced):
             return None
         skip = self._blocked_tokens()
+        if self.store.wanted_catalog_ready():
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=max(0, int(self.cfg.retry_hours or 0)))
+            ).isoformat()
+            for _ in range(5000):
+                name = self.store.next_ready_artist(skip, tag=self.cfg.wanted_tag, retry_before=cutoff)
+                if not name:
+                    return None
+                ready, until = self._searchable_delay(name)
+                if ready:
+                    return name
+                self._defer_artist(name, until)
+                skip.add(self._artist_token(name))
+            return None
         for _ in range(10000):
             name = self._next_saved_name(skip)
             if not name:
@@ -1863,6 +2000,47 @@ class Worker:
             skip.add(self._artist_token(name))
         return None
 
+    def _roll_album_cap(self) -> None:
+        if self._cap_until is None:
+            return
+        if datetime.now().astimezone() >= self._cap_until:
+            self._albums_this_run = 0
+            self._cap_until = None
+
+    def _album_cap_reached(self) -> bool:
+        cap = int(self.cfg.max_albums_per_run or 0)
+        if cap <= 0:
+            return False
+        self._roll_album_cap()
+        if self._albums_this_run < cap:
+            return False
+        if self._cap_until is None:
+            now = datetime.now().astimezone()
+            self._cap_until = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return True
+
+    def _seconds_until_cap(self) -> int:
+        self._album_cap_reached()
+        if self._cap_until is None:
+            return 1
+        return max(1, int((self._cap_until - datetime.now().astimezone()).total_seconds()))
+
+    def _cap_detail(self) -> str:
+        cap = int(self.cfg.max_albums_per_run or 0)
+        return f"Album cap of {cap} searches reached"
+
+    def _note_day_pause(self) -> None:
+        seconds = self._seconds_until_cap()
+        self._apply_wait(seconds, "day")
+        self._write_summary()
+
+    def _claim_album_search(self) -> bool:
+        """Count one real search. False when the daily cap is already full."""
+        if self._album_cap_reached():
+            return False
+        self._albums_this_run += 1
+        return True
+
     def between_pass_wait(self) -> tuple[int, str]:
         """Seconds to sleep, and which setting that wait comes from.
 
@@ -1872,6 +2050,9 @@ class Worker:
         line can count it down to zero and then search that artist.
         """
         cycle = max(0, int(self.cfg.cycle_seconds or 0))
+        if self._album_cap_reached():
+            self._wait_artist = ""
+            return self._seconds_until_cap(), "day"
         catalog = self.store.wanted_catalog_ready() or self.catalog.synced
         if catalog and not self._has_enabled_wanted():
             self._wait_artist = ""
@@ -1887,6 +2068,18 @@ class Worker:
         return (cycle if cycle else IDLE_FLOOR_SECONDS), "idle"
 
     def _apply_wait(self, seconds: int, kind: str) -> None:
+        if kind == "day":
+            now = time.monotonic()
+            self.set_step(
+                Step(
+                    kind="retry",
+                    retry_seconds=max(0, int(seconds)),
+                    retry_kind="day",
+                    retry_deadline=now + max(0, int(seconds)),
+                    detail=self._cap_detail(),
+                )
+            )
+            return
         if kind != "pass" and kind != "artist":
             self._wait_artist = ""
             self.set_step(Step(kind="idle"))
@@ -1910,6 +2103,7 @@ class Worker:
                 retry_seconds=max(0, int(seconds)),
                 retry_kind=kind,
                 retry_deadline=deadline,
+                detail=self._cap_detail() if kind == "day" else (self._pass_note or ""),
             )
         )
 
@@ -1936,6 +2130,8 @@ class Worker:
         """
         searched = self._cycle_attempted_search
         pause, kind = self._note_between_passes()
+        if kind == "day":
+            return pause
         if searched:
             return pause
         if kind == "pass":
@@ -1968,6 +2164,7 @@ class Worker:
             return
         self._cycle_attempted_search = False
         self._cycle_unsent_search = False
+        self._pass_note = ""
         try:
             await self._cycle_once()
         except LidarrUnreachable:
@@ -2077,19 +2274,18 @@ class Worker:
             if cap and self._albums_this_run + len(batch) >= cap:
                 break
             if tag and not album_has_tag(album, tag):
-                log.info("Skip %s – %s: tag %s does not match", artist_name(album), album.get("title") or "", tag)
+                self._note_skip(artist_name(album), album.get("title") or "", f"tag {tag} does not match")
+                continue
+            skipped = release_skip_reason(album, self.cfg, self._metadata_profile_map())
+            if skipped:
+                self._note_skip(artist_name(album), album.get("title") or "", skipped)
                 continue
             if self.store.should_skip(int(album["id"]), self.cfg.retry_hours):
                 continue
             batch.append(album)
-        if cap and self._albums_this_run >= cap and not batch:
-            log.info("Album cap for this run is %s; no more album searches until a restart", cap)
-            self.set_step(
-                Step(
-                    kind="limit",
-                    detail=f"Album cap for this run reached ({cap}). Stop and start to search more.",
-                )
-            )
+        if self._album_cap_reached() and not batch:
+            log.info("Album cap of %s searches reached; pausing until the next day", cap)
+            self._note_day_pause()
             self.sweep_incomplete_folder()
             return
         workers = max(1, int(self.cfg.concurrent_albums or 1))
@@ -2106,7 +2302,6 @@ class Worker:
             async with sem:
                 if self.control.is_stopped():
                     return
-                self._albums_this_run += 1
                 self.store.upsert(album_id, artist, title, "searching")
                 self.set_step(Step(kind="searching", artist=artist, album=title))
                 ok = await self.process_album(album)
@@ -2230,8 +2425,8 @@ class Worker:
         year = album_year(album)
         blocked = self.track_requeue_block(artist, album_title, title, year)
         if blocked:
-            log.info("Skip %s - %s - %s: %s", artist, album_title, title, blocked)
-            status = "downloading" if blocked == "already queued" else "imported"
+            self._note_skip(artist, title, blocked)
+            status = "downloading" if blocked == "already queued" else "staged"
             self.store.upsert_track(track_id, album_id, artist, title, status, blocked)
             return True
         queries = build_track_queries(artist, album_title, title, aliases_from_album(album))
@@ -2377,20 +2572,26 @@ class Worker:
             self.store.upsert_track(track_id, album_id, artist, title, "failed", "no file staged")
             return False
 
-        scan_path = str(Path(self.cfg.lidarr_scan_path) / folder.name)
-        try:
-            self.lidarr.scan_downloaded(scan_path)
-        except Exception as exc:
-            try:
-                self.lidarr.scan_downloaded(str(folder))
-            except Exception:
-                self.store.upsert_track(track_id, album_id, artist, title, "failed", f"scan failed: {exc}")
-                raise
+        ready, reason = self._prepare_staged_folder(folder, album, [track])
+        if not ready:
+            self.store.block_source(best_user, "", reason)
+            self.store.upsert_track(track_id, album_id, artist, title, "failed", reason)
+            self._summary_failed(f"{artist} – {title}", reason)
+            return False
         if self.cfg.delete_sources_after_import:
             cleanup_sources(sources, self.cfg.download_dir)
-        self.ask_lidarr_rename(album)
-        self.store.upsert_track(track_id, album_id, artist, title, "imported", str(folder))
-        log.info("Asked Lidarr to import missing track %s into %s", title, folder)
+        self._summary_grabbed(f"{artist} – {title}")
+        if not self.cfg.auto_import_after_artist:
+            scanned, reason = self._scan_staged_folder(folder)
+            if not scanned:
+                self.store.upsert_track(track_id, album_id, artist, title, "failed", reason)
+                self._summary_failed(f"{artist} – {title}", reason)
+                return False
+            self.ask_lidarr_rename(album)
+        else:
+            self._visit_had_download = True
+        self.store.upsert_track(track_id, album_id, artist, title, "staged", str(folder))
+        log.info("Staged missing track %s into %s", title, folder)
         return True
 
     def _load_quality_profiles(self) -> dict[int, dict]:
@@ -2421,6 +2622,8 @@ class Worker:
         for folder in group_results(results, self.cfg.ignored_users):
             if (folder.username or "").lower() in rejected:
                 continue
+            if self.store.source_blocked(folder.username, folder.remote_dir):
+                continue
             scored = score_folder(
                 folder,
                 artist,
@@ -2441,7 +2644,7 @@ class Worker:
 
     def _free_slot_ready(self, request, artist, title, titles, durations, gate, rejected) -> bool:
         best = self._best_folder(getattr(request, "results", None), artist, title, titles, durations, gate, rejected)
-        return bool(best and best.free_slot)
+        return bool(best and best.free_slot and best.score >= 20)
 
     async def process_album(self, album: dict) -> bool:
         album_id = int(album["id"])
@@ -2463,11 +2666,15 @@ class Worker:
         year = album_year(album)
         blocked = self.requeue_block(artist, title, year)
         if blocked:
-            log.info("Skip %s - %s: %s", artist, title, blocked)
-            status = "downloading" if blocked == "already queued" else "imported"
+            self._note_skip(artist, title, blocked)
+            status = "downloading" if blocked == "already queued" else "staged"
             self.store.upsert(album_id, artist, title, status, blocked)
+            if blocked != "already queued":
+                self._visit_had_download = True
             return True
-        tracks = self.lidarr.tracks_for_album(album_id)
+        tracks = self.store.saved_tracks(album_id)
+        if not tracks:
+            tracks = self.lidarr.tracks_for_album(album_id)
         needed_tracks = monitored_missing_tracks(tracks)
         if not needed_tracks:
             log.info("Skip %s - %s: Lidarr already has every monitored track", artist, title)
@@ -2481,6 +2688,11 @@ class Worker:
                 len(needed_tracks),
             )
             self.store.upsert(album_id, artist, title, "partial", "use track fill")
+            self._note_skip(artist, title, "partial album, filling tracks")
+            return False
+        if self._album_cap_reached():
+            self._note_day_pause()
+            self.store.upsert(album_id, artist, title, "not_sent", "album cap")
             return False
         titles = track_titles(needed_tracks)
         durations = [seconds_from_lidarr(track.get("duration")) for track in needed_tracks]
@@ -2490,6 +2702,8 @@ class Worker:
         log.info("Searching: %s", " | ".join(queries))
 
         best = None
+        ranked = []
+        counted = False
         for index, query in enumerate(queries, start=1):
             signal = await self.control.gate(key)
             if signal != "ok":
@@ -2503,6 +2717,9 @@ class Worker:
             except SearchNotSent:
                 self.store.upsert(album_id, artist, title, "not_sent", "search was not sent")
                 return False
+            if not counted:
+                self._claim_album_search()
+                counted = True
             signal = await self._await_results(
                 request,
                 key,
@@ -2512,6 +2729,7 @@ class Worker:
                 index,
                 len(queries),
                 ready=lambda: self._free_slot_ready(request, artist, title, titles, durations, gate, rejected),
+                grace=self._free_slot_grace,
             )
             self.note_search_receipt(query, getattr(request, "results", None))
             if signal != "ok":
@@ -2532,6 +2750,7 @@ class Worker:
                 )
             )
             picked = self._best_folder(request.results, artist, title, titles, durations, gate, rejected)
+            ranked.extend(self._scored_folders(request.results, artist, title, titles, durations, gate, rejected))
             if picked is not None and (best is None or picked.score > best.score):
                 best = picked
             try:
@@ -2541,10 +2760,46 @@ class Worker:
             if best and best.score >= 20:
                 break
 
-        if best is None:
-            self.store.upsert(album_id, artist, title, "no_match", "no folder passed filters")
-            return False
+        candidates = ranked or ([best] if best is not None else [])
+        return await self._download_candidates(
+            candidates, album, key, album_id, artist, title, year, needed_tracks, rejected
+        )
 
+    async def _download_candidates(self, candidates, album, key, album_id, artist, title, year, needed_tracks, rejected) -> bool:
+        """Download the best folder, then the next user when that download fails."""
+        if not candidates:
+            self.store.upsert(album_id, artist, title, "no_match", "no folder passed filters")
+            self._summary_failed(f"{artist} – {title}", "no folder passed filters")
+            return False
+        tried: set[tuple[str, str]] = set()
+        last = "no folder passed filters"
+        for _attempt in range(max(1, _DOWNLOAD_ATTEMPTS)):
+            best = None
+            for item in sorted(candidates, key=lambda row: row.score, reverse=True):
+                user = (item.username or "").lower()
+                pair = (user, item.remote_dir or "")
+                if user in rejected or pair in tried or self.store.source_blocked(item.username, item.remote_dir):
+                    continue
+                best = item
+                break
+            if best is None:
+                break
+            tried.add(((best.username or "").lower(), best.remote_dir or ""))
+            outcome, last = await self._download_one(best, album, key, album_id, artist, title, year, needed_tracks)
+            if outcome == "ok":
+                return True
+            if outcome == "halt":
+                return False
+            self.store.block_source(best.username, best.remote_dir, last)
+            self.store.reject_usernames({best.username}, album_id=album_id, artist=artist)
+            rejected.add((best.username or "").lower())
+            log.info("Trying another user for %s – %s after %s", artist, title, last)
+        self.store.upsert(album_id, artist, title, "failed", last)
+        self._summary_failed(f"{artist} – {title}", last)
+        return False
+
+    async def _download_one(self, best, album, key, album_id, artist, title, year, needed_tracks):
+        """Download one user's folder. ``again`` means try the next user."""
         log.info(
             "Picked %s :: %s (%s files, score %.1f)",
             best.username,
@@ -2563,7 +2818,7 @@ class Worker:
             if signal != "ok":
                 await self._abandon_transfers(transfers)
                 self._mark_album(album_id, artist, title, signal)
-                return False
+                return "halt", signal
             transfer = await self.client.transfers.download(best.username, item.filename)
             transfers.append(transfer)
             self.set_step(
@@ -2633,7 +2888,7 @@ class Worker:
             if signal != "ok":
                 await self._abandon_transfers(transfers)
                 self._mark_album(album_id, artist, title, signal)
-                return False
+                return "halt", signal
 
         await stage_finished()
         self.remember_completed(transfers, artist, title, "album")
@@ -2643,41 +2898,106 @@ class Worker:
         needed = max(1, len(best.files) - self.cfg.track_count_tolerance)
         if self.cancel_requested or len(complete_transfers) < needed:
             detail = "cancelled" if self.cancel_requested else f"finished {len(complete_transfers)}/{len(transfers)}"
-            self.store.upsert(album_id, artist, title, "failed", detail)
             log.warning("Incomplete download for %s - %s (%s)", artist, title, detail)
             leftovers = [t for t in transfers if t not in complete_transfers]
             if self.cfg.delete_sources_after_import:
                 leftovers = transfers
             self.discard_failed_downloads(leftovers)
             self.cancel_requested = False
-            return False
+            return "again", detail
         self.cancel_requested = False
 
         folder, leftover = stage_album_folder(self.cfg, artist, title, year, complete_transfers)
         for src in leftover:
             if src not in sources:
                 sources.append(src)
-        audio_count = sum(1 for p in folder.iterdir() if p.suffix.lower() in AUDIO_EXT)
-        if audio_count == 0:
-            self.store.upsert(album_id, artist, title, "failed", "no files staged")
-            return False
+        if not any(path.suffix.lower() in AUDIO_EXT for path in folder.iterdir()):
+            return "again", "no files staged"
+        ready, reason = self._prepare_staged_folder(folder, album, needed_tracks)
+        if not ready:
+            return "again", reason
+        label = f"{artist} – {title}"
+        self._summary_grabbed(f"{label} from {best.username}")
+        self.store.upsert(album_id, artist, title, "staged", str(folder))
+        if self.cfg.auto_import_after_artist:
+            self._visit_had_download = True
+            return "ok", ""
+        scanned, reason = self._scan_staged_folder(folder)
+        if not scanned:
+            self._move_artist_to_review(artist)
+            return "again", reason
+        self.resync_artist_from_lidarr(artist)
+        job = self.store.get(album_id)
+        if job and job["status"] == "imported":
+            self._summary_imported(label)
+            return "ok", ""
+        log.info("Asked Lidarr to import %s", folder)
+        return "ok", ""
 
+    def _prepare_staged_folder(self, folder: Path, album: dict, tracks: list) -> tuple[bool, str]:
+        try:
+            tag_album_folder(folder, album, tracks, min_ratio=self.cfg.min_filename_ratio)
+        except Exception:
+            log.exception("Could not write MusicBrainz tags in %s", folder)
+        reason = folder_fake_reason(folder)
+        if reason:
+            log.warning("Rejected %s: %s", folder.name, reason)
+            return False, reason
+        return True, ""
+
+    def _scan_staged_folder(self, folder: Path) -> tuple[bool, str]:
         scan_path = str(Path(self.cfg.lidarr_scan_path) / folder.name)
         try:
-            self.lidarr.scan_downloaded(scan_path)
+            result = self.lidarr.scan_downloaded(scan_path)
         except Exception as exc:
-            # fall back to the Windows path Lidarr may already see
             try:
-                self.lidarr.scan_downloaded(str(folder))
+                result = self.lidarr.scan_downloaded(str(folder))
             except Exception:
-                self.store.upsert(album_id, artist, title, "failed", f"scan failed: {exc}")
-                raise
-        if self.cfg.delete_sources_after_import:
-            cleanup_sources(sources, self.cfg.download_dir)
-        self.ask_lidarr_rename(album)
-        self.store.upsert(album_id, artist, title, "imported", str(folder))
-        log.info("Asked Lidarr to import %s", folder)
-        return True
+                return False, f"scan failed: {exc}"
+        waited = self._finish_lidarr_command(result)
+        if self._command_failed(waited):
+            return False, f"Lidarr scan {waited.get('status') or 'failed'}"
+        return True, ""
+
+    def _scored_folders(self, results, artist, title, titles, durations, gate, rejected) -> list:
+        found = []
+        for folder in group_results(results, self.cfg.ignored_users):
+            if (folder.username or "").lower() in rejected:
+                continue
+            if self.store.source_blocked(folder.username, folder.remote_dir):
+                continue
+            scored = score_folder(
+                folder,
+                artist,
+                title,
+                titles,
+                self.cfg.preferred_extensions,
+                self.cfg.min_filename_ratio,
+                self.cfg.track_count_tolerance,
+                self.cfg.min_mp3_bitrate,
+                durations=durations,
+                gate=gate,
+            )
+            if scored.reason == "ok":
+                found.append(scored)
+        return found
+
+    def _metadata_profile_map(self) -> dict[int, dict]:
+        if self._metadata_profiles is not None:
+            return self._metadata_profiles
+        loader = getattr(self.lidarr, "metadata_profiles", None)
+        cached: dict[int, dict] = {}
+        if callable(loader):
+            try:
+                rows = loader() or []
+            except Exception:
+                log.exception("Could not read Lidarr metadata profiles")
+                rows = []
+            for row in rows:
+                if isinstance(row, dict) and row.get("id") is not None:
+                    cached[int(row["id"])] = row
+        self._metadata_profiles = cached
+        return cached
 
     def take_config_dirty(self) -> bool:
         dirty = self._config_dirty
@@ -3239,15 +3559,10 @@ class Worker:
                 await asyncio.to_thread(stage_one_file, self.cfg, dest, transfer)
             if not complete:
                 continue
-            scan_path = str(Path(self.cfg.lidarr_scan_path) / dest.name)
-            try:
-                self.lidarr.scan_downloaded(scan_path)
-            except Exception:
-                log.exception("Lidarr scan failed for %s; trying the staged folder", scan_path)
-                try:
-                    self.lidarr.scan_downloaded(str(dest))
-                except Exception:
-                    log.exception("Lidarr scan failed for manual download %s", dest)
+            self._prepare_staged_folder(dest, {"title": folder, "artist": {"artistName": group_artist}}, [])
+            scanned, reason = self._scan_staged_folder(dest)
+            if not scanned:
+                log.warning("Lidarr scan failed for manual download %s: %s", dest, reason)
         finished = {id(item) for item in transfers}
         self.manual_transfers = [item for item in self.manual_transfers if id(item) not in finished or state_name(item) not in {"COMPLETE", "FAILED", "ABORTED"}]
         self.maybe_auto_import()

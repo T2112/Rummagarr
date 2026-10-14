@@ -2,6 +2,35 @@
 
 All notable changes to this project are documented here.
 
+## [1.12.0] — 2026-10-14
+
+### Added
+
+- A download that fails or times out tries the next best Soulseek user in the same visit. That user and folder are remembered on a blocklist. Settings → Blocklist can remove one row or clear the list.
+- A FLAC whose bitrate is far too low, or whose spectrum cuts off like a lossy file, is treated as fake. That user is blocklisted and the next user is tried.
+- MusicBrainz album, release-group, and recording ids are written on the staged files before Lidarr imports them.
+- Live, compilation, single, and bootleg albums are skipped unless Settings allows that type or the artist's Lidarr metadata profile allows it. The Status line says why an album produced no search.
+- Each Start writes a run summary: grabbed, imported, moved to Review, and failed with the reason. The Status card shows the counts, and the same text is saved as `run-summary.txt` next to the log.
+- The folder Rummagarr prefers can be filled from another format in the same folder when that format is missing a wanted track.
+- A free-slot match that is still a weak score waits a few seconds for a stronger folder before the search ends early.
+- The in-app update prompt shows the changelog section for the new version.
+
+### Changed
+
+- Lidarr's DownloadedAlbumsScan and RenameFiles commands are waited on before the wanted list is read back. An album is marked imported only after Lidarr shows the files. A failed or timed-out scan moves the files to Review.
+- Album searches use the track list saved at Sync. Lidarr is asked for tracks only when that list is missing.
+- The album cap pauses until the next day instead of stopping the worker. It counts a search only after Soulseek accepts it. Skipped albums are not counted.
+- The next artist is chosen in one database query. The worker can search the next artist while Lidarr is still scanning, and waits for the wanted resync.
+- A year is included in the Soulseek query when it is this calendar year or earlier. Only a year in the future is left off.
+- Albums at a time defaults to 3, matching the example config. Albums per cycle defaults to 1.
+- Queue and history failures are read past the first page.
+
+### Fixed
+
+- A file already in the download folder is no longer marked imported. It stays staged until Lidarr shows it.
+- Locked Soulseek files are left out of the folder that is scored.
+- An album already marked partial is not searched as a full album again.
+
 ## [1.11.0] — 2026-10-13
 
 ### Added

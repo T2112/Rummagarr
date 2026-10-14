@@ -175,7 +175,7 @@ class JobStore:
         job = self.get(album_id)
         if not job:
             return False
-        if job["status"] in {"imported", "downloading"}:
+        if job["status"] in {"imported", "downloading", "partial", "staged"}:
             return True
         if job["status"] in {"not_sent", "import_failed"}:
             return False
@@ -298,7 +298,7 @@ class JobStore:
         job = self.get_track(track_id)
         if not job:
             return False
-        if job["status"] in {"imported", "downloading"}:
+        if job["status"] in {"imported", "downloading", "staged"}:
             return True
         if job["status"] in {"not_sent", "import_failed"}:
             return False
@@ -357,7 +357,7 @@ class JobStore:
             ).fetchall()
         for album_id, name, title in rows:
             job = self.get(int(album_id))
-            if not job or job["status"] not in {"imported", "downloading", "searching"}:
+            if not job or job["status"] not in {"imported", "downloading", "searching", "staged"}:
                 continue
             self.upsert(int(album_id), name, title, "import_failed", detail)
 
@@ -1364,6 +1364,221 @@ class JobStore:
                 return artist
         return None
 
+    def saved_tracks(self, album_id: int) -> list[dict] | None:
+        """Track rows saved at Sync. None when this album has no saved tracks."""
+        with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT track_json FROM wanted_rows
+                WHERE album_id = ? AND kind = 'song' AND track_json IS NOT NULL AND track_json != ''
+                """,
+                (int(album_id),),
+            ).fetchall()
+        tracks = []
+        for (payload,) in rows:
+            data = _loads(payload)
+            if isinstance(data, dict) and data.get("id") is not None:
+                tracks.append(data)
+        return tracks or None
+
+    def next_ready_artist(self, skip: set[str] | None = None, *, tag: str = "", retry_before: str = "") -> str | None:
+        """The first artist who can be searched now, in one query.
+
+        Monitored and recently added still come first. The skip set is cooled
+        or deferred artists. ``retry_before`` is the ISO timestamp before which
+        a failed or no-match job may be searched again.
+        """
+        self._ensure_artist_priority()
+        skip_tokens = sorted({(item or "").casefold().strip() for item in (skip or set()) if item})
+        wanted_tag = (tag or "").casefold().strip()
+        cutoff = retry_before or "9999"
+        with self._lock:
+            self._db.execute("CREATE TEMP TABLE IF NOT EXISTS ready_skip (token TEXT PRIMARY KEY)")
+            self._db.execute("DELETE FROM ready_skip")
+            if skip_tokens:
+                self._db.executemany(
+                    "INSERT OR IGNORE INTO ready_skip(token) VALUES (?)",
+                    [(token,) for token in skip_tokens],
+                )
+            row = self._db.execute(
+                """
+                SELECT a.artist
+                FROM wanted_artists a
+                WHERE a.disabled_children < (a.albums + a.songs)
+                  AND NOT EXISTS (SELECT 1 FROM ready_skip s WHERE s.token = a.artist_key)
+                  AND (
+                    EXISTS (
+                      SELECT 1
+                      FROM wanted_rows album
+                      LEFT JOIN jobs j ON j.album_id = album.album_id
+                      LEFT JOIN wanted_stats st ON st.kind = 'album'
+                      WHERE album.artist_key = a.artist_key
+                        AND album.kind = 'album'
+                        AND album.album_id IS NOT NULL
+                        AND IFNULL(CAST(json_extract(album.payload, '$.statistics.trackFileCount') AS INTEGER), 0) = 0
+                        AND (
+                          (album.enabled_gen = IFNULL(st.generation, 0) AND album.enabled = 1)
+                          OR (album.enabled_gen != IFNULL(st.generation, 0) AND IFNULL(st.default_enabled, 1) = 1)
+                        )
+                        AND (
+                          j.album_id IS NULL
+                          OR j.status IN ('not_sent', 'import_failed', 'stopped', 'skipped', 'searching')
+                          OR (j.status IN ('failed', 'no_match') AND j.updated_at < ?)
+                        )
+                    )
+                    OR EXISTS (
+                      SELECT 1
+                      FROM wanted_rows album
+                      LEFT JOIN wanted_stats st ON st.kind = 'album'
+                      WHERE album.artist_key = a.artist_key
+                        AND album.kind = 'album'
+                        AND IFNULL(CAST(json_extract(album.payload, '$.statistics.trackFileCount') AS INTEGER), 0) > 0
+                        AND IFNULL(CAST(json_extract(album.payload, '$.statistics.trackFileCount') AS INTEGER), 0)
+                            < COALESCE(
+                                CAST(json_extract(album.payload, '$.statistics.totalTrackCount') AS INTEGER),
+                                CAST(json_extract(album.payload, '$.statistics.trackCount') AS INTEGER),
+                                0
+                            )
+                        AND (
+                          (album.enabled_gen = IFNULL(st.generation, 0) AND album.enabled = 1)
+                          OR (album.enabled_gen != IFNULL(st.generation, 0) AND IFNULL(st.default_enabled, 1) = 1)
+                        )
+                    )
+                    OR EXISTS (
+                      SELECT 1
+                      FROM wanted_rows song
+                      LEFT JOIN track_jobs t ON t.track_id = song.track_id
+                      LEFT JOIN wanted_rows album
+                        ON album.album_id = song.album_id AND album.kind = 'album'
+                      LEFT JOIN wanted_stats st ON st.kind = 'song'
+                      WHERE song.artist_key = a.artist_key
+                        AND song.kind = 'song'
+                        AND song.track_id IS NOT NULL
+                        AND IFNULL(CAST(json_extract(album.payload, '$.statistics.trackFileCount') AS INTEGER), 0) > 0
+                        AND (
+                          (song.enabled_gen = IFNULL(st.generation, 0) AND song.enabled = 1)
+                          OR (song.enabled_gen != IFNULL(st.generation, 0) AND IFNULL(st.default_enabled, 1) = 1)
+                        )
+                        AND (
+                          t.track_id IS NULL
+                          OR t.status IN ('not_sent', 'import_failed', 'stopped', 'skipped', 'searching')
+                          OR (t.status IN ('failed', 'no_match') AND t.updated_at < ?)
+                        )
+                    )
+                  )
+                  AND (
+                    ? = ''
+                    OR EXISTS (
+                      SELECT 1
+                      FROM wanted_rows tag_row, json_each(tag_row.payload, '$.tags') je
+                      WHERE tag_row.artist_key = a.artist_key
+                        AND tag_row.kind = 'album'
+                        AND lower(je.value) = ?
+                    )
+                    OR EXISTS (
+                      SELECT 1
+                      FROM wanted_rows tag_row, json_each(tag_row.payload, '$.artist.tags') je
+                      WHERE tag_row.artist_key = a.artist_key
+                        AND tag_row.kind = 'album'
+                        AND lower(je.value) = ?
+                    )
+                  )
+                ORDER BY a.monitored DESC,
+                         CASE WHEN a.added = '' THEN 1 ELSE 0 END,
+                         a.added DESC,
+                         a.sort_artist
+                LIMIT 1
+                """,
+                (cutoff, cutoff, wanted_tag, wanted_tag, wanted_tag),
+            ).fetchone()
+        return None if not row else row[0]
+
+    def _ensure_artist_priority(self) -> None:
+        with self._lock:
+            if self._meta_locked("artist_priority") == "1":
+                return
+            self._refresh_artist_priority_locked()
+            self._db.commit()
+
+    def _refresh_artist_priority_locked(self) -> None:
+        self._add_column("wanted_artists", "monitored", "INTEGER NOT NULL DEFAULT 1")
+        self._add_column("wanted_artists", "added", "TEXT NOT NULL DEFAULT ''")
+        self._db.execute(
+            """
+            UPDATE wanted_artists
+            SET monitored = IFNULL((
+                    SELECT MAX(CASE
+                        WHEN json_extract(r.payload, '$.monitored') IN (0, 'false', '0') THEN 0
+                        ELSE 1
+                    END)
+                    FROM wanted_rows r
+                    WHERE r.artist_key = wanted_artists.artist_key AND r.kind = 'album'
+                ), 1),
+                added = IFNULL((
+                    SELECT MAX(json_extract(r.payload, '$.added'))
+                    FROM wanted_rows r
+                    WHERE r.artist_key = wanted_artists.artist_key AND r.kind = 'album'
+                ), '')
+            """
+        )
+        self._set_meta_locked("artist_priority", "1")
+
+    def block_source(self, username: str, folder: str, reason: str) -> None:
+        name = (username or "").strip()
+        if not name:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO blocklist(username, folder, reason, created_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(username, folder) DO UPDATE SET
+                    reason = excluded.reason,
+                    created_at = excluded.created_at
+                """,
+                (name, folder or "", reason or "failed", now),
+            )
+            self._db.commit()
+
+    def source_blocked(self, username: str, folder: str = "") -> bool:
+        name = (username or "").casefold().strip()
+        if not name:
+            return False
+        remote = (folder or "").casefold().strip()
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT username, folder FROM blocklist WHERE lower(username) = ?",
+                (name,),
+            ).fetchall()
+        for _user, blocked_folder in rows:
+            blocked = (blocked_folder or "").casefold().strip()
+            if not blocked or blocked == remote or (remote and remote.startswith(blocked)):
+                return True
+        return False
+
+    def blocklist_rows(self) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT id, username, folder, reason, created_at
+                FROM blocklist
+                ORDER BY created_at DESC, id DESC
+                """
+            ).fetchall()
+        keys = ("id", "username", "folder", "reason", "created_at")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def clear_block(self, row_id: int) -> None:
+        with self._lock:
+            self._db.execute("DELETE FROM blocklist WHERE id = ?", (int(row_id),))
+            self._db.commit()
+
+    def clear_blocklist(self) -> None:
+        with self._lock:
+            self._db.execute("DELETE FROM blocklist")
+            self._db.commit()
+
     def _artist_has_tag_locked(self, token: str, tag: str) -> bool:
         rows = self._db.execute(
             """
@@ -1535,6 +1750,14 @@ class JobStore:
                 artist_id INTEGER,
                 page_fingerprint TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS blocklist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                folder TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(username, folder)
+            );
             """
         )
         self._add_column("wanted_rows", "enabled_gen", "INTEGER NOT NULL DEFAULT 0")
@@ -1546,6 +1769,8 @@ class JobStore:
         self._add_column("wanted_artists", "disabled_songs", "INTEGER NOT NULL DEFAULT 0")
         self._add_column("wanted_stats", "generation", "INTEGER NOT NULL DEFAULT 0")
         self._add_column("wanted_stats", "default_enabled", "INTEGER NOT NULL DEFAULT 1")
+        self._add_column("wanted_artists", "monitored", "INTEGER NOT NULL DEFAULT 1")
+        self._add_column("wanted_artists", "added", "TEXT NOT NULL DEFAULT ''")
         self._db.commit()
 
     def _add_column(self, table: str, column: str, declaration: str) -> None:
@@ -1751,6 +1976,7 @@ class JobStore:
         self._sync_start = count
         self._sync_inserted = 0
         self._refresh_artist_details_locked(None)
+        self._set_meta_locked("artist_priority", "0")
 
     def _rebuild_stats_locked(self) -> None:
         modes = self._stat_modes_locked()
