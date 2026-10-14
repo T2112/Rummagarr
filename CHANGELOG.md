@@ -16,6 +16,10 @@ All notable changes to this project are documented here.
 - The Status card has a Details toggle for the login and server line. Downloads that are already running are not labeled Soulseek offline.
 - Lidarr requests use a longer timeout, retry with a pause between tries, and lookup or paged routes instead of the full artist list. When Lidarr does not answer, the status line says Lidarr unreachable.
 
+### Fixed
+
+- Converting a download with ffmpeg, and launching the installer, no longer opens a blank console window. On Windows 11 that window was Windows Terminal, titled with a path under AppData\Local, and it took the keyboard. Child processes are started with CREATE_NO_WINDOW and a hidden window.
+
 ### Changed
 
 - The last automatic import result, including the Lidarr error, stays on the Status card until the next artist visit finishes.

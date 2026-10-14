@@ -4,7 +4,6 @@ import asyncio
 import logging
 import re
 import shutil
-import subprocess
 import threading
 import time
 from dataclasses import replace
@@ -71,6 +70,7 @@ from match import (
     score_track_item,
     seconds_from_lidarr,
 )
+from process_launch import run_hidden
 from sharing import (
     IDLE_FLOOR_SECONDS,
     Decision,
@@ -509,7 +509,7 @@ def convert_to_mp3(src: Path, dest_mp3: Path, bitrate: int) -> None:
         "3",
         str(dest_mp3),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = run_hidden(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed for {src.name}: {proc.stderr[-500:]}")
 

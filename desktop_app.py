@@ -4084,4 +4084,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from process_launch import configure_child_processes
+
+    configure_child_processes()
     main()
