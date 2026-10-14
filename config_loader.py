@@ -53,7 +53,7 @@ class Config:
     clean_incomplete_on_fail: bool = True
     incomplete_max_age_hours: float = 12.0
     ignored_users: set[str] = field(default_factory=set)
-    concurrent_albums: int = 1
+    concurrent_albums: int = 3
     lidarr_track_concurrency: int = 6
     download_timeout_minutes: int = 90
     status_bind: str = "127.0.0.1"
@@ -76,6 +76,11 @@ class Config:
     confirm_download_all: bool = True
     max_albums_per_run: int = 40
     wanted_tag: str = ""
+    follow_metadata_profile: bool = True
+    allow_live: bool = False
+    allow_compilation: bool = False
+    allow_single: bool = False
+    allow_bootleg: bool = False
 
 
 def normalize_theme(value) -> str:
@@ -271,6 +276,11 @@ def default_config(**overrides) -> Config:
         confirm_download_all=bool(overrides.pop("confirm_download_all", True)),
         max_albums_per_run=int(overrides.pop("max_albums_per_run", 40)),
         wanted_tag=str(overrides.pop("wanted_tag", "")),
+        follow_metadata_profile=bool(overrides.pop("follow_metadata_profile", True)),
+        allow_live=bool(overrides.pop("allow_live", False)),
+        allow_compilation=bool(overrides.pop("allow_compilation", False)),
+        allow_single=bool(overrides.pop("allow_single", False)),
+        allow_bootleg=bool(overrides.pop("allow_bootleg", False)),
     )
     if overrides:
         cfg = replace(cfg, **overrides)
@@ -330,6 +340,11 @@ def save_config(path: Path, cfg: Config) -> None:
             f"max_albums_per_cycle = {int(cfg.max_albums_per_cycle)}",
             f"max_albums_per_run = {int(cfg.max_albums_per_run)}",
             f"wanted_tag = {_toml_str(cfg.wanted_tag)}",
+            f"follow_metadata_profile = {_toml_bool(cfg.follow_metadata_profile)}",
+            f"allow_live = {_toml_bool(cfg.allow_live)}",
+            f"allow_compilation = {_toml_bool(cfg.allow_compilation)}",
+            f"allow_single = {_toml_bool(cfg.allow_single)}",
+            f"allow_bootleg = {_toml_bool(cfg.allow_bootleg)}",
             f"focus_one_artist = {_toml_bool(cfg.focus_one_artist)}",
             f"artist_cooldown_days = {cfg.artist_cooldown_days}",
             f"max_missing_pages = {int(cfg.max_missing_pages)}",
@@ -449,7 +464,7 @@ def try_load_config(path: Path) -> Config:
         state_db=state_db,
         log_file=log_file,
         search_wait_seconds=float(search.get("search_wait_seconds", 12)),
-        max_albums_per_cycle=int(search.get("max_albums_per_cycle", 3)),
+        max_albums_per_cycle=int(search.get("max_albums_per_cycle", 1)),
         max_albums_per_run=int(search.get("max_albums_per_run", 40)),
         wanted_tag=str(search.get("wanted_tag", "") or ""),
         max_tracks_per_cycle=int(search.get("max_tracks_per_cycle", 5)),
@@ -469,7 +484,7 @@ def try_load_config(path: Path) -> Config:
         clean_incomplete_on_fail=bool(search.get("clean_incomplete_on_fail", True)),
         incomplete_max_age_hours=float(search.get("incomplete_max_age_hours", 12)),
         ignored_users={u.lower() for u in search.get("ignored_users", []) if u},
-        concurrent_albums=int(runtime.get("concurrent_albums", 1)),
+        concurrent_albums=int(runtime.get("concurrent_albums", 3)),
         lidarr_track_concurrency=max(1, min(8, int(runtime.get("lidarr_track_concurrency", 6)))),
         download_timeout_minutes=int(runtime.get("download_timeout_minutes", 90)),
         status_bind=str(runtime.get("status_bind", "127.0.0.1")),
@@ -491,4 +506,9 @@ def try_load_config(path: Path) -> Config:
         auto_import_after_artist=bool(lidarr.get("auto_import_after_artist", False)),
         theme=normalize_theme(ui.get("theme", "dark")),
         confirm_download_all=bool(ui.get("confirm_download_all", True)),
+        follow_metadata_profile=bool(search.get("follow_metadata_profile", True)),
+        allow_live=bool(search.get("allow_live", False)),
+        allow_compilation=bool(search.get("allow_compilation", False)),
+        allow_single=bool(search.get("allow_single", False)),
+        allow_bootleg=bool(search.get("allow_bootleg", False)),
     )

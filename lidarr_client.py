@@ -215,6 +215,41 @@ class LidarrClient:
         payload = self._get("/qualityprofile") or []
         return payload if isinstance(payload, list) else []
 
+    def metadata_profiles(self) -> list[dict[str, Any]]:
+        payload = self._get("/metadataprofile") or []
+        return payload if isinstance(payload, list) else []
+
+    def finish_command(self, result: Any, timeout: float = 900.0) -> dict[str, Any]:
+        """Wait until Lidarr finishes a command accepted by POST /command.
+
+        A result with no id is returned as-is. Callers that only need the POST
+        to be accepted keep working. A command that never leaves the queue
+        comes back with status ``timeout``.
+        """
+        body = result.get("body") if isinstance(result, dict) and isinstance(result.get("body"), dict) else result
+        if not isinstance(body, dict):
+            return {}
+        raw = body.get("id")
+        try:
+            command_id = int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            command_id = None
+        if not command_id:
+            return body
+        deadline = time.time() + max(1.0, float(timeout))
+        last = dict(body)
+        while time.time() < deadline:
+            payload = self._get_once(f"/command/{command_id}", timeout=20.0)
+            if isinstance(payload, dict) and payload.get("id"):
+                last = payload
+            status = str(last.get("status") or "").casefold()
+            if status in {"completed", "failed", "aborted", "cancelled", "canceled"}:
+                return last
+            time.sleep(1.0)
+        last = dict(last)
+        last["status"] = "timeout"
+        return last
+
     def missing_tracks_on_partial_albums(self) -> list[dict[str, Any]]:
         """Monitored tracks that have no file, on albums that already have at least one file.
 
@@ -299,20 +334,41 @@ class LidarrClient:
         if not wanted:
             return []
         found: list[str] = []
-        queries = (
-            ("/queue", {"page": 1, "pageSize": 50, "includeUnknownArtistItems": "true"}),
-            ("/history", {"page": 1, "pageSize": 40, "sortKey": "date", "sortDirection": "descending"}),
+        found.extend(
+            self._problem_pages(
+                "/queue",
+                {"includeUnknownArtistItems": "true"},
+                page_size=50,
+                artist=wanted,
+            )
         )
-        for path, params in queries:
+        found.extend(
+            self._problem_pages(
+                "/history",
+                {"sortKey": "date", "sortDirection": "descending"},
+                page_size=40,
+                artist=wanted,
+            )
+        )
+        return found
+
+    def _problem_pages(self, path: str, extra: dict[str, str], *, page_size: int, artist: str) -> list[str]:
+        """Every page of queue or history, stopping when a page is short or Lidarr does not answer."""
+        found: list[str] = []
+        for page in range(1, 21):
+            params = {"page": page, "pageSize": page_size, **extra}
             try:
                 response = self._client.get(f"/api/v1{path}", params=params, timeout=20.0)
                 if response.status_code >= 400:
-                    continue
+                    break
                 payload = response.json()
             except Exception:
                 log.info("Could not read Lidarr %s after import", path)
-                continue
-            found.extend(_import_problem_lines(payload, wanted))
+                break
+            found.extend(_import_problem_lines(payload, artist))
+            records = payload.get("records") if isinstance(payload, dict) else payload
+            if not isinstance(records, list) or len(records) < page_size:
+                break
         return found
 
     def rename_artist_files(self, artist_id: int) -> Any:

@@ -74,10 +74,12 @@ def test_apostrophes_and_slashes_already_share_one_folded_query():
 
 
 def test_a_placeholder_year_is_left_off_the_query():
-    queries = build_queries("Björk", "Fossora", "2026")
+    queries = build_queries("Björk", "Fossora", "2099")
     assert queries[0] == "bjork fossora"
-    assert all("2026" not in query for query in queries)
+    assert all("2099" not in query for query in queries)
     assert any(query.startswith("Björk") for query in queries)
+    current = build_queries("Björk", "Fossora", "2026")
+    assert "2026" in current[0]
 
 
 def test_aliases_are_extra_terms_and_duplicates_are_skipped():

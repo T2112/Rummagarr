@@ -653,6 +653,23 @@ def slim_album(album: dict) -> dict:
     tags = _tag_labels(album.get("tags")) + _tag_labels(artist.get("tags"))
     if tags:
         slim_artist["tags"] = tags
+    profile_id = album.get("metadataProfileId") or artist.get("metadataProfileId")
+    if profile_id is not None:
+        slim_artist["metadataProfileId"] = profile_id
+    releases = []
+    raw_releases = album.get("releases")
+    if isinstance(raw_releases, list):
+        for release in raw_releases:
+            if not isinstance(release, dict):
+                continue
+            releases.append(
+                {
+                    "foreignReleaseId": release.get("foreignReleaseId") or "",
+                    "title": release.get("title") or "",
+                    "trackCount": release.get("trackCount"),
+                    "monitored": bool(release.get("monitored", True)),
+                }
+            )
     slim = {
         "id": album.get("id"),
         "title": album.get("title"),
@@ -663,6 +680,16 @@ def slim_album(album: dict) -> dict:
         "monitored": album.get("monitored", True),
         "added": album.get("added") or "",
     }
+    if album.get("albumType"):
+        slim["albumType"] = album.get("albumType")
+    if album.get("secondaryTypes"):
+        slim["secondaryTypes"] = album.get("secondaryTypes")
+    if profile_id is not None:
+        slim["metadataProfileId"] = profile_id
+    if album.get("foreignAlbumId"):
+        slim["foreignAlbumId"] = album.get("foreignAlbumId")
+    if releases:
+        slim["releases"] = releases
     if album.get("qualityProfileId") is not None:
         slim["qualityProfileId"] = album.get("qualityProfileId")
     if tags:
@@ -697,6 +724,10 @@ def slim_track(track: dict) -> dict:
     }
     if track.get("duration"):
         slim["duration"] = track.get("duration")
+    if track.get("foreignRecordingId"):
+        slim["foreignRecordingId"] = track.get("foreignRecordingId")
+    if track.get("foreignTrackId"):
+        slim["foreignTrackId"] = track.get("foreignTrackId")
     return slim
 
 
