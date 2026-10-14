@@ -90,16 +90,6 @@ jobs:
           )
           notes_file=$(mktemp)
           python3 scripts/release_notes.py --version "$version" > "$notes_file"
-          cat >> "$notes_file" <<EOF
-
-Windows installer for Rummagarr ${version}.
-
-Download Rummagarr-Setup-${version}.exe and run it. The first window asks for the Lidarr URL, API key, and Soulseek login.
-
-The same installer is also attached as LidarrSoulseek-Setup-${version}.exe so an installed copy of 1.9.4 can update from Help → Check for updates. Both .sha256 files are the installer checksum.
-
-ffmpeg is separate if you want FLAC converted to MP3: winget install Gyan.FFmpeg.
-EOF
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" \
               "$asset" "${asset}.sha256" \

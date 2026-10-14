@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from changelog_notes import ChangelogError, changelog_section
+from changelog_notes import ChangelogError, release_body
 
 
 def main() -> int:
@@ -19,7 +19,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         text = args.changelog.read_text(encoding="utf-8")
-        print(changelog_section(text, args.version))
+        print(release_body(text, args.version), end="")
     except (OSError, ChangelogError) as exc:
         print(str(exc), file=sys.stderr)
         return 1

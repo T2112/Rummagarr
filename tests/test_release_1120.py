@@ -42,6 +42,18 @@ def test_changelog_section_is_the_version_and_nothing_after_it():
         raise AssertionError("missing section should fail")
 
 
+def test_release_body_is_the_changelog_then_the_installer_notes():
+    from changelog_notes import release_body
+
+    text = "## [1.12.0] — 2026-10-14\n\n- Tries the next user\n\n## [1.11.0] — 2026-10-13\n\n- Older\n"
+    body = release_body(text, "1.12.0")
+    assert body.startswith("## [1.12.0]")
+    assert "Tries the next user" in body
+    assert "1.11.0" not in body.split("Windows installer for Rummagarr", 1)[0]
+    assert body.index("Tries the next user") < body.index("Windows installer for Rummagarr 1.12.0.")
+    assert "Rummagarr-Setup-1.12.0.exe" in body
+
+
 def test_shipped_changelog_has_the_published_versions():
     from pathlib import Path
 
