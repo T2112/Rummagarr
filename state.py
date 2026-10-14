@@ -895,6 +895,53 @@ class JobStore:
             )
         return albums
 
+    def replace_artist_wanted(self, artist: str, rows: list[dict]) -> None:
+        """Replace one artist's saved wanted rows. Other artists stay.
+
+        Does nothing until Sync has stored a catalog, so a one-artist refresh
+        cannot replace the live Lidarr list with a single artist.
+        """
+        token = (artist or "").casefold().strip()
+        if not token or not self._catalog_ready:
+            return
+        with self._lock:
+            saved = {
+                key: (int(enabled), int(enabled_gen or 0))
+                for key, enabled, enabled_gen in self._db.execute(
+                    "SELECT key, enabled, enabled_gen FROM wanted_rows WHERE artist_key = ?",
+                    (token,),
+                )
+            }
+            album_ids = [
+                int(album_id)
+                for (album_id,) in self._db.execute(
+                    """
+                    SELECT DISTINCT album_id FROM wanted_rows
+                    WHERE artist_key = ? AND album_id IS NOT NULL
+                    """,
+                    (token,),
+                )
+            ]
+            self._db.execute("DELETE FROM wanted_rows WHERE artist_key = ?", (token,))
+            if album_ids:
+                marks = ",".join("?" * len(album_ids))
+                self._db.execute(
+                    f"DELETE FROM wanted_track_queue WHERE album_id IN ({marks})",
+                    album_ids,
+                )
+        prepared = []
+        for row in rows:
+            item = dict(row)
+            previous = saved.get(item["key"])
+            if previous is not None:
+                item["keep_choice"] = previous
+            prepared.append(item)
+        if prepared:
+            self.write_wanted_page(prepared)
+        with self._lock:
+            self._rebuild_derived_locked()
+            self._db.commit()
+
     def replace_album_songs(self, album_id: int, rows: list[dict], fingerprint: str) -> None:
         """Replace one album's song rows and remember the wanted/missing fingerprint."""
         with self._lock:

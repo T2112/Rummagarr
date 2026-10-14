@@ -52,8 +52,10 @@ from wanted import (
     count_value,
     holes_for_search,
     is_enabled,
+    items_to_rows,
     optional_id,
     song_key,
+    wanted_from_library,
 )
 from match import (
     AUDIO_EXT,
@@ -714,7 +716,8 @@ class Worker:
         """Start one Lidarr import per time the queue is empty after an artist finishes.
 
         A later call while the queue stays empty does nothing. The scan runs on
-        a side thread so the worker can search the next artist.
+        a side thread so the window stays responsive. The worker waits for that
+        thread, including the wanted resync, before it picks the next artist.
         """
         if not self.cfg.auto_import_after_artist:
             return
@@ -765,8 +768,10 @@ class Worker:
 
     def _import_one_artist(self, artist: str, folder: str) -> None:
         self._publish_import(f"Importing {artist} into Lidarr...", hold=True)
+        scanned = False
         try:
             result = self.lidarr.scan_downloaded(folder)
+            scanned = True
             problems = self._import_problems(artist)
             if problems:
                 detail = "; ".join(problems)
@@ -788,6 +793,9 @@ class Worker:
             detail = str(exc).strip() or exc.__class__.__name__
             log.exception("Importing %s into Lidarr failed", artist)
             self._publish_import(f"Importing {artist} into Lidarr failed: {detail}", hold=False)
+        finally:
+            if scanned:
+                self.resync_artist_from_lidarr(artist)
 
     def _import_problems(self, artist: str) -> list[str]:
         checker = getattr(self.lidarr, "import_failures", None)
@@ -852,6 +860,201 @@ class Worker:
                 if self._import_thread is threading.current_thread():
                     self._import_thread = None
             self.maybe_auto_import()
+
+    async def _wait_for_import(self) -> None:
+        """Let a finished import resync that artist before the next search."""
+        while not self.control.is_stopped():
+            self.maybe_auto_import()
+            with self._import_lock:
+                thread = self._import_thread
+                pending = bool(self._import_armed and self._import_artists)
+            if thread is not None and thread.is_alive():
+                await asyncio.sleep(0.2)
+                continue
+            if pending and not self._queue_busy() and self.cfg.auto_import_after_artist:
+                await asyncio.sleep(0.05)
+                continue
+            return
+
+    def resync_artist_from_lidarr(self, artist: str) -> None:
+        """Refresh one artist's wanted rows and track files from Lidarr.
+
+        Already-imported albums and tracks are marked imported so the next pass
+        does not search them. A Lidarr that does not answer leaves the list as it was.
+        """
+        name = (artist or "").strip()
+        if not name:
+            return
+        loader = getattr(self.lidarr, "artist_library", None)
+        if not callable(loader):
+            return
+        try:
+            library = loader(name)
+        except Exception:
+            log.exception("Could not resync %s from Lidarr", name)
+            return
+        if not library or library.get("artist_id") is None:
+            log.info("Lidarr did not return a library for %s; the wanted list was left as-is", name)
+            return
+        items, imported_albums, imported_tracks = wanted_from_library(
+            library.get("albums") or [],
+            library.get("tracks") or [],
+        )
+        for album_id, album_artist, title in imported_albums:
+            self.store.upsert(album_id, album_artist, title, "imported", "already in Lidarr")
+        for track_id, album_id, track_artist, title in imported_tracks:
+            self.store.upsert_track(track_id, album_id, track_artist, title, "imported", "already in Lidarr")
+        rows = items_to_rows(items) if items else []
+        self.store.replace_artist_wanted(name, rows)
+        if self.catalog.synced:
+            self.catalog.merge_artist(name, items)
+        log.info(
+            "Resynced %s from Lidarr: %s still wanted, %s album(s) already imported",
+            name,
+            sum(1 for item in items if item.kind != "artist"),
+            len(imported_albums),
+        )
+
+    def requeue_block(self, artist: str, title: str, year: str | None = None) -> str:
+        """Why this album must not be queued again, or an empty string."""
+        if self._album_queued(artist, title):
+            return "already queued"
+        if self._album_on_disk(artist, title, year):
+            return "already in the download folder"
+        return ""
+
+    def track_requeue_block(self, artist: str, album_title: str, track_title: str, year: str | None = None) -> str:
+        """Why this track must not be queued again, or an empty string."""
+        if self._track_queued(track_title, artist, album_title):
+            return "already queued"
+        if self._track_on_disk(artist, album_title, track_title, year):
+            return "already in the download folder"
+        return ""
+
+    def _album_stamps(self, artist: str, title: str, year: str | None) -> list[str]:
+        base = f"{safe_name(artist)} - {safe_name(title)}"
+        stamps = [base]
+        if year:
+            stamps.append(f"{base} ({year})")
+        return stamps
+
+    def _audio_in_dir(self, path: Path) -> list[Path]:
+        try:
+            if not path.is_dir():
+                return []
+            return [child for child in path.iterdir() if child.is_file() and child.suffix.lower() in AUDIO_EXT]
+        except OSError:
+            return []
+
+    def _album_roots(self) -> list[Path]:
+        roots = [self.cfg.complete_dir, self.cfg.download_dir]
+        scan = (self.cfg.lidarr_scan_path or "").strip()
+        if scan:
+            roots.append(Path(scan))
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for root in roots:
+            key = str(root)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(root)
+        return unique
+
+    def _album_on_disk(self, artist: str, title: str, year: str | None) -> bool:
+        for root in self._album_roots():
+            for stamp in self._album_stamps(artist, title, year):
+                if self._audio_in_dir(root / stamp):
+                    return True
+        return False
+
+    def _track_on_disk(self, artist: str, album_title: str, track_title: str, year: str | None) -> bool:
+        needle = (track_title or "").casefold().strip()
+        if not needle:
+            return False
+        for root in self._album_roots():
+            for stamp in self._album_stamps(artist, album_title, year):
+                for path in self._audio_in_dir(root / stamp):
+                    if needle in path.stem.casefold():
+                        return True
+        return False
+
+    def _live_transfers(self) -> list:
+        live = []
+        for transfer in list(self.active_transfers) + list(self.manual_transfers):
+            if state_name(transfer) in {"FAILED", "ABORTED", "COMPLETE"}:
+                continue
+            live.append(transfer)
+        return live
+
+    def _transfer_path(self, transfer) -> str:
+        raw = getattr(transfer, "filename", None) or getattr(transfer, "remote_path", None) or ""
+        return str(raw).replace("/", "\\").casefold()
+
+    def _album_queued(self, artist: str, title: str) -> bool:
+        artist_cf = (artist or "").casefold().strip()
+        title_cf = (title or "").casefold().strip()
+        if not artist_cf or not title_cf:
+            return False
+        for transfer in self._live_transfers():
+            parts = [part.strip() for part in self._transfer_path(transfer).split("\\") if part.strip()]
+            if any(artist_cf in part for part in parts) and any(title_cf in part for part in parts):
+                return True
+        return False
+
+    def _track_queued(self, track_title: str, artist: str = "", album_title: str = "") -> bool:
+        needle = (track_title or "").casefold().strip()
+        if not needle:
+            return False
+        artist_cf = (artist or "").casefold().strip()
+        album_cf = (album_title or "").casefold().strip()
+        for transfer in self._live_transfers():
+            path = self._transfer_path(transfer)
+            base = path.split("\\")[-1]
+            if needle not in base and needle not in path:
+                continue
+            if artist_cf and artist_cf not in path and album_cf and album_cf not in path:
+                continue
+            return True
+        return False
+
+    def _path_queued(self, filename: str) -> bool:
+        wanted = (filename or "").replace("/", "\\").casefold()
+        if not wanted:
+            return False
+        base = wanted.split("\\")[-1]
+        for transfer in self._live_transfers():
+            path = self._transfer_path(transfer)
+            if path == wanted or (base and path.split("\\")[-1] == base and (len(base) > 8 or "\\" in wanted)):
+                return True
+        return False
+
+    def _skip_queued_specs(self, specs: list[dict], link: dict | None) -> list[dict]:
+        """Drop manual files that are already queued or already in the download folder."""
+        kept = []
+        link = link or {}
+        for spec in specs:
+            filename = str(spec.get("filename") or "")
+            spec_link = spec.get("link") if isinstance(spec.get("link"), dict) else link
+            artist = str((spec_link or {}).get("artist") or link.get("artist") or "")
+            album = str((spec_link or {}).get("album") or link.get("album") or "")
+            title = str((spec_link or {}).get("title") or "")
+            kind = str((spec_link or {}).get("kind") or "").casefold()
+            if filename and self._path_queued(filename):
+                log.info("Skip %s: already queued", filename)
+                continue
+            if kind == "song" or (title and kind != "album"):
+                reason = self.track_requeue_block(artist, album, title or Path(filename).stem, None) if title or filename else ""
+                if reason:
+                    log.info("Skip %s - %s - %s: %s", artist, album, title or filename, reason)
+                    continue
+            elif album:
+                reason = self.requeue_block(artist, album, None)
+                if reason:
+                    log.info("Skip %s - %s: %s", artist, album, reason)
+                    continue
+            kept.append(spec)
+        return kept
 
     def ask_lidarr_rename(self, album: dict) -> None:
         artist = album.get("artist") or {}
@@ -1774,6 +1977,9 @@ class Worker:
     async def _cycle_once(self) -> None:
         if self.control.is_stopped():
             return
+        await self._wait_for_import()
+        if self.control.is_stopped():
+            return
         self.set_step(Step(kind="preparing"))
         # A Sync stores the wanted list in SQLite. Until that happens, keep
         # reading Lidarr 20 pages at a time and resume next cycle.
@@ -1926,6 +2132,7 @@ class Worker:
         if self._visit_had_download:
             self.arm_auto_import(focus)
         self._visit_had_download = False
+        await self._wait_for_import()
 
     def _close_focus(self, focus: str) -> None:
         if self._cycle_unsent_search:
@@ -2021,6 +2228,12 @@ class Worker:
         album_title = hole["album_title"]
         title = track.get("title") or "Unknown Track"
         year = album_year(album)
+        blocked = self.track_requeue_block(artist, album_title, title, year)
+        if blocked:
+            log.info("Skip %s - %s - %s: %s", artist, album_title, title, blocked)
+            status = "downloading" if blocked == "already queued" else "imported"
+            self.store.upsert_track(track_id, album_id, artist, title, status, blocked)
+            return True
         queries = build_track_queries(artist, album_title, title, aliases_from_album(album))
         log.info("Track search: %s", " | ".join(queries))
 
@@ -2248,6 +2461,12 @@ class Worker:
             return False
         assert self.client is not None
         year = album_year(album)
+        blocked = self.requeue_block(artist, title, year)
+        if blocked:
+            log.info("Skip %s - %s: %s", artist, title, blocked)
+            status = "downloading" if blocked == "already queued" else "imported"
+            self.store.upsert(album_id, artist, title, status, blocked)
+            return True
         tracks = self.lidarr.tracks_for_album(album_id)
         needed_tracks = monitored_missing_tracks(tracks)
         if not needed_tracks:
@@ -2940,6 +3159,10 @@ class Worker:
         the worker's own searches; it only adds transfers on that connection.
         """
         if not specs:
+            return ""
+        specs = self._skip_queued_specs(specs, link)
+        if not specs:
+            log.info("Nothing new to queue; those files are already queued or in the download folder")
             return ""
         if not await self.ensure_soulseek():
             raise RuntimeError("Start the worker to download. Downloads use that Soulseek connection.")

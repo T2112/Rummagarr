@@ -66,6 +66,29 @@ class LidarrClient:
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return self._request("GET", path, params=params)
 
+    def _get_once(self, path: str, params: dict[str, Any] | None = None, timeout: float = 5.0) -> Any:
+        """One GET. A downed Lidarr returns None instead of the long retry used by Sync."""
+        try:
+            response = self._client.request(
+                "GET",
+                f"/api/v1{path}",
+                params=params,
+                timeout=httpx.Timeout(timeout, connect=1.0),
+            )
+        except httpx.TransportError:
+            log.warning("Lidarr %s did not answer", path)
+            return None
+        if response.status_code >= 400:
+            log.warning("Lidarr %s returned %s", path, response.status_code)
+            return None
+        if not response.content:
+            return []
+        try:
+            return response.json()
+        except ValueError:
+            log.warning("Lidarr %s did not return JSON", path)
+            return None
+
     def _post(self, path: str, payload: dict[str, Any]) -> Any:
         return self._request("POST", path, payload=payload)
 
@@ -152,6 +175,41 @@ class LidarrClient:
             if label == wanted and artist_id:
                 return int(artist_id)
         return None
+
+    def artist_library(self, name: str) -> dict[str, Any] | None:
+        """Albums and tracks for one artist. None when Lidarr does not answer.
+
+        Uses the lookup and that artist's albums and tracks, not the full artist list.
+        Each request is a single attempt so a finished import is not held up by retries.
+        """
+        wanted = (name or "").casefold().strip()
+        if not wanted:
+            return None
+        payload = self._get_once("/search", {"term": name})
+        if payload is None:
+            return None
+        if isinstance(payload, dict):
+            payload = payload.get("results") or payload.get("records") or []
+        artist_id = None
+        if isinstance(payload, list):
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                artist = item.get("artist") if isinstance(item.get("artist"), dict) else item
+                label = (artist.get("artistName") or item.get("artistName") or "").casefold().strip()
+                found = artist.get("id") or item.get("artistId")
+                if label == wanted and found:
+                    artist_id = int(found)
+                    break
+        if not artist_id:
+            return {"artist_id": None, "albums": [], "tracks": []}
+        albums = self._get_once("/album", {"artistId": artist_id})
+        if not isinstance(albums, list):
+            return None
+        tracks = self._get_once("/track", {"artistId": artist_id})
+        if not isinstance(tracks, list):
+            return None
+        return {"artist_id": artist_id, "albums": albums, "tracks": tracks}
 
     def quality_profiles(self) -> list[dict[str, Any]]:
         payload = self._get("/qualityprofile") or []

@@ -485,6 +485,29 @@ def apply_theme(root: tk.Misc, name: str | None = None) -> None:
         rowheight=max(18, int(round(22 * palette.scale))),
         font=_sized_font(palette, 10),
     )
+    # Both themes use clam. The tree area has to stick to every edge or the
+    # list stops short of the window and leaves an empty band underneath.
+    style.layout(
+        "Treeview",
+        [
+            (
+                "Treeview.field",
+                {
+                    "sticky": "nswe",
+                    "border": "1",
+                    "children": [
+                        (
+                            "Treeview.padding",
+                            {
+                                "sticky": "nswe",
+                                "children": [("Treeview.treearea", {"sticky": "nswe"})],
+                            },
+                        )
+                    ],
+                },
+            )
+        ],
+    )
     style.configure(
         "Treeview.Heading",
         background=palette.tree_heading,
@@ -622,6 +645,13 @@ BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
     BehaviorField("convert_to_mp3", "Convert to MP3", "bool", "", "Convert FLAC and WAV to MP3 with ffmpeg before Lidarr imports them."),
     BehaviorField("convert_bitrate", "Convert bitrate", "int", "kbps", "Bitrate ffmpeg uses for the MP3.", 128, 320),
     BehaviorField(
+        "confirm_download_all",
+        "Ask before download all wanted",
+        "bool",
+        "",
+        "Download all wanted opens a checklist first. Turn this off to queue those files without asking. Turn it back on to show the popup again.",
+    ),
+    BehaviorField(
         "max_albums_per_run",
         "Albums per run",
         "int",
@@ -676,6 +706,7 @@ _PRIMARY_BEHAVIOR = frozenset(
         "cycle_seconds",
         "convert_to_mp3",
         "convert_bitrate",
+        "confirm_download_all",
     }
 )
 
@@ -699,7 +730,7 @@ _RESTART_FIELDS = frozenset(
     }
 )
 _LAUNCH_FIELDS = frozenset({"start_on_launch", "check_updates"})
-_IMMEDIATE_FIELDS = frozenset({"theme"})
+_IMMEDIATE_FIELDS = frozenset({"theme", "confirm_download_all"})
 _SHARE_LIVE_FIELDS = frozenset(
     {
         "upload_slots",
@@ -1640,7 +1671,7 @@ def _release_tk_objects(widget: tk.Misc) -> None:
 class WantedPreview(tk.Toplevel):
     """Wanted files about to be queued. All start checked."""
 
-    def __init__(self, master: tk.Misc, matches, on_queue, summary: str = "") -> None:
+    def __init__(self, master: tk.Misc, matches, on_queue, summary: str = "", on_dont_ask=None) -> None:
         super().__init__(master)
         self.title("Download wanted files")
         self.transient(master)
@@ -1648,6 +1679,8 @@ class WantedPreview(tk.Toplevel):
         self.minsize(640, 400)
         apply_theme(self)
         self.on_queue = on_queue
+        self.on_dont_ask = on_dont_ask
+        self.dont_ask = tk.BooleanVar(value=False)
         self.matches = list(matches)
         self._checked = {index: True for index in range(len(self.matches))}
         frame = ttk.Frame(self, padding=12)
@@ -1698,6 +1731,7 @@ class WantedPreview(tk.Toplevel):
         buttons.pack(fill="x", pady=(8, 0))
         ttk.Button(buttons, text="Queue checked", style="Start.TButton", command=self._queue).pack(side="left")
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(buttons, text="Don't ask again", variable=self.dont_ask).pack(side="left", padx=(16, 0))
 
     def _box(self, state: str) -> tk.PhotoImage:
         size = 16
@@ -1735,8 +1769,12 @@ class WantedPreview(tk.Toplevel):
 
     def _queue(self) -> None:
         picked = [match for index, match in enumerate(self.matches) if self._checked.get(index, False)]
+        remember = bool(self.dont_ask.get())
         callback = self.on_queue
+        skip = self.on_dont_ask
         self.destroy()
+        if remember and skip is not None:
+            skip()
         if picked:
             callback(picked)
 
@@ -2191,6 +2229,7 @@ class DesktopApp(tk.Tk):
             frame_style="Card.TFrame",
         )
         frame.pack(fill="both", expand=True)
+        self._bind_filling_tree(self.transfers)
         palette = active_palette(self)
         self.transfers.tag_configure("ok", foreground=palette.ok)
         self.transfers.tag_configure("bad", foreground=palette.bad)
@@ -2221,6 +2260,7 @@ class DesktopApp(tk.Tk):
             frame_style="Card.TFrame",
         )
         frame.pack(fill="both", expand=True)
+        self._bind_filling_tree(self.recent)
         port = self.worker.cfg.status_port
         host = self.worker.cfg.status_bind
         ttk.Label(
@@ -2307,6 +2347,7 @@ class DesktopApp(tk.Tk):
         self.wanted.bind("<Down>", self._wanted_key)
         self.wanted.bind("<Configure>", self._wanted_resized)
         self.wanted.bind("<Configure>", lambda _event: self._place_finders(), add="+")
+        self._bind_filling_tree(self.wanted)
 
     def _tick(self) -> None:
         if self._shutting_down:
@@ -2704,9 +2745,62 @@ class DesktopApp(tk.Tk):
         self._wanted_offset = 0
         self.refresh_wanted()
 
+    def _tree_row_px(self) -> int:
+        style = ttk.Style(self)
+        raw = style.lookup("Treeview", "rowheight")
+        try:
+            return max(1, int(float(str(raw))))
+        except (TypeError, ValueError):
+            return max(18, int(round(22 * self.ui_scale)))
+
+    def _rows_for_height(self, pixel_height: int, *, heading: int | None = None, row: int | None = None) -> int:
+        """How many rows fit in a list of this pixel height, including a partial last row."""
+        row_px = row or self._tree_row_px()
+        head = row_px if heading is None else max(0, heading)
+        body = max(row_px, int(pixel_height) - head)
+        return max(1, (body + row_px - 1) // row_px)
+
+    def _fit_tree(self, tree: ttk.Treeview | None) -> None:
+        """Give a table enough rows to fill its parent, in either theme."""
+        if tree is None or getattr(tree, "_fitting", False):
+            return
+        tree._fitting = True
+        try:
+            if not tree.winfo_exists():
+                return
+            available = tree.master.winfo_height()
+            if available < 40:
+                return
+            rows = self._rows_for_height(available)
+            if int(tree.cget("height")) != rows:
+                tree.configure(height=rows)
+        except (tk.TclError, ValueError):
+            return
+        finally:
+            tree._fitting = False
+
+    def _bind_filling_tree(self, tree: ttk.Treeview) -> None:
+        def _on_configure(_event, current=tree) -> None:
+            self._fit_tree(current)
+
+        tree.master.bind("<Configure>", _on_configure, add="+")
+        tree.bind("<Configure>", _on_configure, add="+")
+
     def _wanted_resized(self, event) -> None:
-        row_px = 28
-        window = max(WANTED_WINDOW_MIN, int(event.height) // row_px or 1)
+        self._fit_tree(self.wanted)
+        row_px = self._tree_row_px()
+        heading = row_px
+        try:
+            children = self.wanted.get_children()
+            if children:
+                box = self.wanted.bbox(children[0])
+                if box and box[1] > 0:
+                    heading = box[1]
+                    if box[3] > 0:
+                        row_px = box[3]
+        except tk.TclError:
+            pass
+        window = max(WANTED_WINDOW_MIN, self._rows_for_height(int(event.height), heading=heading, row=row_px))
         if window == self._wanted_window:
             return
         self._wanted_window = window
@@ -3037,6 +3131,7 @@ class DesktopApp(tk.Tk):
         scroll.grid(row=0, column=1, sticky="ns")
         tree_frame.rowconfigure(0, weight=1)
         tree_frame.columnconfigure(0, weight=1)
+        self._bind_filling_tree(board.tree)
         headings = (
             ("#0", "User / file", 360),
             ("size", "Size", 80),
@@ -3346,6 +3441,7 @@ class DesktopApp(tk.Tk):
             frame_style="Card.TFrame",
         )
         frame.pack(fill="both", expand=True)
+        self._bind_filling_tree(tree)
         self.shared_tree = tree
         tree.configure(selectmode="extended")
         self.refresh_shared()
@@ -3504,7 +3600,11 @@ class DesktopApp(tk.Tk):
         if board.status is not None:
             board.status.set(text)
         log.info("Download all wanted from %s for %r: %s", username, board.query, text)
-        WantedPreview(self, matches, lambda picked, board=board: self._queue_matches(board, picked), summary=text)
+        self._confirm_wanted(
+            matches,
+            lambda picked, board=board: self._queue_matches(board, picked),
+            summary=text,
+        )
 
     def _download_wanted_from_everyone(self, board: SearchBoard) -> None:
         scope = self._search_wanted_scope(board)
@@ -3525,12 +3625,28 @@ class DesktopApp(tk.Tk):
         log.info("Download all wanted for %r: %s%s", artist, text, extra)
         if not plan.matches:
             return
-        WantedPreview(
-            self,
+        self._confirm_wanted(
             plan.matches,
             lambda picked, board=board, text=text: self._queue_matches(board, picked, note=text),
             summary=text,
         )
+
+    def _confirm_wanted(self, matches, on_queue, summary: str = "") -> None:
+        """Ask before queueing Download all wanted, unless that popup was turned off."""
+        if not bool(getattr(self.worker.cfg, "confirm_download_all", True)):
+            on_queue(list(matches))
+            return
+        WantedPreview(self, matches, on_queue, summary=summary, on_dont_ask=self._disable_download_confirm)
+
+    def _disable_download_confirm(self) -> None:
+        self.worker.cfg = replace(self.worker.cfg, confirm_download_all=False)
+        form = self._settings_form
+        if form is not None and "confirm_download_all" in getattr(form, "fields", {}):
+            form.fields["confirm_download_all"].set(False)
+        try:
+            save_config(self.config_path, self.worker.cfg)
+        except OSError:
+            log.exception("Could not save the download confirmation setting")
 
     def _queue_matches(self, board: SearchBoard, matches, note: str = "") -> None:
         by_id = {item.id: item for item in board.files}

@@ -70,6 +70,7 @@ This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs 
 - Soulseek can start a download as soon as a free-slot match arrives. A search that never went out is retried when Soulseek reconnects, without the multi-day artist cooldown.
 - Status no longer says Soulseek is offline while a download is running. The login and server line is behind Details. The last auto-import result, including a Lidarr error, stays until the next artist finishes. A failed import (track count or an unmatched release) is flagged, moved to a Review folder, and the next try uses another user.
 - A large wanted list can be capped per run, with monitored and recently added artists first, and an optional Lidarr tag. Lidarr calls retry on a slow link and say Lidarr unreachable instead of sitting still. Behavior leads with formats, cooldown, wait, and conversion.
+- Wanted, Search, Shared, and Status lists fill the window. After Lidarr imports an artist, that artist's wanted rows are refreshed before the next search, and files already queued or already downloaded are not queued again. Download all wanted can remember Don't ask again; Settings turns the question back on.
 
 ## What's new in 1.10.0
 

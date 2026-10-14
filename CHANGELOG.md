@@ -6,6 +6,7 @@ All notable changes to this project are documented here.
 
 ### Added
 
+- Download all wanted asks with a checklist. Don't ask again saves that choice, and Settings → Behavior → Ask before download all wanted turns the popup back on.
 - Each album follows its Lidarr quality profile (Any, Lossless, or Standard). One format is downloaded for that album, from one user, and anything below the profile cutoff is skipped.
 - Matches use the file duration as well as the filename, and a studio recording is preferred to a live or remix cut unless the Lidarr title asks for one.
 - A free-slot match can be scored and downloaded before the full search wait ends.
@@ -18,6 +19,8 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- Wanted, Search, Shared, and the Status lists stretch to the bottom of the window in Dark and Light, including after the window is resized.
+- After an automatic Lidarr import, that artist's wanted albums and track files are read back from Lidarr before the next artist is searched. Albums and tracks Lidarr now has are not downloaded again. An album whose files are already queued or already in the download folder is not queued again.
 - Converting a download with ffmpeg, and launching the installer, no longer opens a blank console window. On Windows 11 that window was Windows Terminal, titled with a path under AppData\Local, and it took the keyboard. Child processes are started with CREATE_NO_WINDOW and a hidden window.
 
 ### Changed

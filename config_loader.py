@@ -73,6 +73,7 @@ class Config:
     pause_uploads: bool = False
     auto_import_after_artist: bool = False
     theme: str = "dark"
+    confirm_download_all: bool = True
     max_albums_per_run: int = 40
     wanted_tag: str = ""
 
@@ -267,6 +268,7 @@ def default_config(**overrides) -> Config:
         pause_uploads=bool(overrides.pop("pause_uploads", False)),
         auto_import_after_artist=bool(overrides.pop("auto_import_after_artist", False)),
         theme=normalize_theme(overrides.pop("theme", "dark")),
+        confirm_download_all=bool(overrides.pop("confirm_download_all", True)),
         max_albums_per_run=int(overrides.pop("max_albums_per_run", 40)),
         wanted_tag=str(overrides.pop("wanted_tag", "")),
     )
@@ -370,6 +372,7 @@ def save_config(path: Path, cfg: Config) -> None:
             "",
             "[ui]",
             f"theme = {_toml_str(normalize_theme(cfg.theme))}",
+            f"confirm_download_all = {_toml_bool(cfg.confirm_download_all)}",
             "",
         ]
     )
@@ -487,4 +490,5 @@ def try_load_config(path: Path) -> Config:
         pause_uploads=bool(sharing.get("pause_uploads", False)),
         auto_import_after_artist=bool(lidarr.get("auto_import_after_artist", False)),
         theme=normalize_theme(ui.get("theme", "dark")),
+        confirm_download_all=bool(ui.get("confirm_download_all", True)),
     )

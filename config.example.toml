@@ -80,3 +80,5 @@ check_updates = true
 [ui]
 # Dark matches the sidebar. Light is the same layout with a light palette.
 theme = "dark"
+# Download all wanted asks before queueing. false skips that popup.
+confirm_download_all = true
