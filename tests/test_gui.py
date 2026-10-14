@@ -397,6 +397,13 @@ def test_wait_before_next_artist_is_visible_and_the_behavior_tab_scrolls(tmp_pat
     assert form.save() is True
     assert saved["cfg"].cycle_seconds == 0
 
+    hidden = _label_named(form, "Albums at once")
+    assert hidden.winfo_ismapped() == 0
+    form.advanced_var.set(True)
+    form._toggle_advanced()
+    root.update()
+    assert hidden.winfo_ismapped() == 1
+
     bbox = canvas.bbox("all")
     assert bbox is not None and bbox[3] > canvas.winfo_height()
     canvas.yview_moveto(0)
@@ -653,6 +660,91 @@ def test_magnifier_opens_a_folded_search(desktop):
     file_iid = next(iter(song_board.row_files))
     assert "Cowboy.flac" in song_board.tree.item(file_iid, "text")
     assert song_board.tree.set(file_iid, "format") == "FLAC"
+
+
+def test_lists_fill_the_window_in_both_themes(desktop):
+    from desktop_app import apply_theme
+
+    desktop.notebook.select(desktop.wanted_tab)
+    for theme in ("dark", "light"):
+        apply_theme(desktop, theme)
+        for height in (900, 640):
+            desktop.geometry(f"1200x{height}")
+            desktop.update_idletasks()
+            desktop.update()
+            tree = desktop.wanted
+            assert tree.winfo_height() >= tree.master.winfo_height() - 8
+            assert desktop._wanted_window + 1 >= desktop._rows_for_height(tree.winfo_height())
+    desktop.geometry("1200x900")
+    desktop.notebook.select(desktop.shared_tab)
+    desktop.update()
+    assert desktop.shared_tree.winfo_height() >= desktop.shared_tree.master.winfo_height() - 8
+    desktop.notebook.select(desktop.status_tab)
+    desktop.update()
+    assert desktop.transfers.winfo_height() >= desktop.transfers.master.winfo_height() - 8
+    assert desktop.recent.winfo_height() >= desktop.recent.master.winfo_height() - 8
+    desktop.notebook.select(desktop.search_tab)
+    board = desktop._add_search_board("Ella Langley", None)
+    desktop.update()
+    assert board.tree is not None
+    assert board.tree.winfo_height() >= board.tree.master.winfo_height() - 8
+
+
+def test_download_all_wanted_can_skip_the_confirmation(desktop):
+    from desktop_app import WantedPreview
+    from search_model import SearchFile
+    from wanted import items_to_rows
+
+    desktop.worker.store.write_wanted_page(items_to_rows(desktop.worker.catalog.items()))
+    board = desktop._add_search_board("Ella Langley", None)
+    desktop.searches.select(board.frame)
+    desktop.show_search_files(
+        board,
+        [
+            SearchFile(
+                username="fast",
+                filename=r"Ella Langley\Hungover\01 Blue.flac",
+                extension="flac",
+                size=1000,
+                free_slot=True,
+                speed=9_000,
+            )
+        ],
+    )
+    desktop.update()
+    desktop.download_all_wanted()
+    desktop.update()
+    previews = [child for child in desktop.winfo_children() if isinstance(child, WantedPreview)]
+    assert len(previews) == 1
+    preview = previews[0]
+    assert preview.dont_ask.get() is False
+    preview.dont_ask.set(True)
+    preview._queue()
+    desktop.update()
+    assert desktop.worker.cfg.confirm_download_all is False
+    assert try_load_config(desktop.config_path).confirm_download_all is False
+    assert not [child for child in desktop.winfo_children() if isinstance(child, WantedPreview)]
+
+    desktop.download_all_wanted()
+    desktop.update()
+    assert not [child for child in desktop.winfo_children() if isinstance(child, WantedPreview)]
+    assert "Start the worker" in board.status.get()
+
+    desktop.notebook.select(desktop.settings_tab)
+    desktop.update()
+    form = desktop._settings_form
+    assert form is not None
+    assert form.fields["confirm_download_all"].get() is False
+    form.fields["confirm_download_all"].set(True)
+    assert form.save() is True
+    assert try_load_config(desktop.config_path).confirm_download_all is True
+    desktop.notebook.select(desktop.search_tab)
+    desktop.searches.select(board.frame)
+    desktop.download_all_wanted()
+    desktop.update()
+    again = [child for child in desktop.winfo_children() if isinstance(child, WantedPreview)]
+    assert len(again) == 1
+    again[0].destroy()
 
 
 def test_download_all_wanted_without_a_selected_user(desktop, caplog):

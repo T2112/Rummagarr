@@ -177,6 +177,8 @@ class JobStore:
             return False
         if job["status"] in {"imported", "downloading"}:
             return True
+        if job["status"] in {"not_sent", "import_failed"}:
+            return False
         if job["status"] in {"failed", "no_match"}:
             try:
                 updated = datetime.fromisoformat(job["updated_at"])
@@ -298,6 +300,8 @@ class JobStore:
             return False
         if job["status"] in {"imported", "downloading"}:
             return True
+        if job["status"] in {"not_sent", "import_failed"}:
+            return False
         if job["status"] in {"failed", "no_match"}:
             try:
                 updated = datetime.fromisoformat(job["updated_at"])
@@ -305,6 +309,57 @@ class JobStore:
                 return False
             return datetime.now(timezone.utc) - updated < timedelta(hours=retry_hours)
         return False
+
+    def rejected_usernames(self, album_id: int | None = None, artist: str = "") -> set[str]:
+        raw = self.get_meta("rejected_sources") or "{}"
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return set()
+        if not isinstance(data, dict):
+            return set()
+        names: set[str] = set()
+        if album_id is not None:
+            names.update(str(item).lower() for item in data.get(str(album_id)) or [])
+        token = (artist or "").casefold().strip()
+        if token:
+            names.update(str(item).lower() for item in data.get("artist:" + token) or [])
+        return {item for item in names if item}
+
+    def reject_usernames(self, usernames: set[str], *, album_id: int | None = None, artist: str = "") -> None:
+        raw = self.get_meta("rejected_sources") or "{}"
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        keys = []
+        if album_id is not None:
+            keys.append(str(album_id))
+        token = (artist or "").casefold().strip()
+        if token:
+            keys.append("artist:" + token)
+        for key in keys:
+            current = {str(item).lower() for item in data.get(key) or [] if item}
+            current.update(name.lower() for name in usernames if name)
+            data[key] = sorted(current)
+        self.set_meta("rejected_sources", json.dumps(data))
+
+    def mark_import_failed(self, artist: str, detail: str) -> None:
+        token = (artist or "").casefold().strip()
+        if not token:
+            return
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT album_id, artist, title FROM jobs WHERE lower(artist) = ?",
+                (token,),
+            ).fetchall()
+        for album_id, name, title in rows:
+            job = self.get(int(album_id))
+            if not job or job["status"] not in {"imported", "downloading", "searching"}:
+                continue
+            self.upsert(int(album_id), name, title, "import_failed", detail)
 
     def add_completed_download(
         self, artist: str, title: str, filename: str, username: str, kind: str
@@ -840,6 +895,53 @@ class JobStore:
             )
         return albums
 
+    def replace_artist_wanted(self, artist: str, rows: list[dict]) -> None:
+        """Replace one artist's saved wanted rows. Other artists stay.
+
+        Does nothing until Sync has stored a catalog, so a one-artist refresh
+        cannot replace the live Lidarr list with a single artist.
+        """
+        token = (artist or "").casefold().strip()
+        if not token or not self._catalog_ready:
+            return
+        with self._lock:
+            saved = {
+                key: (int(enabled), int(enabled_gen or 0))
+                for key, enabled, enabled_gen in self._db.execute(
+                    "SELECT key, enabled, enabled_gen FROM wanted_rows WHERE artist_key = ?",
+                    (token,),
+                )
+            }
+            album_ids = [
+                int(album_id)
+                for (album_id,) in self._db.execute(
+                    """
+                    SELECT DISTINCT album_id FROM wanted_rows
+                    WHERE artist_key = ? AND album_id IS NOT NULL
+                    """,
+                    (token,),
+                )
+            ]
+            self._db.execute("DELETE FROM wanted_rows WHERE artist_key = ?", (token,))
+            if album_ids:
+                marks = ",".join("?" * len(album_ids))
+                self._db.execute(
+                    f"DELETE FROM wanted_track_queue WHERE album_id IN ({marks})",
+                    album_ids,
+                )
+        prepared = []
+        for row in rows:
+            item = dict(row)
+            previous = saved.get(item["key"])
+            if previous is not None:
+                item["keep_choice"] = previous
+            prepared.append(item)
+        if prepared:
+            self.write_wanted_page(prepared)
+        with self._lock:
+            self._rebuild_derived_locked()
+            self._db.commit()
+
     def replace_album_songs(self, album_id: int, rows: list[dict], fingerprint: str) -> None:
         """Replace one album's song rows and remember the wanted/missing fingerprint."""
         with self._lock:
@@ -1228,39 +1330,63 @@ class JobStore:
             )
             self._db.commit()
 
-    def next_wanted_artist(self, skip: set[str] | None = None) -> str | None:
-        skip = skip or set()
+    def next_wanted_artist(self, skip: set[str] | None = None, *, tag: str = "") -> str | None:
+        """Next artist with work left. Monitored and recently added come first.
+
+        ``tag`` keeps artists whose album payload lists that Lidarr tag. Blank keeps everyone.
+        """
+        skip = {(item or "").casefold().strip() for item in (skip or set())}
+        wanted_tag = (tag or "").casefold().strip()
         with self._lock:
-            if len(skip) > 500:
-                offset = 0
-                while True:
-                    rows = self._db.execute(
-                        """
-                        SELECT artist, artist_key FROM wanted_artists
-                        WHERE disabled_children < (albums + songs)
-                        ORDER BY sort_artist
-                        LIMIT 200 OFFSET ?
-                        """,
-                        (offset,),
-                    ).fetchall()
-                    if not rows:
-                        return None
-                    for artist, token in rows:
-                        if token not in skip:
-                            return artist
-                    offset += 200
-            params: list = []
-            sql = """
-                SELECT artist FROM wanted_artists
-                WHERE disabled_children < (albums + songs)
+            rows = self._db.execute(
+                """
+                SELECT a.artist, a.artist_key,
+                       IFNULL(MAX(json_extract(r.payload, '$.added')), '') AS added,
+                       MAX(CASE
+                           WHEN json_extract(r.payload, '$.monitored') IN (0, 'false') THEN 0
+                           ELSE 1
+                       END) AS monitored
+                FROM wanted_artists a
+                LEFT JOIN wanted_rows r ON r.artist_key = a.artist_key AND r.kind = 'album'
+                WHERE a.disabled_children < (a.albums + a.songs)
+                GROUP BY a.artist_key
+                ORDER BY monitored DESC,
+                         CASE WHEN added = '' THEN 1 ELSE 0 END,
+                         added DESC,
+                         a.sort_artist
+                """
+            ).fetchall()
+            for artist, token, _added, _monitored in rows:
+                if token in skip:
+                    continue
+                if wanted_tag and not self._artist_has_tag_locked(token, wanted_tag):
+                    continue
+                return artist
+        return None
+
+    def _artist_has_tag_locked(self, token: str, tag: str) -> bool:
+        rows = self._db.execute(
             """
-            if skip:
-                marks = ",".join("?" * len(skip))
-                sql += f" AND artist_key NOT IN ({marks})"
-                params.extend(sorted(skip))
-            sql += " ORDER BY sort_artist LIMIT 1"
-            row = self._db.execute(sql, params).fetchone()
-        return None if row is None else row[0]
+            SELECT payload FROM wanted_rows
+            WHERE artist_key = ? AND kind = 'album' AND payload IS NOT NULL
+            LIMIT 12
+            """,
+            (token,),
+        ).fetchall()
+        for (payload,) in rows:
+            try:
+                data = json.loads(payload or "")
+            except json.JSONDecodeError:
+                continue
+            labels = []
+            if isinstance(data, dict):
+                labels.extend(data.get("tags") or [])
+                artist = data.get("artist") if isinstance(data.get("artist"), dict) else {}
+                labels.extend(artist.get("tags") or [])
+            for label in labels:
+                if str(label).casefold().strip() == tag:
+                    return True
+        return False
 
     def wanted_artist_label(self, token: str) -> str:
         """Display name for a casefolded artist key. The key itself if it is unknown."""

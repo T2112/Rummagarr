@@ -44,6 +44,8 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
+    # Windowed bootloader, the pythonw equivalent. A console bootloader would
+    # open a terminal for the app itself. Child tools still need CREATE_NO_WINDOW.
     console=False,
     disable_windowed_traceback=False,
     icon=str(root / "packaging" / "rummagarr.ico"),

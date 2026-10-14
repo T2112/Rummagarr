@@ -4,7 +4,6 @@ import asyncio
 import logging
 import re
 import shutil
-import subprocess
 import threading
 import time
 from dataclasses import replace
@@ -35,7 +34,7 @@ from aioslsk.user.model import BlockingFlag
 from activity import Step, describe_step, format_elapsed, step_from_legacy
 from config_loader import Config
 from control import WorkerControl
-from lidarr_client import LidarrClient
+from lidarr_client import LidarrClient, LidarrUnreachable
 from search_model import (
     counts_for_server,
     explain_search,
@@ -53,19 +52,27 @@ from wanted import (
     count_value,
     holes_for_search,
     is_enabled,
+    items_to_rows,
     optional_id,
     song_key,
+    wanted_from_library,
 )
 from match import (
     AUDIO_EXT,
+    QualityGate,
+    album_has_tag,
+    album_priority_key,
     aliases_from_album,
     build_queries,
     build_track_queries,
+    gate_from_profile,
     group_results,
     normalize,
     score_folder,
     score_track_item,
+    seconds_from_lidarr,
 )
+from process_launch import run_hidden
 from sharing import (
     IDLE_FLOOR_SECONDS,
     Decision,
@@ -504,7 +511,7 @@ def convert_to_mp3(src: Path, dest_mp3: Path, bitrate: int) -> None:
         "3",
         str(dest_mp3),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = run_hidden(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed for {src.name}: {proc.stderr[-500:]}")
 
@@ -659,6 +666,9 @@ class Worker:
         self._loop_beat = 0.0
         self._heartbeat_task: asyncio.Task | None = None
         self._cycle_attempted_search = False
+        self._cycle_unsent_search = False
+        self._albums_this_run = 0
+        self._quality_profiles: dict[int, dict] | None = None
         # Artists with nothing to search right now, and when to look at them again.
         self._not_ready_until: dict[str, datetime] = {}
         self._wait_artist = ""
@@ -706,7 +716,8 @@ class Worker:
         """Start one Lidarr import per time the queue is empty after an artist finishes.
 
         A later call while the queue stays empty does nothing. The scan runs on
-        a side thread so the worker can search the next artist.
+        a side thread so the window stays responsive. The worker waits for that
+        thread, including the wanted resync, before it picks the next artist.
         """
         if not self.cfg.auto_import_after_artist:
             return
@@ -757,8 +768,17 @@ class Worker:
 
     def _import_one_artist(self, artist: str, folder: str) -> None:
         self._publish_import(f"Importing {artist} into Lidarr...", hold=True)
+        scanned = False
         try:
             result = self.lidarr.scan_downloaded(folder)
+            scanned = True
+            problems = self._import_problems(artist)
+            if problems:
+                detail = "; ".join(problems)
+                self._park_failed_import(artist, detail)
+                log.error("Importing %s into Lidarr failed: %s", artist, detail)
+                self._publish_import(f"Importing {artist} into Lidarr failed: {detail}", hold=False)
+                return
             if not self._import_already_renamed(result):
                 artist_id = self.lidarr.artist_id_by_name(artist)
                 if not artist_id:
@@ -769,9 +789,64 @@ class Worker:
                 log.info("Lidarr already renames %s on import", artist)
             log.info("Imported %s into Lidarr from %s", artist, folder)
             self._publish_import(f"Imported {artist} into Lidarr", hold=False)
-        except Exception:
+        except Exception as exc:
+            detail = str(exc).strip() or exc.__class__.__name__
             log.exception("Importing %s into Lidarr failed", artist)
-            self._publish_import(f"Importing {artist} into Lidarr failed", hold=False)
+            self._publish_import(f"Importing {artist} into Lidarr failed: {detail}", hold=False)
+        finally:
+            if scanned:
+                self.resync_artist_from_lidarr(artist)
+
+    def _import_problems(self, artist: str) -> list[str]:
+        checker = getattr(self.lidarr, "import_failures", None)
+        if not callable(checker):
+            return []
+        try:
+            return [str(item) for item in (checker(artist) or []) if str(item).strip()]
+        except Exception:
+            log.exception("Could not read Lidarr's queue after importing %s", artist)
+            return []
+
+    def _park_failed_import(self, artist: str, detail: str) -> None:
+        """Flag the album, skip that Soulseek user next time, and move files aside for review."""
+        users = {
+            (row.get("username") or "").lower()
+            for row in self.store.recent_completed_downloads(80)
+            if (row.get("artist") or "").casefold() == artist.casefold() and row.get("username")
+        }
+        if users:
+            self.store.reject_usernames(users, artist=artist)
+        self.store.mark_import_failed(artist, detail)
+        moved = self._move_artist_to_review(artist)
+        if moved:
+            log.info("Moved %s to the review folder %s", artist, moved)
+
+    def _move_artist_to_review(self, artist: str) -> str:
+        token = (artist or "").casefold().strip()
+        if not token:
+            return ""
+        roots = []
+        for folder in (self.cfg.complete_dir, self.cfg.lidarr_scan_path):
+            path = Path(folder) if folder else None
+            if path is not None and path not in roots:
+                roots.append(path)
+        destination = ""
+        for root in roots:
+            if not root.is_dir():
+                continue
+            review = root / "Review"
+            for child in list(root.iterdir()):
+                if not child.is_dir() or child.name.casefold() == "review":
+                    continue
+                if token not in child.name.casefold():
+                    continue
+                review.mkdir(parents=True, exist_ok=True)
+                target = review / child.name
+                if target.exists():
+                    target = review / f"{child.name}-{int(time.time())}"
+                shutil.move(str(child), str(target))
+                destination = str(review)
+        return destination
 
     def _run_auto_import(self, artists: list[str]) -> None:
         folder = self._import_folder()
@@ -785,6 +860,201 @@ class Worker:
                 if self._import_thread is threading.current_thread():
                     self._import_thread = None
             self.maybe_auto_import()
+
+    async def _wait_for_import(self) -> None:
+        """Let a finished import resync that artist before the next search."""
+        while not self.control.is_stopped():
+            self.maybe_auto_import()
+            with self._import_lock:
+                thread = self._import_thread
+                pending = bool(self._import_armed and self._import_artists)
+            if thread is not None and thread.is_alive():
+                await asyncio.sleep(0.2)
+                continue
+            if pending and not self._queue_busy() and self.cfg.auto_import_after_artist:
+                await asyncio.sleep(0.05)
+                continue
+            return
+
+    def resync_artist_from_lidarr(self, artist: str) -> None:
+        """Refresh one artist's wanted rows and track files from Lidarr.
+
+        Already-imported albums and tracks are marked imported so the next pass
+        does not search them. A Lidarr that does not answer leaves the list as it was.
+        """
+        name = (artist or "").strip()
+        if not name:
+            return
+        loader = getattr(self.lidarr, "artist_library", None)
+        if not callable(loader):
+            return
+        try:
+            library = loader(name)
+        except Exception:
+            log.exception("Could not resync %s from Lidarr", name)
+            return
+        if not library or library.get("artist_id") is None:
+            log.info("Lidarr did not return a library for %s; the wanted list was left as-is", name)
+            return
+        items, imported_albums, imported_tracks = wanted_from_library(
+            library.get("albums") or [],
+            library.get("tracks") or [],
+        )
+        for album_id, album_artist, title in imported_albums:
+            self.store.upsert(album_id, album_artist, title, "imported", "already in Lidarr")
+        for track_id, album_id, track_artist, title in imported_tracks:
+            self.store.upsert_track(track_id, album_id, track_artist, title, "imported", "already in Lidarr")
+        rows = items_to_rows(items) if items else []
+        self.store.replace_artist_wanted(name, rows)
+        if self.catalog.synced:
+            self.catalog.merge_artist(name, items)
+        log.info(
+            "Resynced %s from Lidarr: %s still wanted, %s album(s) already imported",
+            name,
+            sum(1 for item in items if item.kind != "artist"),
+            len(imported_albums),
+        )
+
+    def requeue_block(self, artist: str, title: str, year: str | None = None) -> str:
+        """Why this album must not be queued again, or an empty string."""
+        if self._album_queued(artist, title):
+            return "already queued"
+        if self._album_on_disk(artist, title, year):
+            return "already in the download folder"
+        return ""
+
+    def track_requeue_block(self, artist: str, album_title: str, track_title: str, year: str | None = None) -> str:
+        """Why this track must not be queued again, or an empty string."""
+        if self._track_queued(track_title, artist, album_title):
+            return "already queued"
+        if self._track_on_disk(artist, album_title, track_title, year):
+            return "already in the download folder"
+        return ""
+
+    def _album_stamps(self, artist: str, title: str, year: str | None) -> list[str]:
+        base = f"{safe_name(artist)} - {safe_name(title)}"
+        stamps = [base]
+        if year:
+            stamps.append(f"{base} ({year})")
+        return stamps
+
+    def _audio_in_dir(self, path: Path) -> list[Path]:
+        try:
+            if not path.is_dir():
+                return []
+            return [child for child in path.iterdir() if child.is_file() and child.suffix.lower() in AUDIO_EXT]
+        except OSError:
+            return []
+
+    def _album_roots(self) -> list[Path]:
+        roots = [self.cfg.complete_dir, self.cfg.download_dir]
+        scan = (self.cfg.lidarr_scan_path or "").strip()
+        if scan:
+            roots.append(Path(scan))
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for root in roots:
+            key = str(root)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(root)
+        return unique
+
+    def _album_on_disk(self, artist: str, title: str, year: str | None) -> bool:
+        for root in self._album_roots():
+            for stamp in self._album_stamps(artist, title, year):
+                if self._audio_in_dir(root / stamp):
+                    return True
+        return False
+
+    def _track_on_disk(self, artist: str, album_title: str, track_title: str, year: str | None) -> bool:
+        needle = (track_title or "").casefold().strip()
+        if not needle:
+            return False
+        for root in self._album_roots():
+            for stamp in self._album_stamps(artist, album_title, year):
+                for path in self._audio_in_dir(root / stamp):
+                    if needle in path.stem.casefold():
+                        return True
+        return False
+
+    def _live_transfers(self) -> list:
+        live = []
+        for transfer in list(self.active_transfers) + list(self.manual_transfers):
+            if state_name(transfer) in {"FAILED", "ABORTED", "COMPLETE"}:
+                continue
+            live.append(transfer)
+        return live
+
+    def _transfer_path(self, transfer) -> str:
+        raw = getattr(transfer, "filename", None) or getattr(transfer, "remote_path", None) or ""
+        return str(raw).replace("/", "\\").casefold()
+
+    def _album_queued(self, artist: str, title: str) -> bool:
+        artist_cf = (artist or "").casefold().strip()
+        title_cf = (title or "").casefold().strip()
+        if not artist_cf or not title_cf:
+            return False
+        for transfer in self._live_transfers():
+            parts = [part.strip() for part in self._transfer_path(transfer).split("\\") if part.strip()]
+            if any(artist_cf in part for part in parts) and any(title_cf in part for part in parts):
+                return True
+        return False
+
+    def _track_queued(self, track_title: str, artist: str = "", album_title: str = "") -> bool:
+        needle = (track_title or "").casefold().strip()
+        if not needle:
+            return False
+        artist_cf = (artist or "").casefold().strip()
+        album_cf = (album_title or "").casefold().strip()
+        for transfer in self._live_transfers():
+            path = self._transfer_path(transfer)
+            base = path.split("\\")[-1]
+            if needle not in base and needle not in path:
+                continue
+            if artist_cf and artist_cf not in path and album_cf and album_cf not in path:
+                continue
+            return True
+        return False
+
+    def _path_queued(self, filename: str) -> bool:
+        wanted = (filename or "").replace("/", "\\").casefold()
+        if not wanted:
+            return False
+        base = wanted.split("\\")[-1]
+        for transfer in self._live_transfers():
+            path = self._transfer_path(transfer)
+            if path == wanted or (base and path.split("\\")[-1] == base and (len(base) > 8 or "\\" in wanted)):
+                return True
+        return False
+
+    def _skip_queued_specs(self, specs: list[dict], link: dict | None) -> list[dict]:
+        """Drop manual files that are already queued or already in the download folder."""
+        kept = []
+        link = link or {}
+        for spec in specs:
+            filename = str(spec.get("filename") or "")
+            spec_link = spec.get("link") if isinstance(spec.get("link"), dict) else link
+            artist = str((spec_link or {}).get("artist") or link.get("artist") or "")
+            album = str((spec_link or {}).get("album") or link.get("album") or "")
+            title = str((spec_link or {}).get("title") or "")
+            kind = str((spec_link or {}).get("kind") or "").casefold()
+            if filename and self._path_queued(filename):
+                log.info("Skip %s: already queued", filename)
+                continue
+            if kind == "song" or (title and kind != "album"):
+                reason = self.track_requeue_block(artist, album, title or Path(filename).stem, None) if title or filename else ""
+                if reason:
+                    log.info("Skip %s - %s - %s: %s", artist, album, title or filename, reason)
+                    continue
+            elif album:
+                reason = self.requeue_block(artist, album, None)
+                if reason:
+                    log.info("Skip %s - %s: %s", artist, album, reason)
+                    continue
+            kept.append(spec)
+        return kept
 
     def ask_lidarr_rename(self, album: dict) -> None:
         artist = album.get("artist") or {}
@@ -845,9 +1115,8 @@ class Worker:
         self.step = step_from_legacy(phase, artist, title)
 
     def set_step(self, step: Step) -> None:
+        # The last import result stays until the next artist visit finishes.
         self._import_epoch += 1
-        if self._import_notice and not self._import_hold and self._import_epoch > self._import_notice_epoch:
-            self._import_notice = ""
         previous = self.step
         same = (
             previous.kind == step.kind
@@ -897,18 +1166,17 @@ class Worker:
             self._search_lock = asyncio.Lock()
         return self._search_lock
 
-    async def _send_search(self, query: str):
+    async def _send_search(self, query: str, *, cycle: bool = True):
         """One search on the shared Soulseek session.
 
         The lock only covers sending the request. Waiting for results, and
         downloads, keep going so a manual search does not freeze the worker.
         """
         assert self.client is not None
-        self._cycle_attempted_search = True
         log.info("Sending search %r. %s", query, self.search_diagnostics())
         try:
             async with self._search_slot():
-                return await asyncio.wait_for(
+                request = await asyncio.wait_for(
                     self.client.searches.search(query),
                     timeout=_SEARCH_SEND_TIMEOUT,
                 )
@@ -920,14 +1188,19 @@ class Worker:
                 _SEARCH_SEND_TIMEOUT,
                 detail,
             )
+            if cycle:
+                self._cycle_unsent_search = True
             raise SearchNotSent(
                 f"Soulseek did not accept the search within {int(_SEARCH_SEND_TIMEOUT)}s. {detail}"
             ) from None
+        if cycle:
+            self._cycle_attempted_search = True
+        return request
 
     async def begin_manual_search(self, query: str):
         if not await self.ensure_soulseek():
             raise RuntimeError("Start the worker to search. Search uses that Soulseek login.")
-        return await self._send_search(query)
+        return await self._send_search(query, cycle=False)
 
     def search_outcome(self, replies: int, shown: int, locked: int) -> str:
         """Say why a search listed the files it did, using the live connection."""
@@ -1001,9 +1274,17 @@ class Worker:
         album: str,
         query_index: int,
         query_total: int,
+        ready=None,
     ) -> str:
         started = time.monotonic()
         while True:
+            if ready is not None:
+                try:
+                    if ready():
+                        log.info("A free-slot match is already in for %s – %s; scoring now", artist, album)
+                        return "ok"
+                except Exception:
+                    log.debug("Could not score results early", exc_info=True)
             waited = int(time.monotonic() - started)
             self.set_step(
                 Step(
@@ -1265,8 +1546,12 @@ class Worker:
                 raise RuntimeError("Soulseek login returned but session is not active")
             while not self.control.is_stopped():
                 self._cycle_attempted_search = False
+                self._cycle_unsent_search = False
                 try:
                     await self.cycle()
+                except LidarrUnreachable:
+                    log.warning("Lidarr unreachable. %s", self.search_diagnostics())
+                    self.set_step(Step(kind="error", detail="Lidarr unreachable"))
                 except Exception:
                     log.exception("Cycle failed. %s", self.search_diagnostics())
                 if self.control.is_stopped():
@@ -1327,7 +1612,7 @@ class Worker:
             if chosen:
                 log.info("Focusing on artist: %s", chosen)
             return chosen
-        for album in sorted(missing, key=lambda a: artist_name(a).casefold()):
+        for album in sorted(missing, key=album_priority_key):
             chosen = artist_name(album)
             if self._cooled(chosen, cooldowns, now):
                 continue
@@ -1345,6 +1630,8 @@ class Worker:
         return None
 
     def _finish_artist_visit(self, artist: str) -> None:
+        if self._import_notice and not self._import_hold:
+            self._import_notice = ""
         days = float(self.cfg.artist_cooldown_days or 0)
         if days <= 0 or not artist:
             return
@@ -1538,7 +1825,7 @@ class Worker:
 
     def _has_enabled_wanted(self) -> bool:
         if self.store.wanted_catalog_ready():
-            return self.store.next_wanted_artist(set()) is not None
+            return self.store.next_wanted_artist(set(), tag=self.cfg.wanted_tag) is not None
         if self.catalog.synced:
             choices = self.store.wanted_choices()
             return any(self.catalog.has_enabled_work(name, choices) for name in self.catalog.artist_labels())
@@ -1546,7 +1833,7 @@ class Worker:
 
     def _next_saved_name(self, skip: set[str]) -> str | None:
         if self.store.wanted_catalog_ready():
-            return self.store.next_wanted_artist(skip)
+            return self.store.next_wanted_artist(skip, tag=self.cfg.wanted_tag)
         if not self.catalog.synced:
             return None
         choices = self.store.wanted_choices()
@@ -1679,6 +1966,20 @@ class Worker:
     async def cycle(self) -> None:
         if self.control.is_stopped():
             return
+        self._cycle_attempted_search = False
+        self._cycle_unsent_search = False
+        try:
+            await self._cycle_once()
+        except LidarrUnreachable:
+            log.warning("Lidarr unreachable. %s", self.search_diagnostics())
+            self.set_step(Step(kind="error", detail="Lidarr unreachable"))
+
+    async def _cycle_once(self) -> None:
+        if self.control.is_stopped():
+            return
+        await self._wait_for_import()
+        if self.control.is_stopped():
+            return
         self.set_step(Step(kind="preparing"))
         # A Sync stores the wanted list in SQLite. Until that happens, keep
         # reading Lidarr 20 pages at a time and resume next cycle.
@@ -1742,7 +2043,7 @@ class Worker:
                 len(catalog),
                 "end of list" if exhausted else f"next page {next_page}",
             )
-            catalog.sort(key=lambda a: (artist_name(a).casefold(), (a.get("title") or "").casefold()))
+            catalog.sort(key=album_priority_key)
             focus = self.choose_focus_artist(catalog, [])
             if not focus:
                 log.info("No artist ready (all cooled off or nothing missing)")
@@ -1767,13 +2068,30 @@ class Worker:
             self.sweep_incomplete_folder()
             return
         log.info("Artist %s: %s empty albums, %s partial tracks", focus, len(missing), len(holes))
+        tag = (self.cfg.wanted_tag or "").strip()
+        cap = int(self.cfg.max_albums_per_run or 0)
         batch = []
-        for album in missing:
+        for album in sorted(missing, key=album_priority_key):
             if len(batch) >= self.cfg.max_albums_per_cycle:
                 break
+            if cap and self._albums_this_run + len(batch) >= cap:
+                break
+            if tag and not album_has_tag(album, tag):
+                log.info("Skip %s – %s: tag %s does not match", artist_name(album), album.get("title") or "", tag)
+                continue
             if self.store.should_skip(int(album["id"]), self.cfg.retry_hours):
                 continue
             batch.append(album)
+        if cap and self._albums_this_run >= cap and not batch:
+            log.info("Album cap for this run is %s; no more album searches until a restart", cap)
+            self.set_step(
+                Step(
+                    kind="limit",
+                    detail=f"Album cap for this run reached ({cap}). Stop and start to search more.",
+                )
+            )
+            self.sweep_incomplete_folder()
+            return
         workers = max(1, int(self.cfg.concurrent_albums or 1))
         sem = asyncio.Semaphore(workers)
         log.info("Album batch %s (up to %s at once)", len(batch), workers)
@@ -1788,6 +2106,7 @@ class Worker:
             async with sem:
                 if self.control.is_stopped():
                     return
+                self._albums_this_run += 1
                 self.store.upsert(album_id, artist, title, "searching")
                 self.set_step(Step(kind="searching", artist=artist, album=title))
                 ok = await self.process_album(album)
@@ -1795,7 +2114,10 @@ class Worker:
                     log.info("No usable result yet for %s - %s", artist, title)
 
         if batch:
-            await asyncio.gather(*(run_one(album) for album in batch), return_exceptions=True)
+            outcomes = await asyncio.gather(*(run_one(album) for album in batch), return_exceptions=True)
+            for outcome in outcomes:
+                if isinstance(outcome, LidarrUnreachable):
+                    raise outcome
         if self.control.is_stopped():
             self.set_step(Step(kind="stopped"))
             return
@@ -1804,21 +2126,31 @@ class Worker:
         if self.control.is_stopped():
             self.set_step(Step(kind="stopped"))
             return
-        if self._cycle_attempted_search:
-            self._finish_artist_visit(focus)
-        else:
-            still_ready, until = self._searchable_delay(focus)
-            if still_ready:
-                log.info("Artist %s was not searched; trying again without a cooldown", focus)
-            else:
-                log.info("Artist %s had nothing new to search; not starting the retry cooldown", focus)
-                self._defer_artist(focus, until)
-                self.store.set_focus_artist(None)
+        self._close_focus(focus)
         self.sweep_incomplete_folder()
         self._note_between_passes()
         if self._visit_had_download:
             self.arm_auto_import(focus)
         self._visit_had_download = False
+        await self._wait_for_import()
+
+    def _close_focus(self, focus: str) -> None:
+        if self._cycle_unsent_search:
+            log.info(
+                "A search for %s was not sent because Soulseek was disconnected; no cooldown",
+                focus,
+            )
+            return
+        if self._cycle_attempted_search:
+            self._finish_artist_visit(focus)
+            return
+        still_ready, until = self._searchable_delay(focus)
+        if still_ready:
+            log.info("Artist %s was not searched; trying again without a cooldown", focus)
+            return
+        log.info("Artist %s had nothing new to search; not starting the retry cooldown", focus)
+        self._defer_artist(focus, until)
+        self.store.set_focus_artist(None)
 
     async def cycle_tracks(self, holes: list[dict] | None = None) -> None:
         if holes is None:
@@ -1896,6 +2228,12 @@ class Worker:
         album_title = hole["album_title"]
         title = track.get("title") or "Unknown Track"
         year = album_year(album)
+        blocked = self.track_requeue_block(artist, album_title, title, year)
+        if blocked:
+            log.info("Skip %s - %s - %s: %s", artist, album_title, title, blocked)
+            status = "downloading" if blocked == "already queued" else "imported"
+            self.store.upsert_track(track_id, album_id, artist, title, status, blocked)
+            return True
         queries = build_track_queries(artist, album_title, title, aliases_from_album(album))
         log.info("Track search: %s", " | ".join(queries))
 
@@ -1920,7 +2258,7 @@ class Worker:
             try:
                 request = await self._send_search(query)
             except SearchNotSent:
-                self.store.upsert_track(track_id, album_id, artist, title, "failed", "search was not sent")
+                self.store.upsert_track(track_id, album_id, artist, title, "not_sent", "search was not sent")
                 return False
             signal = await self._await_results(
                 request, key, self.cfg.search_wait_seconds, artist, album_title, index, len(queries)
@@ -1958,6 +2296,8 @@ class Worker:
                         self.cfg.preferred_extensions,
                         self.cfg.min_filename_ratio,
                         self.cfg.min_mp3_bitrate,
+                        expected_duration=seconds_from_lidarr(track.get("duration")),
+                        gate=self._quality_gate(album),
                     )
                     if reason != "ok":
                         continue
@@ -2053,6 +2393,56 @@ class Worker:
         log.info("Asked Lidarr to import missing track %s into %s", title, folder)
         return True
 
+    def _load_quality_profiles(self) -> dict[int, dict]:
+        if self._quality_profiles is not None:
+            return self._quality_profiles
+        rows = self.lidarr.quality_profiles()
+        cached: dict[int, dict] = {}
+        for row in rows or []:
+            if isinstance(row, dict) and row.get("id") is not None:
+                cached[int(row["id"])] = row
+        self._quality_profiles = cached
+        return cached
+
+    def _quality_gate(self, album: dict) -> QualityGate:
+        profile = None
+        profile_id = album.get("qualityProfileId")
+        if profile_id is not None:
+            try:
+                profile = self._load_quality_profiles().get(int(profile_id))
+            except LidarrUnreachable:
+                raise
+            except Exception:
+                log.exception("Could not read Lidarr quality profiles")
+        return gate_from_profile(profile, self.cfg.preferred_extensions, self.cfg.min_mp3_bitrate)
+
+    def _best_folder(self, results, artist, title, titles, durations, gate, rejected: set[str]):
+        best = None
+        for folder in group_results(results, self.cfg.ignored_users):
+            if (folder.username or "").lower() in rejected:
+                continue
+            scored = score_folder(
+                folder,
+                artist,
+                title,
+                titles,
+                self.cfg.preferred_extensions,
+                self.cfg.min_filename_ratio,
+                self.cfg.track_count_tolerance,
+                self.cfg.min_mp3_bitrate,
+                durations=durations,
+                gate=gate,
+            )
+            if scored.reason != "ok":
+                continue
+            if best is None or scored.score > best.score:
+                best = scored
+        return best
+
+    def _free_slot_ready(self, request, artist, title, titles, durations, gate, rejected) -> bool:
+        best = self._best_folder(getattr(request, "results", None), artist, title, titles, durations, gate, rejected)
+        return bool(best and best.free_slot)
+
     async def process_album(self, album: dict) -> bool:
         album_id = int(album["id"])
         artist = artist_name(album)
@@ -2071,6 +2461,12 @@ class Worker:
             return False
         assert self.client is not None
         year = album_year(album)
+        blocked = self.requeue_block(artist, title, year)
+        if blocked:
+            log.info("Skip %s - %s: %s", artist, title, blocked)
+            status = "downloading" if blocked == "already queued" else "imported"
+            self.store.upsert(album_id, artist, title, status, blocked)
+            return True
         tracks = self.lidarr.tracks_for_album(album_id)
         needed_tracks = monitored_missing_tracks(tracks)
         if not needed_tracks:
@@ -2087,6 +2483,9 @@ class Worker:
             self.store.upsert(album_id, artist, title, "partial", "use track fill")
             return False
         titles = track_titles(needed_tracks)
+        durations = [seconds_from_lidarr(track.get("duration")) for track in needed_tracks]
+        gate = self._quality_gate(album)
+        rejected = self.store.rejected_usernames(album_id, artist)
         queries = build_queries(artist, title, year, aliases_from_album(album))
         log.info("Searching: %s", " | ".join(queries))
 
@@ -2102,10 +2501,17 @@ class Worker:
             try:
                 request = await self._send_search(query)
             except SearchNotSent:
-                self.store.upsert(album_id, artist, title, "failed", "search was not sent")
+                self.store.upsert(album_id, artist, title, "not_sent", "search was not sent")
                 return False
             signal = await self._await_results(
-                request, key, self.cfg.search_wait_seconds, artist, title, index, len(queries)
+                request,
+                key,
+                self.cfg.search_wait_seconds,
+                artist,
+                title,
+                index,
+                len(queries),
+                ready=lambda: self._free_slot_ready(request, artist, title, titles, durations, gate, rejected),
             )
             self.note_search_receipt(query, getattr(request, "results", None))
             if signal != "ok":
@@ -2125,22 +2531,9 @@ class Worker:
                     result_count=result_count(request),
                 )
             )
-            folders = group_results(request.results, self.cfg.ignored_users)
-            for folder in folders:
-                scored = score_folder(
-                    folder,
-                    artist,
-                    title,
-                    titles,
-                    self.cfg.preferred_extensions,
-                    self.cfg.min_filename_ratio,
-                    self.cfg.track_count_tolerance,
-                    self.cfg.min_mp3_bitrate,
-                )
-                if scored.reason != "ok":
-                    continue
-                if best is None or scored.score > best.score:
-                    best = scored
+            picked = self._best_folder(request.results, artist, title, titles, durations, gate, rejected)
+            if picked is not None and (best is None or picked.score > best.score):
+                best = picked
             try:
                 self.client.searches.remove_request(request)
             except Exception:
@@ -2766,6 +3159,10 @@ class Worker:
         the worker's own searches; it only adds transfers on that connection.
         """
         if not specs:
+            return ""
+        specs = self._skip_queued_specs(specs, link)
+        if not specs:
+            log.info("Nothing new to queue; those files are already queued or in the download folder")
             return ""
         if not await self.ensure_soulseek():
             raise RuntimeError("Start the worker to download. Downloads use that Soulseek connection.")

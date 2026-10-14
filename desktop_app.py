@@ -485,6 +485,29 @@ def apply_theme(root: tk.Misc, name: str | None = None) -> None:
         rowheight=max(18, int(round(22 * palette.scale))),
         font=_sized_font(palette, 10),
     )
+    # Both themes use clam. The tree area has to stick to every edge or the
+    # list stops short of the window and leaves an empty band underneath.
+    style.layout(
+        "Treeview",
+        [
+            (
+                "Treeview.field",
+                {
+                    "sticky": "nswe",
+                    "border": "1",
+                    "children": [
+                        (
+                            "Treeview.padding",
+                            {
+                                "sticky": "nswe",
+                                "children": [("Treeview.treearea", {"sticky": "nswe"})],
+                            },
+                        )
+                    ],
+                },
+            )
+        ],
+    )
     style.configure(
         "Treeview.Heading",
         background=palette.tree_heading,
@@ -600,7 +623,7 @@ class BehaviorField:
 
 
 BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
-    BehaviorField("focus_one_artist", "One artist at a time", "bool", "", "Stay on a single artist, then move on."),
+    BehaviorField("preferred_extensions", "Formats, in order", "csv", "", "Tried in this order. One format is used per album. Example: mp3, flac, wav."),
     BehaviorField(
         "artist_cooldown_days",
         "Artist retry period",
@@ -619,6 +642,32 @@ BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
         0,
         7200,
     ),
+    BehaviorField("convert_to_mp3", "Convert to MP3", "bool", "", "Convert FLAC and WAV to MP3 with ffmpeg before Lidarr imports them."),
+    BehaviorField("convert_bitrate", "Convert bitrate", "int", "kbps", "Bitrate ffmpeg uses for the MP3.", 128, 320),
+    BehaviorField(
+        "confirm_download_all",
+        "Ask before download all wanted",
+        "bool",
+        "",
+        "Download all wanted opens a checklist first. Turn this off to queue those files without asking. Turn it back on to show the popup again.",
+    ),
+    BehaviorField(
+        "max_albums_per_run",
+        "Albums per run",
+        "int",
+        "albums",
+        "Stop starting new album searches after this many since Start. 0 does not cap the run. Recently added and monitored albums go first.",
+        0,
+        5000,
+    ),
+    BehaviorField(
+        "wanted_tag",
+        "Only this Lidarr tag",
+        "text",
+        "",
+        "Leave blank to search every wanted artist. Otherwise only artists with this tag are searched. Sync Wanted again after changing tags in Lidarr.",
+    ),
+    BehaviorField("focus_one_artist", "One artist at a time", "bool", "", "Stay on a single artist, then move on."),
     BehaviorField("concurrent_albums", "Albums at once", "int", "", "How many albums to search or download together. 1 is one after another.", 1, 8),
     BehaviorField(
         "lidarr_track_concurrency",
@@ -637,10 +686,7 @@ BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
     BehaviorField("retry_hours", "Retry a miss after", "int", "hours", "How long to wait before searching again for an album or song that did not match.", 0, 168),
     BehaviorField("min_filename_ratio", "Filename match", "float", "0–1", "How close a filename must be to the Lidarr title. Higher is stricter.", 0.2, 0.95),
     BehaviorField("track_count_tolerance", "Track count slack", "int", "tracks", "How many extra or missing files an album folder may have.", 0, 15),
-    BehaviorField("preferred_extensions", "Formats, in order", "csv", "", "Tried in this order. Example: mp3, flac, wav."),
     BehaviorField("min_mp3_bitrate", "Minimum MP3 bitrate", "int", "kbps", "Reject MP3s below this bitrate when Soulseek reports one.", 96, 320),
-    BehaviorField("convert_to_mp3", "Convert to MP3", "bool", "", "Convert FLAC and WAV to MP3 with ffmpeg before Lidarr imports them."),
-    BehaviorField("convert_bitrate", "Convert bitrate", "int", "kbps", "Bitrate ffmpeg uses for the MP3.", 128, 320),
     BehaviorField("delete_sources_after_import", "Delete source after import", "bool", "", "Remove the original FLAC or WAV from Incomplete after Lidarr is asked to import the MP3."),
     BehaviorField("clean_incomplete_on_fail", "Clean up failed downloads", "bool", "", "Delete leftover files in Incomplete when a download fails or is cancelled."),
     BehaviorField("incomplete_max_age_hours", "Delete old Incomplete files", "float", "hours", "Also delete Incomplete files older than this. 0 turns the sweep off.", 0, 168),
@@ -652,6 +698,18 @@ BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
     BehaviorField("state_db", "Database file", "text", "", "SQLite file for progress and wanted checkboxes. Restart to apply.", restore=False),
     BehaviorField("log_file", "Log file", "text", "", "Where the worker writes its log. Restart to apply.", restore=False),
 )
+
+_PRIMARY_BEHAVIOR = frozenset(
+    {
+        "preferred_extensions",
+        "artist_cooldown_days",
+        "cycle_seconds",
+        "convert_to_mp3",
+        "convert_bitrate",
+        "confirm_download_all",
+    }
+)
+
 
 _RESTART_FIELDS = frozenset(
     {
@@ -672,7 +730,7 @@ _RESTART_FIELDS = frozenset(
     }
 )
 _LAUNCH_FIELDS = frozenset({"start_on_launch", "check_updates"})
-_IMMEDIATE_FIELDS = frozenset({"theme"})
+_IMMEDIATE_FIELDS = frozenset({"theme", "confirm_download_all"})
 _SHARE_LIVE_FIELDS = frozenset(
     {
         "upload_slots",
@@ -968,7 +1026,7 @@ class SettingsForm(ttk.Frame):
         )
         ttk.Label(
             parent,
-            text="Search limits, conversion, the status page, and the update check are on the Behavior tab. Uploads are on Sharing.",
+            text="Formats, the artist retry period, the wait before the next artist, and conversion are at the top of Behavior. Everything else is under Advanced. Uploads are on Sharing.",
             style="Muted.TLabel",
             wraplength=760,
         ).grid(row=13, column=0, columnspan=3, sticky="w", pady=(12, 0))
@@ -1016,9 +1074,27 @@ class SettingsForm(ttk.Frame):
                 wraplength=720,
             ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8))
             row += 1
-        for spec in BEHAVIOR_FIELDS:
+        primary = [spec for spec in BEHAVIOR_FIELDS if spec.key in _PRIMARY_BEHAVIOR]
+        advanced = [spec for spec in BEHAVIOR_FIELDS if spec.key not in _PRIMARY_BEHAVIOR]
+        for spec in primary:
             self._behavior_row(inner, row, spec)
             row += 2
+        self.advanced_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            inner,
+            text="Advanced",
+            variable=self.advanced_var,
+            command=self._toggle_advanced,
+        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(12, 4))
+        row += 1
+        self._advanced_frame = ttk.Frame(inner)
+        self._advanced_frame.grid(row=row, column=0, columnspan=3, sticky="ew")
+        advanced_row = 0
+        for spec in advanced:
+            self._behavior_row(self._advanced_frame, advanced_row, spec)
+            advanced_row += 2
+        self._advanced_frame.columnconfigure(1, weight=1)
+        self._advanced_frame.grid_remove()
         inner.columnconfigure(1, weight=1)
         # Bind the wheel on every field. Enter/Leave on the canvas unbinds as
         # soon as the pointer moves onto this inner frame, which is the whole
@@ -1230,6 +1306,18 @@ class SettingsForm(ttk.Frame):
         ttk.Label(parent, text=spec.help, style="Muted.TLabel", wraplength=720).grid(
             row=row + 1, column=0, columnspan=3, sticky="w", pady=(0, 2)
         )
+
+    def _toggle_advanced(self) -> None:
+        frame = getattr(self, "_advanced_frame", None)
+        if frame is None:
+            return
+        if self.advanced_var.get():
+            frame.grid()
+        else:
+            frame.grid_remove()
+        canvas = self._behavior_canvas
+        if canvas is not None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
 
     def _bind_behavior_wheel(self, widget: tk.Misc) -> None:
         if isinstance(widget, (tk.Scrollbar, ttk.Scrollbar)):
@@ -1583,7 +1671,7 @@ def _release_tk_objects(widget: tk.Misc) -> None:
 class WantedPreview(tk.Toplevel):
     """Wanted files about to be queued. All start checked."""
 
-    def __init__(self, master: tk.Misc, matches, on_queue, summary: str = "") -> None:
+    def __init__(self, master: tk.Misc, matches, on_queue, summary: str = "", on_dont_ask=None) -> None:
         super().__init__(master)
         self.title("Download wanted files")
         self.transient(master)
@@ -1591,6 +1679,8 @@ class WantedPreview(tk.Toplevel):
         self.minsize(640, 400)
         apply_theme(self)
         self.on_queue = on_queue
+        self.on_dont_ask = on_dont_ask
+        self.dont_ask = tk.BooleanVar(value=False)
         self.matches = list(matches)
         self._checked = {index: True for index in range(len(self.matches))}
         frame = ttk.Frame(self, padding=12)
@@ -1641,6 +1731,7 @@ class WantedPreview(tk.Toplevel):
         buttons.pack(fill="x", pady=(8, 0))
         ttk.Button(buttons, text="Queue checked", style="Start.TButton", command=self._queue).pack(side="left")
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(buttons, text="Don't ask again", variable=self.dont_ask).pack(side="left", padx=(16, 0))
 
     def _box(self, state: str) -> tk.PhotoImage:
         size = 16
@@ -1678,8 +1769,12 @@ class WantedPreview(tk.Toplevel):
 
     def _queue(self) -> None:
         picked = [match for index, match in enumerate(self.matches) if self._checked.get(index, False)]
+        remember = bool(self.dont_ask.get())
         callback = self.on_queue
+        skip = self.on_dont_ask
         self.destroy()
+        if remember and skip is not None:
+            skip()
         if picked:
             callback(picked)
 
@@ -2091,6 +2186,13 @@ class DesktopApp(tk.Tk):
         text_col.pack(side="left", fill="x", expand=True)
         self.status_line = ttk.Label(text_col, text="Stopped · Soulseek offline · Stopped", style="Banner.TLabel")
         self.status_line.pack(anchor="w", fill="x")
+        self.details_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            status_row,
+            text="Details",
+            variable=self.details_var,
+            command=self.refresh_status,
+        ).pack(side="right")
         self.session_line = ttk.Label(text_col, text="", style="CardMuted.TLabel", wraplength=self.px(980), justify="left")
         self.session_line.pack(anchor="w", fill="x", pady=(self.px(2), 0))
         self.notice_line = ttk.Label(parent, textvariable=self.notice_var, style="Muted.TLabel")
@@ -2127,6 +2229,7 @@ class DesktopApp(tk.Tk):
             frame_style="Card.TFrame",
         )
         frame.pack(fill="both", expand=True)
+        self._bind_filling_tree(self.transfers)
         palette = active_palette(self)
         self.transfers.tag_configure("ok", foreground=palette.ok)
         self.transfers.tag_configure("bad", foreground=palette.bad)
@@ -2157,6 +2260,7 @@ class DesktopApp(tk.Tk):
             frame_style="Card.TFrame",
         )
         frame.pack(fill="both", expand=True)
+        self._bind_filling_tree(self.recent)
         port = self.worker.cfg.status_port
         host = self.worker.cfg.status_bind
         ttk.Label(
@@ -2243,6 +2347,7 @@ class DesktopApp(tk.Tk):
         self.wanted.bind("<Down>", self._wanted_key)
         self.wanted.bind("<Configure>", self._wanted_resized)
         self.wanted.bind("<Configure>", lambda _event: self._place_finders(), add="+")
+        self._bind_filling_tree(self.wanted)
 
     def _tick(self) -> None:
         if self._shutting_down:
@@ -2360,7 +2465,10 @@ class DesktopApp(tk.Tk):
         snapshot = self.worker.ui_snapshot(recent_limit=limit)
         self.status_line.configure(text=format_status_line(snapshot))
         if getattr(self, "session_line", None) is not None:
-            self.session_line.configure(text=str(snapshot.get("soulseek_detail") or ""))
+            detail = ""
+            if getattr(self, "details_var", None) is not None and self.details_var.get():
+                detail = str(snapshot.get("soulseek_detail") or "")
+            self.session_line.configure(text=detail)
         self._paint_activity_dot(bool(snapshot.get("busy")))
         self._refresh_open_search_states()
         state = snapshot.get("run_state") or "stopped"
@@ -2637,9 +2745,62 @@ class DesktopApp(tk.Tk):
         self._wanted_offset = 0
         self.refresh_wanted()
 
+    def _tree_row_px(self) -> int:
+        style = ttk.Style(self)
+        raw = style.lookup("Treeview", "rowheight")
+        try:
+            return max(1, int(float(str(raw))))
+        except (TypeError, ValueError):
+            return max(18, int(round(22 * self.ui_scale)))
+
+    def _rows_for_height(self, pixel_height: int, *, heading: int | None = None, row: int | None = None) -> int:
+        """How many rows fit in a list of this pixel height, including a partial last row."""
+        row_px = row or self._tree_row_px()
+        head = row_px if heading is None else max(0, heading)
+        body = max(row_px, int(pixel_height) - head)
+        return max(1, (body + row_px - 1) // row_px)
+
+    def _fit_tree(self, tree: ttk.Treeview | None) -> None:
+        """Give a table enough rows to fill its parent, in either theme."""
+        if tree is None or getattr(tree, "_fitting", False):
+            return
+        tree._fitting = True
+        try:
+            if not tree.winfo_exists():
+                return
+            available = tree.master.winfo_height()
+            if available < 40:
+                return
+            rows = self._rows_for_height(available)
+            if int(tree.cget("height")) != rows:
+                tree.configure(height=rows)
+        except (tk.TclError, ValueError):
+            return
+        finally:
+            tree._fitting = False
+
+    def _bind_filling_tree(self, tree: ttk.Treeview) -> None:
+        def _on_configure(_event, current=tree) -> None:
+            self._fit_tree(current)
+
+        tree.master.bind("<Configure>", _on_configure, add="+")
+        tree.bind("<Configure>", _on_configure, add="+")
+
     def _wanted_resized(self, event) -> None:
-        row_px = 28
-        window = max(WANTED_WINDOW_MIN, int(event.height) // row_px or 1)
+        self._fit_tree(self.wanted)
+        row_px = self._tree_row_px()
+        heading = row_px
+        try:
+            children = self.wanted.get_children()
+            if children:
+                box = self.wanted.bbox(children[0])
+                if box and box[1] > 0:
+                    heading = box[1]
+                    if box[3] > 0:
+                        row_px = box[3]
+        except tk.TclError:
+            pass
+        window = max(WANTED_WINDOW_MIN, self._rows_for_height(int(event.height), heading=heading, row=row_px))
         if window == self._wanted_window:
             return
         self._wanted_window = window
@@ -2970,6 +3131,7 @@ class DesktopApp(tk.Tk):
         scroll.grid(row=0, column=1, sticky="ns")
         tree_frame.rowconfigure(0, weight=1)
         tree_frame.columnconfigure(0, weight=1)
+        self._bind_filling_tree(board.tree)
         headings = (
             ("#0", "User / file", 360),
             ("size", "Size", 80),
@@ -3279,6 +3441,7 @@ class DesktopApp(tk.Tk):
             frame_style="Card.TFrame",
         )
         frame.pack(fill="both", expand=True)
+        self._bind_filling_tree(tree)
         self.shared_tree = tree
         tree.configure(selectmode="extended")
         self.refresh_shared()
@@ -3437,7 +3600,11 @@ class DesktopApp(tk.Tk):
         if board.status is not None:
             board.status.set(text)
         log.info("Download all wanted from %s for %r: %s", username, board.query, text)
-        WantedPreview(self, matches, lambda picked, board=board: self._queue_matches(board, picked), summary=text)
+        self._confirm_wanted(
+            matches,
+            lambda picked, board=board: self._queue_matches(board, picked),
+            summary=text,
+        )
 
     def _download_wanted_from_everyone(self, board: SearchBoard) -> None:
         scope = self._search_wanted_scope(board)
@@ -3458,12 +3625,28 @@ class DesktopApp(tk.Tk):
         log.info("Download all wanted for %r: %s%s", artist, text, extra)
         if not plan.matches:
             return
-        WantedPreview(
-            self,
+        self._confirm_wanted(
             plan.matches,
             lambda picked, board=board, text=text: self._queue_matches(board, picked, note=text),
             summary=text,
         )
+
+    def _confirm_wanted(self, matches, on_queue, summary: str = "") -> None:
+        """Ask before queueing Download all wanted, unless that popup was turned off."""
+        if not bool(getattr(self.worker.cfg, "confirm_download_all", True)):
+            on_queue(list(matches))
+            return
+        WantedPreview(self, matches, on_queue, summary=summary, on_dont_ask=self._disable_download_confirm)
+
+    def _disable_download_confirm(self) -> None:
+        self.worker.cfg = replace(self.worker.cfg, confirm_download_all=False)
+        form = self._settings_form
+        if form is not None and "confirm_download_all" in getattr(form, "fields", {}):
+            form.fields["confirm_download_all"].set(False)
+        try:
+            save_config(self.config_path, self.worker.cfg)
+        except OSError:
+            log.exception("Could not save the download confirmation setting")
 
     def _queue_matches(self, board: SearchBoard, matches, note: str = "") -> None:
         by_id = {item.id: item for item in board.files}
@@ -4017,4 +4200,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from process_launch import configure_child_processes
+
+    configure_child_processes()
     main()

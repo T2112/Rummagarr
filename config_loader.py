@@ -73,6 +73,9 @@ class Config:
     pause_uploads: bool = False
     auto_import_after_artist: bool = False
     theme: str = "dark"
+    confirm_download_all: bool = True
+    max_albums_per_run: int = 40
+    wanted_tag: str = ""
 
 
 def normalize_theme(value) -> str:
@@ -265,6 +268,9 @@ def default_config(**overrides) -> Config:
         pause_uploads=bool(overrides.pop("pause_uploads", False)),
         auto_import_after_artist=bool(overrides.pop("auto_import_after_artist", False)),
         theme=normalize_theme(overrides.pop("theme", "dark")),
+        confirm_download_all=bool(overrides.pop("confirm_download_all", True)),
+        max_albums_per_run=int(overrides.pop("max_albums_per_run", 40)),
+        wanted_tag=str(overrides.pop("wanted_tag", "")),
     )
     if overrides:
         cfg = replace(cfg, **overrides)
@@ -322,6 +328,8 @@ def save_config(path: Path, cfg: Config) -> None:
             "[search]",
             f"search_wait_seconds = {cfg.search_wait_seconds}",
             f"max_albums_per_cycle = {int(cfg.max_albums_per_cycle)}",
+            f"max_albums_per_run = {int(cfg.max_albums_per_run)}",
+            f"wanted_tag = {_toml_str(cfg.wanted_tag)}",
             f"focus_one_artist = {_toml_bool(cfg.focus_one_artist)}",
             f"artist_cooldown_days = {cfg.artist_cooldown_days}",
             f"max_missing_pages = {int(cfg.max_missing_pages)}",
@@ -364,6 +372,7 @@ def save_config(path: Path, cfg: Config) -> None:
             "",
             "[ui]",
             f"theme = {_toml_str(normalize_theme(cfg.theme))}",
+            f"confirm_download_all = {_toml_bool(cfg.confirm_download_all)}",
             "",
         ]
     )
@@ -441,6 +450,8 @@ def try_load_config(path: Path) -> Config:
         log_file=log_file,
         search_wait_seconds=float(search.get("search_wait_seconds", 12)),
         max_albums_per_cycle=int(search.get("max_albums_per_cycle", 3)),
+        max_albums_per_run=int(search.get("max_albums_per_run", 40)),
+        wanted_tag=str(search.get("wanted_tag", "") or ""),
         max_tracks_per_cycle=int(search.get("max_tracks_per_cycle", 5)),
         fill_missing_tracks=bool(search.get("fill_missing_tracks", True)),
         focus_one_artist=bool(search.get("focus_one_artist", True)),
@@ -479,4 +490,5 @@ def try_load_config(path: Path) -> Config:
         pause_uploads=bool(sharing.get("pause_uploads", False)),
         auto_import_after_artist=bool(lidarr.get("auto_import_after_artist", False)),
         theme=normalize_theme(ui.get("theme", "dark")),
+        confirm_download_all=bool(ui.get("confirm_download_all", True)),
     )

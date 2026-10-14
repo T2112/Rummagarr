@@ -16,6 +16,7 @@ from pathlib import Path
 import httpx
 
 from config_loader import app_version
+from process_launch import popen_hidden
 
 LATEST_RELEASE_URL = "https://api.github.com/repos/T2112/lidarr-soulseek/releases/latest"
 RELEASES_PAGE_URL = "https://github.com/T2112/lidarr-soulseek/releases/latest"
@@ -432,10 +433,12 @@ def launch_installer(path: Path) -> None:
         "stderr": subprocess.DEVNULL,
     }
     if os.name == "nt":
+        # DETACHED_PROCESS alone still lets Windows Terminal open a window.
+        # popen_hidden adds CREATE_NO_WINDOW and SW_HIDE on top of these flags.
         flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
         breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
         kwargs["creationflags"] = flags | breakaway
-    subprocess.Popen(installer_launch_args(path), **kwargs)
+    popen_hidden(installer_launch_args(path), **kwargs)
 
 
 def remember_skipped_update(store, version: str) -> None:

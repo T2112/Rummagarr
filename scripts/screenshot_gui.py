@@ -31,7 +31,7 @@ class Transfer:
 
 def grab(widget, path: Path) -> None:
     """Lossless PNG of the window. No resize."""
-    import subprocess
+    from process_launch import run_hidden
 
     path.parent.mkdir(parents=True, exist_ok=True)
     widget.update_idletasks()
@@ -41,7 +41,7 @@ def grab(widget, path: Path) -> None:
     origin_x = int(widget.winfo_rootx())
     origin_y = int(widget.winfo_rooty())
     display = os.environ.get("DISPLAY", ":0")
-    subprocess.check_call(
+    run_hidden(
         [
             "ffmpeg",
             "-y",
@@ -56,7 +56,8 @@ def grab(widget, path: Path) -> None:
             "-frames:v",
             "1",
             str(path),
-        ]
+        ],
+        check=True,
     )
 
 

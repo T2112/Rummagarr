@@ -206,6 +206,13 @@ class WantedCatalog:
                 return None
             return list(self._albums)
 
+    def merge_artist(self, artist: str, items: list[WantedItem]) -> None:
+        """Replace one artist's rows. Other artists stay as they were."""
+        token = artist_token(artist)
+        with self._lock:
+            kept = [item for item in self._items if artist_token(item.artist) != token]
+        self.replace(kept + list(items))
+
 
 def build_catalog(albums: list[dict], holes: list[dict] | None = None) -> list[WantedItem]:
     """Group wanted albums and missing songs under their artists, A–Z."""
@@ -536,6 +543,60 @@ def catalog_from_lidarr(
     return build_catalog(albums, holes), bool(exhausted)
 
 
+def wanted_from_library(
+    albums: list, tracks: list
+) -> tuple[list[WantedItem], list[tuple[int, str, str]], list[tuple[int, int, str, str]]]:
+    """Still-missing wanted rows, plus albums and tracks Lidarr now has a file for.
+
+    ``imported_albums`` is ``(album_id, artist, title)`` when every monitored
+    track has a file. ``imported_tracks`` is ``(track_id, album_id, artist, title)``
+    for each track that has a file. Albums that are still missing stay in the
+    wanted items. A partial album also keeps a song row for each missing track.
+    """
+    by_album: dict[int, list] = {}
+    imported_tracks: list[tuple[int, int, str, str]] = []
+    for track in tracks or []:
+        if not isinstance(track, dict):
+            continue
+        album_id = optional_id(track.get("albumId"))
+        if album_id is None and isinstance(track.get("album"), dict):
+            album_id = optional_id(track["album"].get("id"))
+        if album_id is None:
+            continue
+        by_album.setdefault(album_id, []).append(track)
+    missing_albums: list[dict] = []
+    holes: list[dict] = []
+    imported_albums: list[tuple[int, str, str]] = []
+    for album in albums or []:
+        if not isinstance(album, dict):
+            continue
+        album_id = optional_id(album.get("id"))
+        if album_id is None:
+            continue
+        artist = artist_name(album)
+        title = album.get("title") or "Unknown Album"
+        own = by_album.get(album_id, [])
+        for track in own:
+            track_id = optional_id(track.get("id"))
+            if track_id is not None and track.get("hasFile"):
+                imported_tracks.append((track_id, album_id, artist, track.get("title") or "Unknown Track"))
+        if not album.get("monitored", True):
+            continue
+        own_holes = missing_holes(album, own) if own else []
+        files, total = _stats(album)
+        complete = bool(own) and not own_holes
+        if not own and total > 0 and files >= total:
+            complete = True
+        if complete:
+            imported_albums.append((album_id, artist, title))
+            continue
+        missing_albums.append(album)
+        if files > 0 and own_holes:
+            holes.extend(own_holes)
+    items = build_catalog(missing_albums, holes) if missing_albums or holes else []
+    return items, imported_albums, imported_tracks
+
+
 def missing_holes(album: dict, tracks) -> list[dict]:
     """Monitored tracks that still have no file. Bad rows are skipped."""
     holes: list[dict] = []
@@ -589,7 +650,10 @@ def slim_album(album: dict) -> dict:
     aliases = artist.get("aliases")
     if aliases:
         slim_artist["aliases"] = aliases
-    return {
+    tags = _tag_labels(album.get("tags")) + _tag_labels(artist.get("tags"))
+    if tags:
+        slim_artist["tags"] = tags
+    slim = {
         "id": album.get("id"),
         "title": album.get("title"),
         "artistId": album.get("artistId") or slim_artist.get("id"),
@@ -597,11 +661,33 @@ def slim_album(album: dict) -> dict:
         "releaseDate": album.get("releaseDate"),
         "statistics": album.get("statistics") if isinstance(album.get("statistics"), dict) else {},
         "monitored": album.get("monitored", True),
+        "added": album.get("added") or "",
     }
+    if album.get("qualityProfileId") is not None:
+        slim["qualityProfileId"] = album.get("qualityProfileId")
+    if tags:
+        slim["tags"] = tags
+    return slim
+
+
+def _tag_labels(source) -> list[str]:
+    if isinstance(source, str):
+        source = [source]
+    if not isinstance(source, list):
+        return []
+    labels: list[str] = []
+    for item in source:
+        if isinstance(item, str) and item.strip():
+            labels.append(item.strip())
+        elif isinstance(item, dict):
+            label = str(item.get("label") or item.get("name") or "").strip()
+            if label:
+                labels.append(label)
+    return labels
 
 
 def slim_track(track: dict) -> dict:
-    return {
+    slim = {
         "id": track.get("id"),
         "title": track.get("title"),
         "trackNumber": track.get("trackNumber"),
@@ -609,6 +695,9 @@ def slim_track(track: dict) -> dict:
         "monitored": track.get("monitored", True),
         "hasFile": bool(track.get("hasFile")),
     }
+    if track.get("duration"):
+        slim["duration"] = track.get("duration")
+    return slim
 
 
 def _sort_position(value, *, empty_last: bool = True) -> str:

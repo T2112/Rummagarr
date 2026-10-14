@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented here.
 
+## [1.11.0] — 2026-10-13
+
+### Added
+
+- Download all wanted asks with a checklist. Don't ask again saves that choice, and Settings → Behavior → Ask before download all wanted turns the popup back on.
+- Each album follows its Lidarr quality profile (Any, Lossless, or Standard). One format is downloaded for that album, from one user, and anything below the profile cutoff is skipped.
+- Matches use the file duration as well as the filename, and a studio recording is preferred to a live or remix cut unless the Lidarr title asks for one.
+- A free-slot match can be scored and downloaded before the full search wait ends.
+- An album whose search never reached Soulseek is tried again after reconnect, and that artist is not put on the multi-day cooldown.
+- Behavior shows formats, the artist retry period, the wait before the next artist, and conversion first. The rest is under Advanced.
+- Albums per run caps how many album searches one Start will begin. Monitored and recently added artists go first. Only this Lidarr tag limits the list when it is filled in.
+- After an automatic import, a Lidarr queue or history failure (a track-count mismatch or an unmatched release) is kept on the Status card, the files are moved to a Review folder, and the next search skips that Soulseek user.
+- The Status card has a Details toggle for the login and server line. Downloads that are already running are not labeled Soulseek offline.
+- Lidarr requests use a longer timeout, retry with a pause between tries, and lookup or paged routes instead of the full artist list. When Lidarr does not answer, the status line says Lidarr unreachable.
+
+### Fixed
+
+- Wanted, Search, Shared, and the Status lists stretch to the bottom of the window in Dark and Light, including after the window is resized.
+- After an automatic Lidarr import, that artist's wanted albums and track files are read back from Lidarr before the next artist is searched. Albums and tracks Lidarr now has are not downloaded again. An album whose files are already queued or already in the download folder is not queued again.
+- Converting a download with ffmpeg, and launching the installer, no longer opens a blank console window. On Windows 11 that window was Windows Terminal, titled with a path under AppData\Local, and it took the keyboard. Child processes are started with CREATE_NO_WINDOW and a hidden window.
+
+### Changed
+
+- The last automatic import result, including the Lidarr error, stays on the Status card until the next artist visit finishes.
+
 ## [1.10.0] — 2026-10-13
 
 ### Added

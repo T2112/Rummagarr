@@ -158,3 +158,135 @@ def test_ascii_folder_matches_and_the_wrong_artist_does_not():
     )
     assert rejected.reason != "ok"
     assert rejected.score == 0
+
+
+class _Rated(_File):
+    def __init__(self, filename: str, bitrate: int = 0, duration: float = 0) -> None:
+        super().__init__(filename)
+        self._bitrate = bitrate
+        self._duration = duration
+
+    def get_attribute_map(self):
+        from aioslsk.protocol.primitives import AttributeKey
+
+        attrs = {}
+        if self._bitrate:
+            attrs[AttributeKey.BITRATE] = self._bitrate
+        if self._duration:
+            attrs[AttributeKey.DURATION] = self._duration
+        return attrs
+
+
+def _hungover(files):
+    return FolderCandidate(
+        username="one-user",
+        remote_dir=r"Ella Langley\Hungover",
+        files=files,
+    )
+
+
+def test_one_folder_keeps_a_single_format():
+    mixed = _hungover(
+        [
+            _Rated(r"Ella Langley\Hungover\01 Hungover.mp3", bitrate=320, duration=180),
+            _Rated(r"Ella Langley\Hungover\02 Blue.mp3", bitrate=320, duration=200),
+            _Rated(r"Ella Langley\Hungover\01 Hungover.flac", duration=180),
+            _Rated(r"Ella Langley\Hungover\02 Blue.flac", duration=200),
+        ]
+    )
+    scored = score_folder(
+        mixed,
+        "Ella Langley",
+        "Hungover",
+        ["Hungover", "Blue"],
+        ["mp3", "flac"],
+        0.5,
+        2,
+        320,
+    )
+    assert scored.reason == "ok"
+    assert {scored.files[0].filename.rsplit(".", 1)[-1]} == {"mp3"}
+    assert all(path.endswith(".mp3") for path in (item.filename for item in scored.files))
+
+
+def test_lossless_profile_skips_mp3_and_standard_skips_below_cutoff():
+    from match import gate_from_profile
+
+    lossless = gate_from_profile({"name": "Lossless", "cutoff": 1, "items": [{"quality": {"id": 1, "name": "FLAC"}, "allowed": True}]}, ["mp3", "flac"], 320)
+    flac = _hungover(
+        [
+            _Rated(r"Ella Langley\Hungover\01 Hungover.flac", duration=180),
+            _Rated(r"Ella Langley\Hungover\02 Blue.flac", duration=200),
+        ]
+    )
+    mp3 = _hungover(
+        [
+            _Rated(r"Ella Langley\Hungover\01 Hungover.mp3", bitrate=320, duration=180),
+            _Rated(r"Ella Langley\Hungover\02 Blue.mp3", bitrate=320, duration=200),
+        ]
+    )
+    assert score_folder(flac, "Ella Langley", "Hungover", ["Hungover", "Blue"], ["mp3", "flac"], 0.5, 2, 320, gate=lossless).reason == "ok"
+    assert score_folder(mp3, "Ella Langley", "Hungover", ["Hungover", "Blue"], ["mp3", "flac"], 0.5, 2, 320, gate=lossless).reason == "below quality cutoff"
+
+    standard = gate_from_profile(
+        {"name": "Standard", "cutoff": 9, "items": [{"quality": {"id": 9, "name": "MP3-320"}, "allowed": True}]},
+        ["mp3", "flac"],
+        320,
+    )
+    low = _hungover(
+        [
+            _Rated(r"Ella Langley\Hungover\01 Hungover.mp3", bitrate=128, duration=180),
+            _Rated(r"Ella Langley\Hungover\02 Blue.mp3", bitrate=128, duration=200),
+        ]
+    )
+    assert score_folder(low, "Ella Langley", "Hungover", ["Hungover", "Blue"], ["mp3", "flac"], 0.5, 2, 320, gate=standard).reason != "ok"
+    assert score_folder(mp3, "Ella Langley", "Hungover", ["Hungover", "Blue"], ["mp3", "flac"], 0.5, 2, 320, gate=standard).reason == "ok"
+
+
+def test_duration_and_studio_outrank_a_live_copy():
+    studio = _hungover(
+        [
+            _Rated(r"Ella Langley\Hungover\01 Hungover.mp3", bitrate=320, duration=180),
+            _Rated(r"Ella Langley\Hungover\02 Blue.mp3", bitrate=320, duration=200),
+        ]
+    )
+    live = FolderCandidate(
+        username="other",
+        remote_dir=r"Ella Langley\Hungover Live",
+        files=[
+            _Rated(r"Ella Langley\Hungover Live\01 Hungover Live.mp3", bitrate=320, duration=240),
+            _Rated(r"Ella Langley\Hungover Live\02 Blue Live.mp3", bitrate=320, duration=260),
+        ],
+    )
+    studio_score = score_folder(
+        studio, "Ella Langley", "Hungover", ["Hungover", "Blue"], ["mp3", "flac"], 0.5, 2, 320,
+        durations=[180, 200],
+    )
+    live_score = score_folder(
+        live, "Ella Langley", "Hungover", ["Hungover", "Blue"], ["mp3", "flac"], 0.5, 2, 320,
+        durations=[180, 200],
+    )
+    assert studio_score.reason == "ok"
+    assert live_score.reason == "ok"
+    assert studio_score.score > live_score.score
+    live_points = live_score.score
+
+    titled = score_folder(
+        FolderCandidate(
+            username="other",
+            remote_dir=r"Ella Langley\Hungover Live",
+            files=[
+                _Rated(r"Ella Langley\Hungover Live\01 Hungover Live.mp3", bitrate=320, duration=240),
+                _Rated(r"Ella Langley\Hungover Live\02 Blue Live.mp3", bitrate=320, duration=260),
+            ],
+        ),
+        "Ella Langley",
+        "Hungover Live",
+        ["Hungover Live", "Blue Live"],
+        ["mp3", "flac"],
+        0.5,
+        2,
+        320,
+        durations=[240, 260],
+    )
+    assert titled.score > live_points
