@@ -312,6 +312,52 @@ class JobStore:
         }
         self.set_meta("artist_cooldowns", json.dumps(data))
 
+    def clear_artist_cooldown(self, artist: str) -> None:
+        key = (artist or "").casefold().strip()
+        if not key:
+            return
+        data = self.artist_cooldowns()
+        if key not in data:
+            return
+        data.pop(key, None)
+        self.set_meta("artist_cooldowns", json.dumps(data))
+
+    def note_dry_run(self, detail: str) -> None:
+        text = (detail or "").strip()
+        if not text:
+            return
+        notes = self.dry_run_notes()
+        if notes and notes[0] == text:
+            return
+        notes.insert(0, text)
+        self.set_meta("dry_run_notes", json.dumps(notes[:50]))
+
+    def dry_run_notes(self) -> list[str]:
+        raw = self.get_meta("dry_run_notes") or "[]"
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(data, list):
+            return []
+        return [str(item) for item in data if str(item).strip()]
+
+    def wanted_albums(self) -> list[dict]:
+        """Album payloads saved at Sync, including ones that already have some files."""
+        with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT payload FROM wanted_rows
+                WHERE kind = 'album' AND payload IS NOT NULL AND payload != ''
+                """
+            ).fetchall()
+        albums = []
+        for (payload,) in rows:
+            data = _loads(payload)
+            if isinstance(data, dict):
+                albums.append(data)
+        return albums
+
     def should_skip_track(self, track_id: int, retry_hours: int) -> bool:
         job = self.get_track(track_id)
         if not job:

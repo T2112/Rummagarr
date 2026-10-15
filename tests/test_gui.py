@@ -122,7 +122,7 @@ def _buttons(widget):
 def test_sidebar_replaces_the_tab_strip(desktop):
     assert isinstance(desktop.notebook, PageHost)
     labels = [item._label.cget("text") for item in desktop._nav_items.values()]
-    assert labels == ["Status", "Wanted", "Search", "Shared", "Settings"]
+    assert labels == ["Status", "Wanted", "Dashboard", "Health", "Search", "Shared", "Settings"]
     assert desktop.notebook.select() == str(desktop.status_tab)
     assert desktop.status_tab.winfo_ismapped()
     desktop.notebook.select(desktop.wanted_tab)
@@ -137,6 +137,12 @@ def test_sidebar_replaces_the_tab_strip(desktop):
     assert form.heading == "Settings"
     assert form.theme_var.get() == "dark"
     assert _label_named(form, LIGHT_MODE_HINT)
+    desktop.notebook.select(desktop.dashboard_tab)
+    desktop.update()
+    assert "Missing albums" in desktop.dashboard_text.get("1.0", "end")
+    desktop.notebook.select(desktop.health_tab)
+    desktop.update()
+    assert desktop.health_tree.winfo_ismapped()
 
 
 def test_theme_toggle_applies_live_and_persists(desktop):

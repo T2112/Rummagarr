@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [1.14.0] — 2026-10-15
+
+### Added
+
+- Rummagarr can act as a Lidarr indexer and download client. Settings → Bridge listens on one local port and speaks Torznab plus the qBittorrent Web API 2.11.2. Lidarr already imports a finished album from qBittorrent, so Search and Interactive Search show Soulseek results and the grab, queue, and history path stays Lidarr's. A SABnzbd shim would need a fake NZB for every grab, and Synology Download Station's API is narrower, so qBittorrent is the client Lidarr already tests. Add to Lidarr registers both. The standalone worker still runs when the bridge is off.
+- Quality upgrades are opt-in. Albums below the quality profile cutoff, such as MP3 on a lossless profile, are re-searched on a schedule. Lidarr's own import replaces the old file.
+- Library health lists albums missing tracks, edition titles that disagree, audio files in the complete folder's root, and leftovers in Review. Re-search, Rescan, and Delete (with a confirm) sit on that page.
+- Discord and ntfy webhooks, plus a Plex or Jellyfin library refresh, can run on import or when files move to Review. Test notification sends the same way.
+- The Wanted dashboard counts missing albums by artist, tag, and decade, estimates how long the queue would take at the last 7 days' rate, and lists who is queued next.
+- Settings can keep more than one Lidarr instance. The selected instance is the URL, API key, and scan path Rummagarr uses. Dry run records what would be grabbed and does not download. A Lidarr grab in dry run stays paused so Lidarr does not import it.
+
 ## [1.13.0] — 2026-10-15
 
 ### Added

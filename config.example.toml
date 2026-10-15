@@ -12,6 +12,15 @@ api_key = "CHANGEME"
 scan_path = "D:\\Media\\Incoming\\Soulseek"
 # When on, an empty download queue after an artist asks Lidarr to import that folder.
 auto_import_after_artist = false
+# Which saved instance the worker uses. A file with only url and api_key is one instance named Home.
+active = "Home"
+
+# More Lidarr servers. The active name's url, api_key, and scan_path are what the worker uses.
+# [[lidarr.instances]]
+# name = "Home"
+# url = "http://127.0.0.1:8686"
+# api_key = "CHANGEME"
+# scan_path = "D:\\Media\\Incoming\\Soulseek"
 
 [soulseek]
 username = "CHANGEME"
@@ -74,6 +83,35 @@ clean_incomplete_on_fail = true
 # Also delete Incomplete files older than this many hours (0 disables the sweep).
 incomplete_max_age_hours = 12
 ignored_users = []
+# Record the grab and do not download. A Lidarr grab stays paused so Lidarr does not import it.
+dry_run = false
+# Re-search albums Lidarr already has below the quality cutoff, on this schedule.
+quality_upgrades = false
+quality_upgrade_hours = 24
+
+[bridge]
+# Torznab indexer and qBittorrent Web API 2.11.2 on one port.
+# Lidarr already imports a finished album from qBittorrent, so this is the client it tests.
+# A SABnzbd entry would need a fake NZB. Download Station's API is narrower.
+# Off by default. The standalone worker keeps searching either way.
+enabled = false
+host = "127.0.0.1"
+port = 8788
+api_key = ""
+username = "rummagarr"
+password = ""
+category = "lidarr"
+
+[notify]
+discord_url = ""
+ntfy_url = ""
+on_import = true
+on_review = true
+plex_url = ""
+plex_token = ""
+plex_section = ""
+jellyfin_url = ""
+jellyfin_api_key = ""
 
 [runtime]
 # How many albums to search/download at the same time.
