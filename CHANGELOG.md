@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [1.16.0] — 2026-10-15
+
+### Added
+
+- Browse → Download all missing queues the wanted files that user has. A limits window shows the file cap, the size cap, one file at a time, and the pause between files. A number in the user's profile is used when it is stricter than Rummagarr's own cap. Uploads that are off, or only for a list, are not queued. Their queue ceiling is respected. Files go one at a time, with a pause between them, and a second browse download waits until the first finishes.
+- Stats lists finished downloads by user, album job counts, and uploads from this PC.
+
 ## [1.15.0] — 2026-10-15
 
 ### Added

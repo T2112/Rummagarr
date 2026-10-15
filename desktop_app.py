@@ -52,6 +52,8 @@ from library_report import (
 from lidarr_client import LidarrClient
 from lidarr_register import LidarrRegisterError, register_with_lidarr
 from notifications import deliver
+from peer_limits import apply_limits, select_under_cap, share_file_rows
+from stats_report import format_stats
 from backup_data import create_backup, restore_backup
 from setup_check import format_setup_report, lidarr_check, local_setup_checks
 from user_browse import BrowseCache, ShareIndex, is_wanted, missing_needles, profile_text
@@ -2654,6 +2656,7 @@ class DesktopApp(tk.Tk):
         self.status_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
         self.wanted_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
         self.dashboard_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
+        self.stats_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
         self.health_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
         self.search_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
         self.browse_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
@@ -2663,6 +2666,7 @@ class DesktopApp(tk.Tk):
         self._add_nav(self.sidebar, "Status", self.status_tab)
         self._add_nav(self.sidebar, "Wanted", self.wanted_tab)
         self._add_nav(self.sidebar, "Dashboard", self.dashboard_tab)
+        self._add_nav(self.sidebar, "Stats", self.stats_tab)
         self._add_nav(self.sidebar, "Health", self.health_tab)
         self._add_nav(self.sidebar, "Search", self.search_tab)
         self._add_nav(self.sidebar, "Browse", self.browse_tab)
@@ -2688,6 +2692,7 @@ class DesktopApp(tk.Tk):
         self._build_status(self.status_tab)
         self._build_wanted(self.wanted_tab)
         self._build_dashboard(self.dashboard_tab)
+        self._build_stats(self.stats_tab)
         self._build_health(self.health_tab)
         self._build_search(self.search_tab)
         self._build_browse(self.browse_tab)
@@ -2712,6 +2717,7 @@ class DesktopApp(tk.Tk):
             self.status_tab,
             self.wanted_tab,
             self.dashboard_tab,
+            self.stats_tab,
             self.health_tab,
             self.search_tab,
             self.browse_tab,
@@ -2723,6 +2729,8 @@ class DesktopApp(tk.Tk):
         page.pack(in_=self.content, fill="both", expand=True)
         if page is self.dashboard_tab:
             self.refresh_dashboard()
+        elif page is self.stats_tab:
+            self.refresh_stats()
         elif page is self.health_tab:
             self.refresh_health()
         selected = str(page)
@@ -3094,6 +3102,37 @@ class DesktopApp(tk.Tk):
         except Exception as exc:
             log.exception("Could not build the wanted dashboard")
             text = f"Could not build the dashboard: {exc}"
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text)
+        widget.configure(state="disabled")
+
+    def _build_stats(self, parent: ttk.Frame) -> None:
+        self._page_header(
+            parent,
+            "Stats",
+            "Finished downloads, album jobs, and files uploaded from this PC.",
+        )
+        bar = ttk.Frame(parent, style="Main.TFrame")
+        bar.pack(fill="x", pady=(self.px(12), self.px(8)))
+        ttk.Button(bar, text="Refresh", command=self.refresh_stats).pack(side="left")
+        self.stats_text = tk.Text(parent, wrap="word", height=24, bd=0, highlightthickness=0)
+        self.stats_text.pack(fill="both", expand=True)
+        self.stats_text.configure(state="disabled")
+
+    def refresh_stats(self) -> None:
+        widget = getattr(self, "stats_text", None)
+        if widget is None:
+            return
+        try:
+            text = format_stats(
+                self.worker.store.activity_summary(),
+                self.worker.store.upload_totals(),
+                self.worker.store.get_meta("last_browse_download") or "",
+            )
+        except Exception as exc:
+            log.exception("Could not build the stats page")
+            text = f"Could not build the stats: {exc}"
         widget.configure(state="normal")
         widget.delete("1.0", "end")
         widget.insert("1.0", text)
@@ -4130,6 +4169,7 @@ class DesktopApp(tk.Tk):
         entry.bind("<Return>", lambda _event: self.load_browse(False))
         ttk.Button(row, text="Browse", command=lambda: self.load_browse(False)).pack(side="left", padx=(self.px(8), 0))
         ttk.Button(row, text="Refresh", command=lambda: self.load_browse(True)).pack(side="left", padx=(self.px(8), 0))
+        ttk.Button(row, text="Download all missing", command=self.download_browse_missing).pack(side="left", padx=(self.px(8), 0))
         self.browse_status = tk.StringVar(value="Enter a username. Start the worker so Browse can ask Soulseek.")
         ttk.Label(parent, textvariable=self.browse_status, style="Muted.TLabel", wraplength=self.px(900)).pack(
             anchor="w", pady=(self.px(6), 0)
@@ -4201,6 +4241,7 @@ class DesktopApp(tk.Tk):
         self.browse_profile.delete("1.0", "end")
         self.browse_profile.insert("1.0", profile_text(username, payload.get("profile") or {}))
         self.browse_profile.configure(state="disabled")
+        self._browse_payload = payload
         self._browse_index = ShareIndex(payload.get("directories") or [])
         try:
             albums = self.worker.store.wanted_albums()
@@ -4218,6 +4259,115 @@ class DesktopApp(tk.Tk):
             self.browse_status.set(f"Saved copy from {when}. Refresh asks Soulseek again.")
         else:
             self.browse_status.set(f"Browsed {username}. Saved {when}.")
+
+    def download_browse_missing(self) -> None:
+        payload = getattr(self, "_browse_payload", None)
+        username = self.browse_user_var.get().strip()
+        if not payload or not username:
+            self.browse_status.set("Browse a user first.")
+            return
+        profile = payload.get("profile") or {}
+        description = str(profile.get("description") or "")
+        try:
+            permission = int(profile.get("upload_permissions", -1))
+        except (TypeError, ValueError):
+            permission = -1
+        try:
+            queue_length = int(profile.get("queue_length") or 0)
+        except (TypeError, ValueError):
+            queue_length = 0
+        cfg = self.worker.cfg
+        limits = apply_limits(
+            description,
+            permission=permission,
+            queue_length=queue_length,
+            our_files=int(cfg.max_queued_files_per_user or 1),
+            our_mb=int(cfg.max_queued_mb_per_user or 1),
+        )
+        rows = share_file_rows(username, payload.get("directories") or [])
+        matches = self.worker.match_user_files(rows) if rows else []
+        chosen, skipped = select_under_cap(
+            matches,
+            max_files=limits.max_files,
+            max_bytes=limits.max_mb * 1024 * 1024,
+        )
+        lines = list(limits.lines)
+        if limits.allowed:
+            lines.append("")
+            lines.append(f"{len(chosen)} missing file(s) will be queued from {username}.")
+            if skipped:
+                lines.append(f"{skipped} more match, and stay out because of the cap.")
+            if not chosen:
+                lines.append("Nothing in this share matches the wanted list.")
+        self._show_limits(username, lines, limits, chosen)
+
+    def _show_limits(self, username: str, lines: list[str], limits, chosen: list) -> None:
+        existing = getattr(self, "_limits_window", None)
+        if existing is not None:
+            try:
+                existing.destroy()
+            except tk.TclError:
+                pass
+        window = tk.Toplevel(self)
+        window.title("Download limits")
+        window.transient(self)
+        window.geometry(f"{self.px(560)}x{self.px(420)}")
+        frame = ttk.Frame(window, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=username, style="PageTitle.TLabel").pack(anchor="w")
+        box = tk.Text(frame, wrap="word", height=14, bd=0, highlightthickness=0)
+        box.pack(fill="both", expand=True, pady=(8, 8))
+        box.insert("1.0", "\n".join(lines))
+        box.configure(state="disabled")
+        self._limits_text = box
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x")
+
+        def start() -> None:
+            window.destroy()
+            self._start_browse_download(chosen, limits)
+
+        if limits.allowed and chosen:
+            ttk.Button(buttons, text="Download", command=start).pack(side="left")
+        ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
+        self._limits_window = window
+
+    def _start_browse_download(self, chosen: list, limits) -> None:
+        loop = getattr(self.worker, "_loop", None)
+        if loop is None or not loop.is_running():
+            self.browse_status.set("Start the worker to download. Downloads use that Soulseek login.")
+            return
+        specs = []
+        for match in chosen:
+            specs.append(
+                {
+                    "id": f"{match.username}\n{match.filename}",
+                    "username": match.username,
+                    "filename": match.filename,
+                    "size": match.size,
+                    "link": match.link(),
+                }
+            )
+        self.browse_status.set(
+            f"Downloading {len(specs)} file(s), {limits.files_at_once} at a time, {limits.pace_seconds}s apart."
+        )
+        future = asyncio.run_coroutine_threadsafe(
+            self.worker.download_paced(
+                specs,
+                pace_seconds=limits.pace_seconds,
+                files_at_once=limits.files_at_once,
+            ),
+            loop,
+        )
+
+        def done() -> None:
+            try:
+                text = future.result(timeout=max(60, limits.pace_seconds * max(1, len(specs)) + 120))
+            except Exception as exc:
+                text = str(exc).strip() or "Download failed."
+            self._post(lambda text=text: self.browse_status.set(text))
+
+        threading.Thread(target=done, name="browse-missing", daemon=True).start()
 
     def _insert_browse_children(self, parent: str, path: str) -> None:
         if path in self._browse_opened:

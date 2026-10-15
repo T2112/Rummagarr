@@ -20,6 +20,7 @@ from desktop_app import (
     format_status_line,
     settings_apply_message,
 )
+from sharing import WantedMatch
 from updater import UpdateStatus
 from status_ui import RECENT_LIMITS
 from tests.conftest import album, hole, make_worker
@@ -122,7 +123,7 @@ def _buttons(widget):
 def test_sidebar_replaces_the_tab_strip(desktop):
     assert isinstance(desktop.notebook, PageHost)
     labels = [item._label.cget("text") for item in desktop._nav_items.values()]
-    assert labels == ["Status", "Wanted", "Dashboard", "Health", "Search", "Browse", "Shared", "Settings"]
+    assert labels == ["Status", "Wanted", "Dashboard", "Stats", "Health", "Search", "Browse", "Shared", "Settings"]
     assert desktop.notebook.select() == str(desktop.status_tab)
     assert desktop.status_tab.winfo_ismapped()
     desktop.notebook.select(desktop.wanted_tab)
@@ -940,3 +941,50 @@ def test_about_donate_is_a_placeholder_and_setup_check_opens(desktop):
     desktop.update()
     assert "Setup looks ready." in desktop._setup_text.get("1.0", "end")
     desktop._setup_window.destroy()
+
+
+def test_stats_page_and_browse_limits_popup(desktop):
+    desktop.notebook.select(desktop.stats_tab)
+    desktop.update()
+    assert "30 finished" in desktop.stats_text.get("1.0", "end")
+    desktop._browse_payload = {
+        "username": "goodpeer",
+        "profile": {
+            "description": "only 2 files. one album at a time. wait 30 seconds between downloads.",
+            "upload_permissions": 1,
+            "queue_length": 0,
+        },
+        "directories": [{"name": "Music", "files": [{"filename": "01 Blue.flac", "size": 100, "extension": "flac"}]}],
+    }
+    desktop.browse_user_var.set("goodpeer")
+    desktop.worker.match_user_files = lambda files: [
+        WantedMatch(
+            username="goodpeer",
+            filename="01 Blue.flac",
+            size=100,
+            artist="Ella Langley",
+            album="Hungover",
+            song="Blue",
+            key="song:1",
+            kind="song",
+            album_id=1,
+            track_id=1,
+            score=1,
+        )
+    ]
+    desktop.download_browse_missing()
+    desktop.update()
+    window = desktop._limits_window
+    text = desktop._limits_text.get("1.0", "end")
+    assert "2 files" in text
+    assert "30 seconds" in text
+    assert "1 file at a time" in text
+    assert any(button.cget("text") == "Download" for button in _buttons(window))
+    window.destroy()
+
+    desktop._browse_payload["profile"]["upload_permissions"] = 0
+    desktop.download_browse_missing()
+    desktop.update()
+    assert "Uploads are off" in desktop._limits_text.get("1.0", "end")
+    assert not any(button.cget("text") == "Download" for button in _buttons(desktop._limits_window))
+    desktop._limits_window.destroy()
