@@ -1,6 +1,6 @@
 # Rummagarr
 
-**Version 1.14.0** — Windows desktop app. No Docker. No slskd. The GitHub repository is still [T2112/lidarr-soulseek](https://github.com/T2112/lidarr-soulseek).
+**Version 1.15.0** — Windows desktop app. No Docker. No slskd. The GitHub repository is still [T2112/lidarr-soulseek](https://github.com/T2112/lidarr-soulseek).
 
 The worker reads Lidarr **Wanted → Missing**, searches Soulseek, downloads matching albums or individual missing tracks, converts FLAC/WAV to MP3 when needed, asks Lidarr to import and rename, then cleans leftover files.
 
@@ -58,11 +58,17 @@ dist\Rummagarr-Setup-1.11.0.exe
 
 The same steps run in GitHub Actions (`.github/workflows/windows-installer.yml`) on `windows-latest`. Pull requests and pushes to `main` upload the installer as a workflow artifact.
 
-To publish a public download, push a tag `v<version>` that matches the `VERSION` file (for example `v1.14.0`). That run creates a GitHub Release and attaches `Rummagarr-Setup-<version>.exe` and the same file as `LidarrSoulseek-Setup-<version>.exe`, so an installed 1.9.4 can still update. The release notes are the matching section of `CHANGELOG.md`, followed by the install instructions. The release fails if that section is missing. You can also publish the version already in `VERSION` without making the tag yourself: **Actions → Windows installer → Run workflow**, and choose the `main` branch. If that release already exists, the workflow replaces the installer files and the notes.
+To publish a public download, push a tag `v<version>` that matches the `VERSION` file (for example `v1.15.0`). That run creates a GitHub Release and attaches `Rummagarr-Setup-<version>.exe` and the same file as `LidarrSoulseek-Setup-<version>.exe`, so an installed 1.9.4 can still update. The release notes are the matching section of `CHANGELOG.md`, followed by the install instructions. The release fails if that section is missing. You can also publish the version already in `VERSION` without making the tag yourself: **Actions → Windows installer → Run workflow**, and choose the `main` branch. If that release already exists, the workflow replaces the installer files and the notes.
 
 This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs on, and Inno Setup is a Windows program. Push the branch and let that workflow produce the `.exe`.
 
 `python main.py` still runs the worker without the window, for the original script install below.
+
+## What's new in 1.15.0
+
+- Browse shows one Soulseek user's profile and share list. Folders open one level at a time, the list is saved on this PC, and a folder that names a missing Lidarr album is marked Wanted.
+- Help → Setup check reviews the Lidarr and Soulseek settings. The first launch opens it when something still needs attention. Backup and Restore keep the settings and the database, not the music folders. About has a Donate button; the link is not set yet.
+- Full changelog: [CHANGELOG.md](CHANGELOG.md)
 
 ## What's new in 1.14.0
 

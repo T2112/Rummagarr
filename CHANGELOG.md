@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here.
 
+## [1.15.0] — 2026-10-15
+
+### Added
+
+- Browse shows one Soulseek user's profile and share list. The profile card has status, free slot, queue, upload permission, and the description. The folder tree opens one level at a time, and the list is saved so the next look does not ask the peer again until Refresh. A folder that names a missing Lidarr album is marked Wanted. Search can open that user from a selected file.
+- Help → Setup check reviews the Lidarr URL, API key, Soulseek login, ports, and folders before a search is sent. The first launch opens it when something still needs attention. Test Lidarr asks the server from that window.
+- Help → Backup settings writes a zip of the settings and the local database. Restore replaces those files and leaves the music folders alone. A backup member that names another folder is ignored.
+- Help → About has a Donate button. The link is not set yet.
+
 ## [1.14.0] — 2026-10-15
 
 ### Added

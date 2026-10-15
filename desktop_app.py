@@ -52,6 +52,9 @@ from library_report import (
 from lidarr_client import LidarrClient
 from lidarr_register import LidarrRegisterError, register_with_lidarr
 from notifications import deliver
+from backup_data import create_backup, restore_backup
+from setup_check import format_setup_report, lidarr_check, local_setup_checks
+from user_browse import BrowseCache, ShareIndex, is_wanted, missing_needles, profile_text
 from main import setup_logging
 from status_ui import DEFAULT_RECENT_LIMIT, RECENT_LIMITS, normalize_recent_limit
 from updater import (
@@ -2557,8 +2560,16 @@ class DesktopApp(tk.Tk):
             self.after(300, self.on_start)
         if check_updates:
             self.after(400, lambda: self.check_for_updates(manual=False))
+        self.after(700, self._maybe_setup_check)
 
     def destroy(self) -> None:
+        cache = getattr(self, "_browse_cache_db", None)
+        if cache is not None:
+            try:
+                cache.close()
+            except Exception:
+                pass
+            self._browse_cache_db = None
         self._shutting_down = True
         self._drop_tk_cycles()
         try:
@@ -2645,6 +2656,7 @@ class DesktopApp(tk.Tk):
         self.dashboard_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
         self.health_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
         self.search_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
+        self.browse_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
         self.shared_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
         self.settings_tab = ttk.Frame(self.content, style="Main.TFrame")
         self.notebook = PageHost(self._show_page)
@@ -2653,6 +2665,7 @@ class DesktopApp(tk.Tk):
         self._add_nav(self.sidebar, "Dashboard", self.dashboard_tab)
         self._add_nav(self.sidebar, "Health", self.health_tab)
         self._add_nav(self.sidebar, "Search", self.search_tab)
+        self._add_nav(self.sidebar, "Browse", self.browse_tab)
         self._add_nav(self.sidebar, "Shared", self.shared_tab)
         self._nav_group(self.sidebar, "SYSTEM")
         self._add_nav(self.sidebar, "Settings", self.settings_tab)
@@ -2677,6 +2690,7 @@ class DesktopApp(tk.Tk):
         self._build_dashboard(self.dashboard_tab)
         self._build_health(self.health_tab)
         self._build_search(self.search_tab)
+        self._build_browse(self.browse_tab)
         self._build_shared(self.shared_tab)
         apply_theme(self, self._theme_name)
         self.notebook.select(self.status_tab)
@@ -2700,6 +2714,7 @@ class DesktopApp(tk.Tk):
             self.dashboard_tab,
             self.health_tab,
             self.search_tab,
+            self.browse_tab,
             self.shared_tab,
             self.settings_tab,
         ):
@@ -2894,6 +2909,9 @@ class DesktopApp(tk.Tk):
         help_menu = tk.Menu(menu, tearoff=0)
         help_menu.add_command(label="Check for updates", command=lambda: self.check_for_updates(manual=True))
         help_menu.add_command(label="About", command=self.show_about)
+        help_menu.add_command(label="Setup check", command=self.show_setup_check)
+        help_menu.add_command(label="Backup settings", command=self.backup_settings)
+        help_menu.add_command(label="Restore settings", command=self.restore_settings)
         menu.add_cascade(label="Help", menu=help_menu)
         self.configure(menu=menu)
         self.help_menu = help_menu
@@ -2901,13 +2919,152 @@ class DesktopApp(tk.Tk):
         self._theme_menus.append(menu)
 
     def show_about(self) -> None:
-        messagebox.showinfo(
-            "About Rummagarr",
-            f"Rummagarr {app_version()}\n\n"
-            "Downloads missing music from Soulseek into Lidarr.\n"
-            "Help → Check for updates looks for a newer release.",
+        existing = getattr(self, "_about_window", None)
+        if existing is not None:
+            try:
+                existing.destroy()
+            except tk.TclError:
+                pass
+        window = tk.Toplevel(self)
+        window.title("About Rummagarr")
+        window.transient(self)
+        window.resizable(False, False)
+        frame = ttk.Frame(window, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=f"Rummagarr {app_version()}", style="PageTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            frame,
+            text="Downloads missing music from Soulseek into Lidarr.\nHelp → Check for updates looks for a newer release.",
+            wraplength=420,
+        ).pack(anchor="w", pady=(8, 12))
+        note = tk.StringVar(value="")
+        ttk.Button(frame, text="Donate", command=lambda: note.set("A donate link is not set yet.")).pack(anchor="w")
+        ttk.Label(frame, textvariable=note, style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
+        ttk.Button(frame, text="Close", command=window.destroy).pack(anchor="e", pady=(12, 0))
+        self._about_window = window
+        window.bind("<Destroy>", lambda _event: setattr(self, "_about_window", None), add="+")
+
+    def show_setup_check(self) -> None:
+        checks = local_setup_checks(self.worker.cfg)
+        text = format_setup_report(checks)
+        existing = getattr(self, "_setup_window", None)
+        if existing is not None:
+            try:
+                existing.destroy()
+            except tk.TclError:
+                pass
+        window = tk.Toplevel(self)
+        window.title("Setup check")
+        window.transient(self)
+        window.geometry(f"{self.px(560)}x{self.px(420)}")
+        frame = ttk.Frame(window, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Setup check", style="PageTitle.TLabel").pack(anchor="w")
+        box = tk.Text(frame, wrap="word", height=14, bd=0, highlightthickness=0)
+        box.pack(fill="both", expand=True, pady=(8, 8))
+        box.insert("1.0", text)
+        box.configure(state="disabled")
+        self._setup_text = box
+
+        def test_lidarr() -> None:
+            cfg = self.worker.cfg
+
+            def work() -> None:
+                client = LidarrClient(cfg.lidarr_url, cfg.lidarr_api_key, timeout=15)
+                try:
+                    status = client.ping()
+                    version = status.get("version") or "ok"
+                    item = lidarr_check(True, f"Lidarr answered ({version}).")
+                except Exception as exc:
+                    item = lidarr_check(False, str(exc) or "Lidarr did not answer.")
+                finally:
+                    client.close()
+                line = format_setup_report([item]).split("\n", 1)[0]
+
+                def paint() -> None:
+                    try:
+                        box.configure(state="normal")
+                        box.insert("end", "\n" + line)
+                        box.configure(state="disabled")
+                    except tk.TclError:
+                        pass
+
+                self._post(paint)
+
+            threading.Thread(target=work, name="setup-check", daemon=True).start()
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Test Lidarr", command=test_lidarr).pack(side="left")
+        ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
+        self._setup_window = window
+
+    def _maybe_setup_check(self) -> None:
+        try:
+            checks = local_setup_checks(self.worker.cfg)
+        except Exception:
+            return
+        if all(item.ok for item in checks):
+            return
+        if self.worker.store.get_meta("setup_check_seen") == "1":
+            return
+        self.worker.store.set_meta("setup_check_seen", "1")
+        self.show_setup_check()
+
+    def backup_settings(self) -> None:
+        dest = filedialog.asksaveasfilename(
             parent=self,
+            title="Backup Rummagarr settings",
+            defaultextension=".zip",
+            filetypes=[("Zip", "*.zip")],
+            initialfile="Rummagarr-backup.zip",
         )
+        if not dest:
+            return
+        cfg = self.worker.cfg
+        try:
+            names = create_backup(
+                Path(dest),
+                config_path=self.config_path,
+                state_db=cfg.state_db,
+                log_file=cfg.log_file,
+            )
+        except Exception as exc:
+            messagebox.showerror("Backup", str(exc) or "Could not write the backup.", parent=self)
+            return
+        messagebox.showinfo("Backup", "Saved " + ", ".join(names) + f" to {dest}", parent=self)
+
+    def restore_settings(self) -> None:
+        src = filedialog.askopenfilename(
+            parent=self,
+            title="Restore Rummagarr settings",
+            filetypes=[("Zip", "*.zip")],
+        )
+        if not src:
+            return
+        if not messagebox.askyesno(
+            "Restore",
+            "Replace the current settings and database with this backup? Rummagarr will close. Open it again to use the restored files.",
+            parent=self,
+        ):
+            return
+        cfg = self.worker.cfg
+        try:
+            if getattr(self.worker, "control", None) is not None:
+                self.worker.control.stop()
+            self.worker.close()
+            names = restore_backup(
+                Path(src),
+                config_path=self.config_path,
+                state_db=cfg.state_db,
+                log_file=cfg.log_file,
+            )
+        except Exception as exc:
+            messagebox.showerror("Restore", str(exc) or "Could not restore the backup.", parent=self)
+            return
+        messagebox.showinfo("Restore", "Restored " + ", ".join(names) + ". Rummagarr will close.", parent=self)
+        self._shutting_down = True
+        self.destroy()
 
     def _build_dashboard(self, parent: ttk.Frame) -> None:
         self._page_header(
@@ -3959,6 +4116,166 @@ class DesktopApp(tk.Tk):
         query = manual_query(item.kind, item.artist, item.album, item.song)
         self.open_manual_search(query, link_from_wanted(item))
 
+    def _build_browse(self, parent: ttk.Frame) -> None:
+        self._page_header(
+            parent,
+            "Browse",
+            "Look at one Soulseek user's files. The list is saved on this PC and opened one folder at a time. A folder that names a missing Lidarr album is marked Wanted.",
+        )
+        row = ttk.Frame(parent, style="Main.TFrame")
+        row.pack(fill="x", pady=(self.px(14), 0))
+        self.browse_user_var = tk.StringVar()
+        entry = ttk.Entry(row, textvariable=self.browse_user_var)
+        entry.pack(side="left", fill="x", expand=True)
+        entry.bind("<Return>", lambda _event: self.load_browse(False))
+        ttk.Button(row, text="Browse", command=lambda: self.load_browse(False)).pack(side="left", padx=(self.px(8), 0))
+        ttk.Button(row, text="Refresh", command=lambda: self.load_browse(True)).pack(side="left", padx=(self.px(8), 0))
+        self.browse_status = tk.StringVar(value="Enter a username. Start the worker so Browse can ask Soulseek.")
+        ttk.Label(parent, textvariable=self.browse_status, style="Muted.TLabel", wraplength=self.px(900)).pack(
+            anchor="w", pady=(self.px(6), 0)
+        )
+        self.browse_profile = tk.Text(parent, wrap="word", height=6, bd=0, highlightthickness=0)
+        self.browse_profile.pack(fill="x", pady=(self.px(8), 0))
+        self.browse_profile.configure(state="disabled")
+        card = self._card(parent, padding=(self.px(8), self.px(8), self.px(8), self.px(8)))
+        card.pack(fill="both", expand=True, pady=(self.px(8), 0))
+        self.browse_tree = ttk.Treeview(card.inner, columns=("size", "mark"), show="tree headings", selectmode="browse")
+        self.browse_tree.heading("#0", text="Folder")
+        self.browse_tree.heading("size", text="Size")
+        self.browse_tree.heading("mark", text="Wanted")
+        self.browse_tree.column("#0", width=self.px(420), stretch=True)
+        self.browse_tree.column("size", width=self.px(90), stretch=False, anchor="e")
+        self.browse_tree.column("mark", width=self.px(80), stretch=False)
+        self.browse_tree.pack(fill="both", expand=True)
+        self.browse_tree.bind("<<TreeviewOpen>>", self._browse_open)
+        self._browse_index = ShareIndex()
+        self._browse_needles: list[tuple[str, str]] = []
+        self._browse_paths: dict[str, str] = {}
+        self._browse_opened: set[str] = set()
+
+    def _browse_cache(self) -> BrowseCache:
+        cache = getattr(self, "_browse_cache_db", None)
+        if cache is None:
+            db = Path(self.worker.cfg.state_db)
+            cache = BrowseCache(db.with_name(db.stem + "-browse.sqlite3"))
+            self._browse_cache_db = cache
+        return cache
+
+    def load_browse(self, refresh: bool = False) -> None:
+        username = self.browse_user_var.get().strip()
+        if not username:
+            self.browse_status.set("Enter a Soulseek username.")
+            return
+        cache = self._browse_cache()
+        if not refresh:
+            saved = cache.get(username)
+            if saved is not None:
+                self._show_browse(saved, cached=True)
+                return
+        loop = getattr(self.worker, "_loop", None)
+        if loop is None or not loop.is_running():
+            self.browse_status.set("Start the worker to browse. Browse uses that Soulseek login.")
+            return
+        self.browse_status.set(f"Browsing {username}…")
+        future = asyncio.run_coroutine_threadsafe(self.worker.browse_user(username), loop)
+
+        def done() -> None:
+            try:
+                payload = future.result(timeout=120)
+            except Exception as exc:
+                text = str(exc).strip() or "Browse failed."
+                self._post(lambda text=text: self.browse_status.set(text))
+                return
+
+            def apply() -> None:
+                saved = cache.put(payload["username"], payload["profile"], payload["directories"])
+                self._show_browse(saved, cached=False)
+
+            self._post(apply)
+
+        threading.Thread(target=done, name="browse-user", daemon=True).start()
+
+    def _show_browse(self, payload: dict, *, cached: bool) -> None:
+        username = str(payload.get("username") or self.browse_user_var.get().strip())
+        self.browse_profile.configure(state="normal")
+        self.browse_profile.delete("1.0", "end")
+        self.browse_profile.insert("1.0", profile_text(username, payload.get("profile") or {}))
+        self.browse_profile.configure(state="disabled")
+        self._browse_index = ShareIndex(payload.get("directories") or [])
+        try:
+            albums = self.worker.store.wanted_albums()
+        except Exception:
+            albums = []
+        self._browse_needles = missing_needles(albums)
+        self._browse_paths = {}
+        self._browse_opened = set()
+        tree = self.browse_tree
+        tree.delete(*tree.get_children())
+        tree.tag_configure("wanted", foreground=active_palette(self).ok)
+        self._insert_browse_children("", "")
+        when = str(payload.get("fetched_at") or "")
+        if cached:
+            self.browse_status.set(f"Saved copy from {when}. Refresh asks Soulseek again.")
+        else:
+            self.browse_status.set(f"Browsed {username}. Saved {when}.")
+
+    def _insert_browse_children(self, parent: str, path: str) -> None:
+        if path in self._browse_opened:
+            return
+        self._browse_opened.add(path)
+        tree = self.browse_tree
+        if parent:
+            for child in tree.get_children(parent):
+                if not tree.item(child, "text"):
+                    tree.delete(child)
+        for row in self._browse_index.children(path):
+            label = str(row.get("name") or "")
+            blob = f"{row.get('path') or ''} {label}"
+            wanted = is_wanted(blob, self._browse_needles)
+            tags = ("wanted",) if wanted else ()
+            mark = "Wanted" if wanted else ""
+            if row.get("kind") == "dir":
+                if row.get("locked"):
+                    label = f"{label} (locked)"
+                iid = tree.insert(parent, "end", text=label, values=("", mark), tags=tags)
+                self._browse_paths[iid] = str(row.get("path") or "")
+                tree.insert(iid, "end", text="")
+            else:
+                tree.insert(parent, "end", text=label, values=(self._size_text(row.get("size")), mark), tags=tags)
+
+    def _browse_open(self, _event=None) -> None:
+        tree = self.browse_tree
+        iid = tree.focus()
+        path = self._browse_paths.get(iid)
+        if not path:
+            return
+        self._insert_browse_children(iid, path)
+
+    def browse_selected_user(self) -> None:
+        board = self._current_board()
+        username = self._selected_username(board) if board is not None else ""
+        if not username:
+            if board is not None and board.status is not None:
+                board.status.set("Select a file to browse that user.")
+            return
+        self.browse_user_var.set(username)
+        self.notebook.select(self.browse_tab)
+        self.load_browse(False)
+
+    @staticmethod
+    def _size_text(size) -> str:
+        try:
+            number = float(size or 0)
+        except (TypeError, ValueError):
+            return ""
+        for unit in ("B", "KB", "MB", "GB"):
+            if number < 1024 or unit == "GB":
+                if unit == "B":
+                    return f"{int(number)} B"
+                return f"{number:.1f} {unit}"
+            number /= 1024
+        return ""
+
     def _build_search(self, parent: ttk.Frame) -> None:
         self._page_header(
             parent,
@@ -3985,6 +4302,7 @@ class DesktopApp(tk.Tk):
         self._search_menu.add_command(label="Download all from this user", command=self.download_all_from_user)
         self._search_menu.add_command(label="Download all wanted from this user", command=self.download_all_wanted)
         self._search_menu.add_command(label="Browse folder", command=self.browse_selected_folder)
+        self._search_menu.add_command(label="Browse this user", command=self.browse_selected_user)
 
     def submit_search(self) -> None:
         query = (self.query_var.get() or "").strip()
