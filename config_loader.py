@@ -94,6 +94,8 @@ class Config:
     bridge_username: str = "rummagarr"
     bridge_password: str = ""
     bridge_category: str = "lidarr"
+    bridge_advertise_host: str = ""
+    bridge_remote_path: str = ""
     dry_run: bool = False
     quality_upgrades: bool = False
     quality_upgrade_hours: int = 24
@@ -317,6 +319,8 @@ def default_config(**overrides) -> Config:
         bridge_username=str(overrides.pop("bridge_username", "rummagarr") or "rummagarr"),
         bridge_password=str(overrides.pop("bridge_password", "")),
         bridge_category=str(overrides.pop("bridge_category", "lidarr") or "lidarr"),
+        bridge_advertise_host=str(overrides.pop("bridge_advertise_host", "")),
+        bridge_remote_path=str(overrides.pop("bridge_remote_path", "")),
         dry_run=bool(overrides.pop("dry_run", False)),
         quality_upgrades=bool(overrides.pop("quality_upgrades", False)),
         quality_upgrade_hours=max(1, int(overrides.pop("quality_upgrade_hours", 24))),
@@ -464,6 +468,8 @@ def save_config(path: Path, cfg: Config) -> None:
             f"username = {_toml_str(cfg.bridge_username or 'rummagarr')}",
             f"password = {_toml_str(cfg.bridge_password)}",
             f"category = {_toml_str(cfg.bridge_category or 'lidarr')}",
+            f"advertise_host = {_toml_str(cfg.bridge_advertise_host)}",
+            f"remote_path = {_toml_str(cfg.bridge_remote_path)}",
             "",
             "[notify]",
             f"discord_url = {_toml_str(cfg.notify_discord_url)}",
@@ -652,6 +658,8 @@ def try_load_config(path: Path) -> Config:
         bridge_username=str(bridge.get("username", "rummagarr") or "rummagarr"),
         bridge_password=str(bridge.get("password", "") or ""),
         bridge_category=str(bridge.get("category", "lidarr") or "lidarr"),
+        bridge_advertise_host=str(bridge.get("advertise_host", "") or ""),
+        bridge_remote_path=str(bridge.get("remote_path", "") or ""),
         dry_run=bool(search.get("dry_run", False)),
         quality_upgrades=bool(search.get("quality_upgrades", False)),
         quality_upgrade_hours=max(1, int(search.get("quality_upgrade_hours", 24) or 24)),

@@ -12,6 +12,7 @@ All notable changes to this project are documented here.
 - Discord and ntfy webhooks, plus a Plex or Jellyfin library refresh, can run on import or when files move to Review. Test notification sends the same way.
 - The Wanted dashboard counts missing albums by artist, tag, and decade, estimates how long the queue would take at the last 7 days' rate, and lists who is queued next.
 - Settings can keep more than one Lidarr instance. The selected instance is the URL, API key, and scan path Rummagarr uses. Dry run records what would be grabbed and does not download. A Lidarr grab in dry run stays paused so Lidarr does not import it.
+- The bridge can listen on this PC only, on every interface, or on one address such as Tailscale (100.x). Add to Lidarr registers the address Lidarr can reach, and that address can be typed over the detected Tailscale IP. When the bridge is not limited to this PC, the API key is required on every request except the qBittorrent version check Lidarr sends before login, and that key is the download-client password. The installer and Settings can add a Windows Firewall rule for the bridge port. Path Lidarr sees is the UNC path or mapped drive Lidarr uses for the same complete folder.
 
 ## [1.13.0] — 2026-10-15
 

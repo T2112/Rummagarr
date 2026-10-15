@@ -69,6 +69,7 @@ This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs 
 - Settings → Bridge turns Rummagarr into a Torznab indexer and a qBittorrent 2.11.2 download client, so Lidarr's own Search can grab Soulseek results. Add to Lidarr registers both. The standalone worker still runs with the bridge off.
 - Optional quality upgrades re-search albums below the cutoff on a schedule and let Lidarr replace the old file. Library health lists missing tracks, mismatched editions, loose files, and Review leftovers, with re-search, rescan, and a confirmed delete.
 - Discord, ntfy, Plex, and Jellyfin can be notified on import or Review. The dashboard counts the wanted queue by artist, tag, and decade and estimates how long it would take. More than one Lidarr instance can be saved, and dry run shows a grab without downloading.
+- Lidarr on another PC, including over Tailscale, can reach the bridge. Listen on every interface or the Tailscale address, and Add to Lidarr uses the address that PC can open. A Windows Firewall prompt is in the installer and under Settings → Bridge. Path Lidarr sees is the UNC share or mapped drive for the same complete folder.
 - Full changelog: [CHANGELOG.md](CHANGELOG.md)
 
 ## What's new in 1.13.0
@@ -247,7 +248,9 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\open-firewall.ps1
 ```
 
-Forward TCP `2234` and `2235` on the router to this PC.
+The script opens Soulseek TCP `2234` and `2235`, and the Lidarr bridge port (`8788` unless `[bridge]` in config says otherwise). It still runs when `config.toml` is missing. The installed app keeps that file in `%LOCALAPPDATA%\Rummagarr`, and the script reads it there. The installer can add the same rules at the end of setup. Settings → Bridge → Allow in Windows Firewall opens the bridge port from the app. Lidarr on another machine needs this PC's Tailscale address, not `127.0.0.1`.
+
+Forward TCP `2234` and `2235` on the router to this PC. Tailscale does not need those router forwards for the bridge.
 
 6. Test in the foreground:
 

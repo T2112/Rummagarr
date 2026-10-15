@@ -41,6 +41,7 @@ LicenseFile=..\LICENSE.txt
 
 [Tasks]
 Name: startup; Description: "Start Rummagarr when I sign in to Windows"; Flags: unchecked
+Name: firewall; Description: "Allow Rummagarr through Windows Firewall so Lidarr on another PC can connect"; Flags: unchecked
 
 [InstallDelete]
 Type: files; Name: "{app}\LidarrSoulseek.exe"
@@ -50,6 +51,7 @@ Type: files; Name: "{userdesktop}\Lidarr Soulseek.lnk"
 
 [Files]
 Source: "..\dist\Rummagarr\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\open-firewall.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\Rummagarr"; Filename: "{app}\{#MyAppExeName}"
@@ -61,3 +63,20 @@ Name: "{userstartup}\Rummagarr"; Filename: "{app}\{#MyAppExeName}"; Tasks: start
 ; app (Update now) must start the new version on its own.
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch Rummagarr"; Flags: nowait postinstall skipifsilent
 Filename: "{app}\{#MyAppExeName}"; Flags: nowait skipifnotsilent
+
+[Code]
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ErrorCode: Integer;
+  Script: String;
+begin
+  if CurStep <> ssPostInstall then
+    Exit;
+  if not WizardIsTaskSelected('firewall') then
+    Exit;
+  if MsgBox('Windows will ask for approval to allow Rummagarr through the firewall so Lidarr on another PC can connect.', mbConfirmation, MB_YESNO) <> IDYES then
+    Exit;
+  Script := ExpandConstant('{app}\open-firewall.ps1');
+  if not ShellExec('runas', 'powershell.exe', '-NoProfile -ExecutionPolicy Bypass -File "' + Script + '" -BridgePort 8788', '', SW_SHOWNORMAL, ewWaitUntilTerminated, ErrorCode) then
+    MsgBox('The firewall prompt did not open. Use Settings, Bridge, Allow in Windows Firewall after Rummagarr starts.', mbInformation, MB_OK);
+end;

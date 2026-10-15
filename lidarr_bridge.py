@@ -28,6 +28,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
+from bridge_net import child_path
+
 log = logging.getLogger("lidarr_slsk")
 
 WEBAPI_VERSION = "2.11.2"
@@ -368,7 +370,7 @@ def offer_from_release(release: dict, *, save_path: str, category: str) -> tuple
     files = list(release.get("files") or [])
     token = username + "\n" + "\n".join(str(item.get("filename") or "") for item in files)
     digest, torrent = release_torrent(name, int(release.get("size") or 1), token)
-    folder = str(Path(save_path) / _safe_folder(name))
+    folder = child_path(save_path, _safe_folder(name))
     row = {
         "hash": digest,
         "name": name,
@@ -463,7 +465,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if path == "/api/v2/app/version":
             self._text(APP_VERSION)
             return
-        if not self._qbit_auth():
+        if not self._qbit_auth(query):
             return
         if path == "/api/v2/app/preferences":
             self._json(preferences(self.server.settings["save_path"]))
@@ -490,7 +492,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if path == "/api/v2/auth/login":
             self._login(str(form.get("username") or ""), str(form.get("password") or ""))
             return
-        if not self._qbit_auth():
+        if not self._qbit_auth(self._request_query()):
             return
         if path == "/api/v2/torrents/add":
             self._add(form)
@@ -567,7 +569,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def _login(self, username: str, password: str) -> None:
         settings = self.server.settings
-        ok = username == settings["username"] and password in {settings["password"], settings["api_key"]}
+        key = settings.get("api_key") or ""
+        # A bridge that is not limited to this PC accepts only the API key as the
+        # qBittorrent password. Lidarr's version probe cannot send that key, so
+        # webapiVersion stays open and every later call is behind this login.
+        if settings.get("local_only", True):
+            ok = username == settings["username"] and password in {settings["password"], key}
+        else:
+            ok = bool(key) and username == settings["username"] and password == key
         if not ok or not password:
             self._bytes(403, "text/plain", b"Fails.")
             return
@@ -581,7 +590,24 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _qbit_auth(self) -> bool:
+    def _request_query(self) -> dict:
+        parsed = urlparse(self.path)
+        return {key: values[-1] for key, values in parse_qs(parsed.query).items()}
+
+    def _api_key_ok(self, query: dict) -> bool:
+        """True when a non-local bridge was given the API key on this request."""
+        if self.server.settings.get("local_only", True):
+            return False
+        key = self.server.settings.get("api_key") or ""
+        if not key:
+            return False
+        if (query or {}).get("apikey") == key:
+            return True
+        return (self.headers.get("X-Api-Key") or "") == key
+
+    def _qbit_auth(self, query: dict | None = None) -> bool:
+        if self._api_key_ok(query or {}):
+            return True
         if self.server.book.sid_ok(self.headers.get("Cookie") or ""):
             return True
         self._bytes(403, "text/plain", b"Forbidden")
@@ -703,6 +729,7 @@ def bridge_settings(
     category: str,
     dry_run: bool,
     public_base: str,
+    local_only: bool = True,
 ) -> dict:
     """The dict the HTTP handler reads. ``password`` falls back to the API key."""
     key = api_key or ""
@@ -714,11 +741,6 @@ def bridge_settings(
         "category": category or "lidarr",
         "dry_run": bool(dry_run),
         "public_base": public_base,
+        "local_only": bool(local_only),
         "categories": {},
     }
-
-
-def public_host(host: str) -> str:
-    if host in {"", "0.0.0.0", "::"}:
-        return "127.0.0.1"
-    return host

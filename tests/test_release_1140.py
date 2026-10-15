@@ -41,7 +41,7 @@ def _request(method: str, url: str, data: bytes | None = None, headers: dict | N
         return exc.code, dict(exc.headers), exc.read()
 
 
-def _bridge(tmp_path: Path, *, dry_run: bool = False):
+def _bridge(tmp_path: Path, *, dry_run: bool = False, local_only: bool = True):
     calls = []
 
     def search(artist, album, query):
@@ -67,6 +67,7 @@ def _bridge(tmp_path: Path, *, dry_run: bool = False):
         category="lidarr",
         dry_run=dry_run,
         public_base="http://127.0.0.1",
+        local_only=local_only,
     )
     service = BridgeService("127.0.0.1", 0, book, settings, search, added.append)
     settings["public_base"] = f"http://127.0.0.1:{service.port}"
@@ -400,6 +401,8 @@ def test_config_round_trip_keeps_instances_bridge_and_dry_run(tmp_path: Path):
         bridge_port=8791,
         bridge_api_key="bridge-key",
         bridge_password="bridge-pass",
+        bridge_advertise_host="100.64.1.8",
+        bridge_remote_path=r"D:\Media\Soulseek",
         dry_run=True,
         quality_upgrades=True,
         quality_upgrade_hours=12,
@@ -416,6 +419,8 @@ def test_config_round_trip_keeps_instances_bridge_and_dry_run(tmp_path: Path):
     assert loaded.bridge_enabled is True
     assert loaded.bridge_port == 8791
     assert loaded.bridge_api_key == "bridge-key"
+    assert loaded.bridge_advertise_host == "100.64.1.8"
+    assert loaded.bridge_remote_path == r"D:\Media\Soulseek"
     assert loaded.dry_run is True
     assert loaded.quality_upgrades is True
     assert loaded.quality_upgrade_hours == 12
@@ -459,4 +464,116 @@ def test_changelog_mentions_the_qbittorrent_bridge():
     section = changelog_section(text, "1.14.0")
     assert "qBittorrent" in section
     assert "Torznab" in section
+    assert "Tailscale" in section
     assert "1.13.0" not in section
+
+
+def test_remote_bridge_requires_the_api_key(tmp_path: Path):
+    service, _calls, _added = _bridge(tmp_path, local_only=False)
+    base = f"http://127.0.0.1:{service.port}"
+    try:
+        status, _headers, body = _request("GET", f"{base}/api/v2/app/webapiVersion")
+        assert status == 200
+        assert body.decode() == WEBAPI_VERSION
+        status, _headers, body = _request("GET", f"{base}/api/v2/app/version")
+        assert status == 200
+
+        status, _headers, body = _request("GET", f"{base}/api/v2/app/preferences")
+        assert status == 403
+
+        status, _headers, body = _request(
+            "GET", f"{base}/api/v2/app/preferences", headers={"X-Api-Key": "secret"}
+        )
+        assert status == 200
+        assert "save_path" in json.loads(body)
+
+        status, _headers, body = _request(
+            "POST",
+            f"{base}/api/v2/auth/login",
+            data=b"username=rummagarr&password=bridge-pass",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        assert body == b"Fails."
+
+        status, headers, body = _request(
+            "POST",
+            f"{base}/api/v2/auth/login",
+            data=b"username=rummagarr&password=secret",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        assert body == b"Ok."
+        assert headers["Set-Cookie"].startswith("SID=")
+
+        status, _headers, body = _request("GET", f"{base}/api/v2/torrents/info?apikey=secret")
+        assert status == 200
+        assert json.loads(body) == []
+    finally:
+        service.stop()
+
+
+def test_advertise_host_tailscale_and_remote_path(tmp_path: Path):
+    from bridge_net import (
+        advertise_host,
+        bind_choices,
+        child_path,
+        clean_host,
+        firewall_powershell,
+        is_tailscale,
+        list_ipv4_interfaces,
+        mapped_folder,
+        reported_root,
+        windows_firewall_prompt,
+    )
+    from lidarr_bridge import offer_from_release
+
+    nics = [("eth0", "192.168.1.9"), ("tailscale0", "100.64.1.8"), ("lo", "127.0.0.1")]
+    assert advertise_host("0.0.0.0", "http://100.1.2.3:8788/api", nics) == "100.1.2.3"
+    assert advertise_host("0.0.0.0", "", nics) == "100.64.1.8"
+    assert advertise_host("192.168.1.9", "", nics) == "192.168.1.9"
+    assert advertise_host("127.0.0.1", "", nics) == "127.0.0.1"
+    assert advertise_host("0.0.0.0", "", [("eth0", "10.1.1.5")]) == "10.1.1.5"
+    assert is_tailscale("100.127.255.1")
+    assert not is_tailscale("100.128.0.1")
+    assert clean_host("http://100.1.2.3:8788") == "100.1.2.3"
+    labels = dict(bind_choices(nics))
+    assert labels["127.0.0.1"].startswith("This PC only")
+    assert labels["0.0.0.0"] == "All interfaces"
+    assert "Tailscale" in labels["100.64.1.8"]
+
+    local = tmp_path / "Ella - Hungover"
+    assert mapped_folder(local, tmp_path, r"D:\Media\Soulseek") == r"D:\Media\Soulseek\Ella - Hungover"
+    assert mapped_folder(local, tmp_path, r"\\lidarr\incoming") == r"\\lidarr\incoming\Ella - Hungover"
+    assert mapped_folder(local, tmp_path, "/srv/music") == f"/srv/music/{local.name}"
+    assert mapped_folder(local, tmp_path, "") == str(local.resolve())
+    root = reported_root(tmp_path, r"D:\Media\Soulseek")
+    album_path = mapped_folder(local, tmp_path, r"D:\Media\Soulseek")
+    assert album_path != root
+    row, _torrent = offer_from_release(
+        {"artist": "Ella", "album": "Hungover", "username": "peer", "size": 10, "files": []},
+        save_path=r"D:\Media\Soulseek",
+        category="lidarr",
+    )
+    assert row["content_path"] == child_path(r"D:\Media\Soulseek", "Ella - Hungover")
+    assert row["content_path"] != row["save_path"]
+    assert "\\" in row["content_path"]
+
+    script = firewall_powershell(8788)
+    assert "Rummagarr Bridge 8788" in script
+    assert "localport=8788" in script
+    assert "program=" in firewall_powershell(8788, r"C:\Program\Rummagarr.exe")
+    opened, message = windows_firewall_prompt(8788)
+    assert opened is False
+    assert "Windows" in message
+
+    firewall = Path("open-firewall.ps1").read_text(encoding="utf-8")
+    assert "BridgePort" in firewall
+    assert "Write-Error" not in firewall
+    assert "Rummagarr.exe" in firewall
+    installer = Path("packaging/LidarrSoulseek.iss").read_text(encoding="utf-8")
+    assert "open-firewall.ps1" in installer
+    assert "WizardIsTaskSelected('firewall')" in installer
+    assert "PrivilegesRequired=lowest" in installer
+
+    rows = list_ipv4_interfaces()
+    assert isinstance(rows, list)
+    assert all(len(item) == 2 and isinstance(item[0], str) and isinstance(item[1], str) for item in rows)

@@ -30,6 +30,16 @@ from config_loader import (
     save_config,
     try_load_config,
 )
+from bridge_net import (
+    advertise_host,
+    bind_choices,
+    host_for_url,
+    is_loopback_bind,
+    is_tailscale,
+    list_ipv4_interfaces,
+    url_host_is_local,
+    windows_firewall_prompt,
+)
 from library_report import (
     delete_inside,
     format_summary,
@@ -791,6 +801,8 @@ _BRIDGE_FIELDS = frozenset(
         "bridge_username",
         "bridge_password",
         "bridge_category",
+        "bridge_advertise_host",
+        "bridge_remote_path",
     }
 )
 _SHARE_LIVE_FIELDS = frozenset(
@@ -904,7 +916,7 @@ def settings_apply_message(old: Config, new: Config) -> str:
     if changed & _SHARE_RESCAN_FIELDS:
         parts.append("Shared folders apply after Rescan, or the next time the worker logs in.")
     if changed & _BRIDGE_FIELDS:
-        parts.append("The Lidarr bridge uses the new port and key now.")
+        parts.append("The Lidarr bridge uses the new listen address, port, and key now.")
     if changed & {"dry_run"}:
         parts.append("Dry run applies on the next search.")
     if changed & {"quality_upgrades", "quality_upgrade_hours"}:
@@ -995,6 +1007,8 @@ class SettingsForm(ttk.Frame):
         self._shown_instance = active_name
         self.bridge_enabled_var = tk.BooleanVar(value=bool(getattr(source, "bridge_enabled", False)))
         self.bridge_host_var = tk.StringVar(value=str(getattr(source, "bridge_host", "") or "127.0.0.1"))
+        self.bridge_advertise_var = tk.StringVar(value=str(getattr(source, "bridge_advertise_host", "") or ""))
+        self.bridge_remote_var = tk.StringVar(value=str(getattr(source, "bridge_remote_path", "") or ""))
         self.bridge_port_var = tk.StringVar(value=str(getattr(source, "bridge_port", 8788) or 8788))
         self.bridge_key_var = tk.StringVar(value=str(getattr(source, "bridge_api_key", "") or ""))
         self.bridge_user_var = tk.StringVar(value=str(getattr(source, "bridge_username", "") or "rummagarr"))
@@ -1739,6 +1753,8 @@ class SettingsForm(ttk.Frame):
             "bridge_enabled": bool(self.bridge_enabled_var.get()),
             "bridge_host": host,
             "bridge_port": port,
+            "bridge_advertise_host": self.bridge_advertise_var.get().strip(),
+            "bridge_remote_path": self.bridge_remote_var.get().strip(),
             "bridge_api_key": self.bridge_key_var.get().strip(),
             "bridge_username": self.bridge_user_var.get().strip() or "rummagarr",
             "bridge_password": self.bridge_pass_var.get(),
@@ -1777,8 +1793,9 @@ class SettingsForm(ttk.Frame):
             inner,
             text=(
                 "Rummagarr speaks Torznab and the qBittorrent Web API (2.11.2) on this port. "
-                "Lidarr already imports finished albums from qBittorrent, so Search and Interactive Search "
-                "can grab Soulseek results without a fake NZB. The standalone worker keeps running either way."
+                "Lidarr on another PC, including over Tailscale, cannot use 127.0.0.1. "
+                "Listen on all interfaces or on the Tailscale address, and set the address Lidarr can reach. "
+                "The standalone worker keeps running either way."
             ),
             style="Muted.TLabel",
             wraplength=760,
@@ -1789,61 +1806,162 @@ class SettingsForm(ttk.Frame):
         ttk.Checkbutton(inner, text="Dry run: show what would be grabbed, and do not download", variable=self.dry_run_var).grid(
             row=2, column=0, columnspan=3, sticky="w", pady=2
         )
-        fields = (
-            (3, "Listen address", self.bridge_host_var),
-            (4, "Port", self.bridge_port_var),
-            (5, "API key", self.bridge_key_var),
-            (6, "qBittorrent username", self.bridge_user_var),
-            (7, "qBittorrent password", self.bridge_pass_var),
-            (8, "Category", self.bridge_category_var),
+        self._bind_choices = bind_choices(list_ipv4_interfaces())
+        current_host = self.bridge_host_var.get().strip() or "127.0.0.1"
+        if not any(host == current_host for host, _label in self._bind_choices):
+            self._bind_choices.append((current_host, current_host))
+        self.bridge_bind_label = tk.StringVar(
+            value=next(label for host, label in self._bind_choices if host == current_host)
         )
-        for row, label, variable in fields:
-            ttk.Label(inner, text=label).grid(row=row, column=0, sticky="w", pady=3)
-            show = "*" if "password" in label else ""
-            ttk.Entry(inner, textvariable=variable, width=42, show=show).grid(row=row, column=1, sticky="ew", pady=3)
-        ttk.Button(inner, text="Generate key", command=self._generate_bridge_key).grid(row=5, column=2, padx=(8, 0))
+        ttk.Label(inner, text="Listen on").grid(row=3, column=0, sticky="w", pady=3)
+        bind_box = ttk.Combobox(
+            inner,
+            textvariable=self.bridge_bind_label,
+            values=[label for _host, label in self._bind_choices],
+            state="readonly",
+            width=42,
+        )
+        bind_box.grid(row=3, column=1, columnspan=2, sticky="ew", pady=3)
+        bind_box.bind("<<ComboboxSelected>>", self._on_bind_picked)
+        ttk.Label(inner, text="Port").grid(row=4, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.bridge_port_var, width=10).grid(row=4, column=1, sticky="w", pady=3)
+        ttk.Label(inner, text="Address Lidarr uses").grid(row=5, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.bridge_advertise_var, width=42).grid(row=5, column=1, columnspan=2, sticky="ew", pady=3)
+        detected = advertise_host("0.0.0.0", "", list_ipv4_interfaces())
+        if is_tailscale(detected):
+            detected_text = f"Blank uses this PC's Tailscale address {detected} when listening on all interfaces."
+        elif detected and not is_loopback_bind(detected):
+            detected_text = f"No Tailscale address found. Blank uses {detected} when listening on all interfaces. Type a 100.x address if Lidarr uses Tailscale."
+        else:
+            detected_text = "No Tailscale address found. Type the 100.x address of this PC if Lidarr is on another machine."
+        ttk.Label(inner, text=detected_text, style="Muted.TLabel", wraplength=760).grid(
+            row=6, column=0, columnspan=3, sticky="w"
+        )
+        ttk.Label(inner, text="API key").grid(row=7, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.bridge_key_var, width=42).grid(row=7, column=1, sticky="ew", pady=3)
+        ttk.Button(inner, text="Generate key", command=self._generate_bridge_key).grid(row=7, column=2, padx=(8, 0))
+        ttk.Label(inner, text="qBittorrent username").grid(row=8, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.bridge_user_var, width=42).grid(row=8, column=1, sticky="ew", pady=3)
+        ttk.Label(inner, text="qBittorrent password").grid(row=9, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.bridge_pass_var, width=42, show="*").grid(row=9, column=1, sticky="ew", pady=3)
+        ttk.Label(inner, text="Category").grid(row=10, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.bridge_category_var, width=42).grid(row=10, column=1, sticky="ew", pady=3)
+        ttk.Label(
+            inner,
+            text="When Listen on is not this PC only, Lidarr's download-client password is the API key. The version check Lidarr sends before login stays open. Every other request needs that key.",
+            style="Muted.TLabel",
+            wraplength=760,
+        ).grid(row=11, column=0, columnspan=3, sticky="w", pady=(2, 6))
+        ttk.Label(inner, text="Path Lidarr sees").grid(row=12, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.bridge_remote_var, width=42).grid(row=12, column=1, columnspan=2, sticky="ew", pady=3)
+        ttk.Label(
+            inner,
+            text=(
+                "Leave blank when Lidarr runs on this PC. Otherwise set the path Lidarr uses for this same folder, "
+                "such as a UNC share or a mapped drive. Files still land in the Complete folder. "
+                "The qBittorrent save path uses this value, and the album folder name is added under it."
+            ),
+            style="Muted.TLabel",
+            wraplength=760,
+        ).grid(row=13, column=0, columnspan=3, sticky="w")
+        ttk.Button(inner, text="Allow in Windows Firewall", command=self.allow_firewall).grid(
+            row=14, column=0, columnspan=2, sticky="w", pady=(8, 4)
+        )
         ttk.Checkbutton(inner, text="Re-search albums below the quality cutoff", variable=self.upgrade_var).grid(
-            row=9, column=0, columnspan=2, sticky="w", pady=(10, 2)
+            row=15, column=0, columnspan=2, sticky="w", pady=(10, 2)
         )
-        ttk.Label(inner, text="Hours between cutoff checks").grid(row=10, column=0, sticky="w", pady=3)
-        ttk.Entry(inner, textvariable=self.upgrade_hours_var, width=8).grid(row=10, column=1, sticky="w", pady=3)
+        ttk.Label(inner, text="Hours between cutoff checks").grid(row=16, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.upgrade_hours_var, width=8).grid(row=16, column=1, sticky="w", pady=3)
         ttk.Label(
             inner,
             text="Lidarr replaces the old file when the better copy imports. Rummagarr does not delete it.",
             style="Muted.TLabel",
             wraplength=760,
-        ).grid(row=11, column=0, columnspan=3, sticky="w")
-        ttk.Label(inner, text="Discord webhook").grid(row=12, column=0, sticky="w", pady=(10, 3))
-        ttk.Entry(inner, textvariable=self.discord_var, width=42).grid(row=12, column=1, columnspan=2, sticky="ew", pady=(10, 3))
-        ttk.Label(inner, text="ntfy URL").grid(row=13, column=0, sticky="w", pady=3)
-        ttk.Entry(inner, textvariable=self.ntfy_var, width=42).grid(row=13, column=1, columnspan=2, sticky="ew", pady=3)
+        ).grid(row=17, column=0, columnspan=3, sticky="w")
+        ttk.Label(inner, text="Discord webhook").grid(row=18, column=0, sticky="w", pady=(10, 3))
+        ttk.Entry(inner, textvariable=self.discord_var, width=42).grid(row=18, column=1, columnspan=2, sticky="ew", pady=(10, 3))
+        ttk.Label(inner, text="ntfy URL").grid(row=19, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.ntfy_var, width=42).grid(row=19, column=1, columnspan=2, sticky="ew", pady=3)
         ttk.Checkbutton(inner, text="Notify when an import finishes", variable=self.notify_import_var).grid(
-            row=14, column=0, columnspan=3, sticky="w"
+            row=20, column=0, columnspan=3, sticky="w"
         )
         ttk.Checkbutton(inner, text="Notify when files move to Review", variable=self.notify_review_var).grid(
-            row=15, column=0, columnspan=3, sticky="w"
+            row=21, column=0, columnspan=3, sticky="w"
         )
-        ttk.Label(inner, text="Plex URL").grid(row=16, column=0, sticky="w", pady=(8, 3))
-        ttk.Entry(inner, textvariable=self.plex_url_var, width=42).grid(row=16, column=1, columnspan=2, sticky="ew")
-        ttk.Label(inner, text="Plex token").grid(row=17, column=0, sticky="w", pady=3)
-        ttk.Entry(inner, textvariable=self.plex_token_var, width=42, show="*").grid(row=17, column=1, columnspan=2, sticky="ew")
-        ttk.Label(inner, text="Plex section id").grid(row=18, column=0, sticky="w", pady=3)
-        ttk.Entry(inner, textvariable=self.plex_section_var, width=12).grid(row=18, column=1, sticky="w")
-        ttk.Label(inner, text="Jellyfin URL").grid(row=19, column=0, sticky="w", pady=3)
-        ttk.Entry(inner, textvariable=self.jellyfin_url_var, width=42).grid(row=19, column=1, columnspan=2, sticky="ew")
-        ttk.Label(inner, text="Jellyfin API key").grid(row=20, column=0, sticky="w", pady=3)
-        ttk.Entry(inner, textvariable=self.jellyfin_key_var, width=42, show="*").grid(row=20, column=1, columnspan=2, sticky="ew")
+        ttk.Label(inner, text="Plex URL").grid(row=22, column=0, sticky="w", pady=(8, 3))
+        ttk.Entry(inner, textvariable=self.plex_url_var, width=42).grid(row=22, column=1, columnspan=2, sticky="ew")
+        ttk.Label(inner, text="Plex token").grid(row=23, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.plex_token_var, width=42, show="*").grid(row=23, column=1, columnspan=2, sticky="ew")
+        ttk.Label(inner, text="Plex section id").grid(row=24, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.plex_section_var, width=12).grid(row=24, column=1, sticky="w")
+        ttk.Label(inner, text="Jellyfin URL").grid(row=25, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.jellyfin_url_var, width=42).grid(row=25, column=1, columnspan=2, sticky="ew")
+        ttk.Label(inner, text="Jellyfin API key").grid(row=26, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.jellyfin_key_var, width=42, show="*").grid(row=26, column=1, columnspan=2, sticky="ew")
         ttk.Label(
             inner,
             text="Leave the section id blank to refresh every Plex library. A test sends the webhook and refreshes the libraries.",
             style="Muted.TLabel",
             wraplength=760,
-        ).grid(row=21, column=0, columnspan=3, sticky="w", pady=(4, 8))
+        ).grid(row=27, column=0, columnspan=3, sticky="w", pady=(4, 8))
         buttons = ttk.Frame(inner)
-        buttons.grid(row=22, column=0, columnspan=3, sticky="w")
+        buttons.grid(row=28, column=0, columnspan=3, sticky="w")
         ttk.Button(buttons, text="Test notification", command=self.test_notification).pack(side="left")
         ttk.Button(buttons, text="Add to Lidarr", command=self.add_to_lidarr).pack(side="left", padx=(8, 0))
         inner.columnconfigure(1, weight=1)
+
+    def _on_bind_picked(self, _event=None) -> None:
+        label = self.bridge_bind_label.get()
+        for host, choice in self._bind_choices:
+            if choice == label:
+                self.bridge_host_var.set(host)
+                return
+
+    def allow_firewall(self) -> None:
+        try:
+            port = int(self.bridge_port_var.get().strip())
+        except ValueError:
+            self.message_var.set("Bridge port must be a whole number from 1 to 65535.")
+            return
+        if port < 1 or port > 65535:
+            self.message_var.set("Bridge port must be a whole number from 1 to 65535.")
+            return
+        if os.name != "nt":
+            self.message_var.set("Windows Firewall rules are only added on Windows.")
+            return
+        if not messagebox.askyesno(
+            "Windows Firewall",
+            f"Windows will ask for approval to allow inbound TCP {port} for the Lidarr bridge.",
+            parent=self.winfo_toplevel(),
+        ):
+            return
+        ok, text = windows_firewall_prompt(port)
+        if ok and self.store is not None:
+            self.store.set_meta("firewall_bridge_port", str(port))
+        self.message_var.set(text)
+
+    def _maybe_firewall(self) -> str:
+        """Ask once per port when Lidarr must reach this PC. A Yes is remembered."""
+        if os.name != "nt" or is_loopback_bind(self.bridge_host_var.get().strip()):
+            return ""
+        try:
+            port = int(self.bridge_port_var.get().strip())
+        except ValueError:
+            return ""
+        if port < 1 or port > 65535:
+            return ""
+        if self.store is not None and (self.store.get_meta("firewall_bridge_port") or "") == str(port):
+            return ""
+        if not messagebox.askyesno(
+            "Windows Firewall",
+            f"Allow inbound TCP {port} so Lidarr on another PC can reach Rummagarr? Windows will ask for approval.",
+            parent=self.winfo_toplevel(),
+        ):
+            return ""
+        ok, text = windows_firewall_prompt(port)
+        if ok and self.store is not None:
+            self.store.set_meta("firewall_bridge_port", str(port))
+        return text
 
     def _generate_bridge_key(self) -> None:
         self.bridge_key_var.set(secrets.token_hex(16))
@@ -1888,10 +2006,13 @@ class SettingsForm(ttk.Frame):
         self.bridge_enabled_var.set(True)
         if not self.save():
             return
+        firewall_note = self._maybe_firewall()
         self.message_var.set("Adding Rummagarr to Lidarr…")
 
         def work() -> None:
             text = self._register_bridge()
+            if firewall_note:
+                text = f"{text} {firewall_note}"
             try:
                 self.after(0, lambda text=text: self.message_var.set(text))
             except tk.TclError:
@@ -1907,18 +2028,23 @@ class SettingsForm(ttk.Frame):
             detail = getattr(worker, "_bridge_error", "") or "The bridge is not listening."
             return f"Could not add Rummagarr to Lidarr: {detail}"
         cfg = worker.cfg
-        host = cfg.bridge_host if cfg.bridge_host not in {"", "0.0.0.0", "::"} else "127.0.0.1"
+        host = advertise_host(cfg.bridge_host, getattr(cfg, "bridge_advertise_host", ""))
+        shown = host_for_url(host)
         port = worker.bridge_port()
+        if is_loopback_bind(cfg.bridge_host):
+            password = cfg.bridge_password or cfg.bridge_api_key
+        else:
+            password = cfg.bridge_api_key
         client = LidarrClient(cfg.lidarr_url, cfg.lidarr_api_key, timeout=30)
         try:
-            return register_with_lidarr(
+            text = register_with_lidarr(
                 client,
-                base_url=f"http://{host}:{port}",
+                base_url=f"http://{shown}:{port}",
                 api_key=cfg.bridge_api_key,
-                host=host,
+                host=shown,
                 port=port,
                 username=cfg.bridge_username or "rummagarr",
-                password=cfg.bridge_password or cfg.bridge_api_key,
+                password=password,
                 category=cfg.bridge_category or "lidarr",
             )
         except LidarrRegisterError as exc:
@@ -1927,6 +2053,12 @@ class SettingsForm(ttk.Frame):
             return f"Could not add Rummagarr to Lidarr: {exc}"
         finally:
             client.close()
+        if is_loopback_bind(host) and not url_host_is_local(cfg.lidarr_url):
+            text += (
+                " 127.0.0.1 is unreachable from that Lidarr."
+                " Set Address Lidarr uses to this PC's Tailscale address."
+            )
+        return text
 
     def build_config(self) -> Config:
         url = self.url_var.get().strip().rstrip("/")

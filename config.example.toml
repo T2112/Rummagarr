@@ -94,8 +94,22 @@ quality_upgrade_hours = 24
 # Lidarr already imports a finished album from qBittorrent, so this is the client it tests.
 # A SABnzbd entry would need a fake NZB. Download Station's API is narrower.
 # Off by default. The standalone worker keeps searching either way.
+#
+# host is where Rummagarr listens:
+#   127.0.0.1   this PC only. Lidarr on another machine cannot connect.
+#   0.0.0.0     every interface, including Tailscale.
+#   100.x.x.x   one interface, such as this PC's Tailscale address.
+# advertise_host is the address written into Lidarr. Leave it blank to use the
+# Tailscale 100.x address when host is 0.0.0.0.
+# When host is not 127.0.0.1, the API key is required on every request except
+# the qBittorrent version check Lidarr sends before it logs in. That key is
+# also the download-client password. Allow the port in Windows Firewall.
+# remote_path is the folder Lidarr uses for this same complete directory
+# (a UNC share or a mapped drive). Blank means Lidarr sees the local path.
 enabled = false
 host = "127.0.0.1"
+advertise_host = ""
+remote_path = ""
 port = 8788
 api_key = ""
 username = "rummagarr"

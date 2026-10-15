@@ -37,7 +37,8 @@ from audio_tags import tag_album_folder
 from config_loader import Config
 from control import WorkerControl
 from library_report import merge_upgrade_albums, upgrade_artist
-from lidarr_bridge import BridgeService, GrabBook, bridge_settings, public_host
+from bridge_net import advertise_host, host_for_url, is_loopback_bind, mapped_folder, reported_root
+from lidarr_bridge import BridgeService, GrabBook, bridge_settings
 from lidarr_client import LidarrClient, LidarrUnreachable
 from notifications import deliver
 from search_model import (
@@ -2219,15 +2220,17 @@ class Worker:
             return
         host = self.cfg.bridge_host or "127.0.0.1"
         port = int(self.cfg.bridge_port or 8788)
-        shown = public_host(host)
+        shown = advertise_host(host, getattr(self.cfg, "bridge_advertise_host", ""))
+        shown_url = host_for_url(shown)
         settings = bridge_settings(
-            save_path=str(self.cfg.complete_dir),
+            save_path=reported_root(self.cfg.complete_dir, getattr(self.cfg, "bridge_remote_path", "")),
             api_key=self.cfg.bridge_api_key,
             username=self.cfg.bridge_username,
             password=self.cfg.bridge_password,
             category=self.cfg.bridge_category,
             dry_run=self.cfg.dry_run,
-            public_base=f"http://{shown}:{port}",
+            public_base=f"http://{shown_url}:{port}",
+            local_only=is_loopback_bind(host),
         )
         book = GrabBook(Path(self.cfg.state_db).with_name(Path(self.cfg.state_db).stem + "-bridge.sqlite3"))
         try:
@@ -2237,7 +2240,7 @@ class Worker:
             self._bridge_error = f"Could not listen on {host}:{port}: {exc}"
             log.error(self._bridge_error)
             return
-        settings["public_base"] = f"http://{shown}:{service.port}"
+        settings["public_base"] = f"http://{shown_url}:{service.port}"
         service.start()
         self._bridge = service
         log.info("Lidarr bridge listening on http://%s:%s", shown, service.port)
@@ -2376,13 +2379,14 @@ class Worker:
                 if done == 0:
                     raise RuntimeError("no files downloaded")
                 if book is not None:
+                    remote = getattr(self.cfg, "bridge_remote_path", "")
                     book.update(
                         digest,
                         state="pausedUP",
                         progress=1,
                         eta=0,
-                        content_path=str(dest.resolve()),
-                        save_path=str(Path(self.cfg.complete_dir).resolve()),
+                        content_path=mapped_folder(dest, self.cfg.complete_dir, remote),
+                        save_path=reported_root(self.cfg.complete_dir, remote),
                     )
                 self.store.add_completed_download(artist, album, dest.name, username, "bridge")
             except Exception as exc:
