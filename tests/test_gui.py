@@ -146,6 +146,76 @@ def test_sidebar_replaces_the_tab_strip(desktop):
     assert desktop.health_tree.winfo_ismapped()
 
 
+def _walk(widget):
+    yield widget
+    for child in widget.winfo_children():
+        yield from _walk(child)
+
+
+def _contrast_ratio(foreground: str, background: str) -> float:
+    def channel(pair: str) -> float:
+        value = int(pair, 16) / 255
+        if value <= 0.04045:
+            return value / 12.92
+        return ((value + 0.055) / 1.055) ** 2.4
+
+    def luminance(color: str) -> float:
+        color = color.strip().lstrip("#")
+        red, green, blue = channel(color[0:2]), channel(color[2:4]), channel(color[4:6])
+        return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+    lighter, darker = sorted((luminance(foreground), luminance(background)), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def test_search_order_text_is_high_contrast_in_both_themes(desktop):
+    from tkinter import ttk
+
+    from desktop_app import THEMES, apply_theme
+
+    desktop.notebook.select(desktop.settings_tab)
+    desktop.notebook.select(desktop.wanted_tab)
+    desktop.update()
+    labels = [
+        widget
+        for widget in _walk(desktop)
+        if isinstance(widget, ttk.Label) and widget.cget("text") in {"Search order", "Search direction"}
+    ]
+    boxes = [
+        widget
+        for widget in _walk(desktop)
+        if isinstance(widget, ttk.Combobox)
+        and (
+            "Ascending" in widget.cget("values")
+            or "Lidarr order" in widget.cget("values")
+        )
+    ]
+    assert len(labels) >= 4
+    assert len(boxes) >= 4
+    assert any(widget.cget("text") == "Search direction" for widget in labels)
+    style = ttk.Style(desktop)
+    for name in ("dark", "light"):
+        apply_theme(desktop, name)
+        desktop.update()
+        palette = THEMES[name]
+        for state in ((), ("readonly",), ("readonly", "focus")):
+            field = style.lookup("TCombobox", "fieldbackground", state).lower()
+            ink = style.lookup("TCombobox", "foreground", state).lower()
+            assert field == palette.field
+            assert ink == palette.fg
+            assert _contrast_ratio(ink, field) >= 7
+        assert style.lookup("TCombobox", "selectforeground", ("readonly",)).lower() == palette.fg
+        assert style.lookup("TCombobox", "selectbackground", ("readonly",)).lower() == palette.field
+        assert style.lookup("TCombobox", "arrowcolor", ("readonly",)).lower() == palette.fg
+        assert style.lookup("TCombobox", "font") == style.lookup("TLabel", "font")
+        for label in labels:
+            assert "Muted" not in str(label.cget("style"))
+            assert style.lookup("TLabel", "foreground").lower() == palette.fg
+            assert _contrast_ratio(palette.fg, palette.main) >= 7
+        for box in boxes:
+            assert str(box.cget("state")) == "readonly"
+
+
 def test_theme_toggle_applies_live_and_persists(desktop):
     from tkinter import ttk
 
