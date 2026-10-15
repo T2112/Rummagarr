@@ -563,6 +563,10 @@ def apply_theme(root: tk.Misc, name: str | None = None) -> None:
         arrowcolor=palette.muted,
     )
     style.configure("TEntry", fieldbackground=palette.field, foreground=fg, insertcolor=fg, bordercolor=palette.field_border)
+    # Clam paints a readonly combobox from its own map, so configure() alone
+    # leaves light text on a light field in Dark. Map every state the Search
+    # order menus use, with the same face and contrast as a settings label.
+    combo_font = _sized_font(palette, 10)
     style.configure(
         "TCombobox",
         fieldbackground=palette.field,
@@ -570,9 +574,20 @@ def apply_theme(root: tk.Misc, name: str | None = None) -> None:
         foreground=fg,
         arrowcolor=fg,
         bordercolor=palette.field_border,
+        font=combo_font,
+    )
+    style.map(
+        "TCombobox",
+        fieldbackground=[("disabled", palette.field), ("readonly", palette.field)],
+        foreground=[("disabled", palette.muted), ("readonly", fg)],
+        selectbackground=[("readonly", palette.field)],
+        selectforeground=[("readonly", fg)],
+        background=[("readonly", palette.button), ("active", palette.button_active)],
+        arrowcolor=[("disabled", palette.muted), ("readonly", fg)],
     )
     root.option_add("*TCombobox*Listbox.background", palette.field)
     root.option_add("*TCombobox*Listbox.foreground", fg)
+    root.option_add("*TCombobox*Listbox.font", combo_font)
     root.option_add("*TCombobox*Listbox.selectBackground", palette.nav_on_bg)
     root.option_add("*TCombobox*Listbox.selectForeground", palette.nav_on_fg)
     _paint_chrome(root, palette)
@@ -2812,7 +2827,7 @@ class DesktopApp(tk.Tk):
         self._ensure_order_vars()
         row = ttk.Frame(parent, style="Main.TFrame")
         row.pack(fill="x", pady=(self.px(8), 0))
-        ttk.Label(row, text="Search order", style="Muted.TLabel").pack(side="left")
+        ttk.Label(row, text="Search order").pack(side="left")
         order = ttk.Combobox(
             row,
             textvariable=self.search_order_label_var,

@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## [1.18.1] — 2026-10-15
+
+### Fixed
+
+- Search order is easier to read. The label, the order menu, and Ascending / Descending use the same high-contrast text as the other settings, in Dark and in Light.
+
 ## [1.18.0] — 2026-10-15
 
 ### Added
