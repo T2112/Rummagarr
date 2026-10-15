@@ -3934,3 +3934,107 @@ class Worker:
             "profile": profile_from_reply(info, status, stats),
             "directories": shares_from_reply(directories, locked),
         }
+
+    async def download_paced(
+        self,
+        specs: list[dict],
+        *,
+        pace_seconds: int = 5,
+        files_at_once: int = 1,
+    ) -> str:
+        """Queue a browsed user's missing files one batch at a time, then wait.
+
+        ``files_at_once`` is 1 unless a looser rule was chosen. The wait after
+        each batch is ``pace_seconds``. A second call does not start until the
+        first has finished.
+        """
+        if not specs:
+            return "Nothing to download."
+        if getattr(self, "_paced_busy", False):
+            return "A download from a browsed user is already running."
+        username = str(specs[0].get("username") or "")
+        if self.cfg.dry_run:
+            detail = f"dry run: would grab {len(specs)} file(s) from {username}, {max(1, int(files_at_once or 1))} at a time"
+            self.store.note_dry_run(detail)
+            self.store.set_meta("last_browse_download", detail)
+            log.info(detail)
+            return detail
+        self._paced_busy = True
+        try:
+            specs = self._skip_queued_specs(specs, None)
+            if not specs:
+                detail = "Nothing new to queue. Those files are already queued or downloaded."
+                self.store.set_meta("last_browse_download", detail)
+                return detail
+            if not self.soulseek_logged_in():
+                if not await self.ensure_soulseek():
+                    raise RuntimeError("Start the worker to download. Downloads use that Soulseek connection.")
+            if self.control.is_stopped():
+                detail = "Start the worker to download. Downloads use that Soulseek connection."
+                self.store.set_meta("last_browse_download", detail)
+                return detail
+            assert self.client is not None
+            width = max(1, int(files_at_once or 1))
+            pause = max(0, int(pace_seconds or 0))
+            paired: list[tuple[str, object, dict]] = []
+            per_file = max(30, int(self.cfg.download_timeout_minutes or 1) * 60)
+            for start in range(0, len(specs), width):
+                if self.control.is_stopped():
+                    break
+                chunk = specs[start : start + width]
+                started: list[tuple[str, object, dict]] = []
+                for spec in chunk:
+                    file_id = str(spec.get("id") or "")
+                    spec_link = spec.get("link") if isinstance(spec.get("link"), dict) else {}
+                    self._set_manual_state(file_id, "queued")
+                    transfer = await self.client.transfers.download(str(spec["username"]), str(spec["filename"]))
+                    started.append((file_id, transfer, spec_link or {}))
+                    self.manual_transfers.append(transfer)
+                    self._set_manual_state(file_id, "downloading")
+                deadline = time.monotonic() + per_file
+                while time.monotonic() < deadline:
+                    names = [state_name(item) for _, item, _link in started]
+                    if names and all(name in {"COMPLETE", "FAILED", "ABORTED"} for name in names):
+                        break
+                    if self.control.is_stopped():
+                        for _, transfer, _link in started:
+                            if state_name(transfer) not in {"COMPLETE", "FAILED", "ABORTED"}:
+                                await abort_transfer(self.client, transfer)
+                        break
+                    await asyncio.sleep(0.05)
+                paired.extend(started)
+                if start + width < len(specs) and pause and not self.control.is_stopped():
+                    remaining = pause
+                    while remaining > 0 and not self.control.is_stopped():
+                        step = min(0.25, remaining)
+                        await asyncio.sleep(step)
+                        remaining -= step
+            groups: dict[tuple[str, str], list] = {}
+            for _file_id, transfer, spec_link in paired:
+                artist = str((spec_link or {}).get("artist") or "Manual")
+                album = str((spec_link or {}).get("album") or (spec_link or {}).get("title") or "Manual")
+                groups.setdefault((artist, album), []).append(transfer)
+            done = 0
+            for (artist, album), transfers in groups.items():
+                self.remember_completed(transfers, artist, album, "browse")
+                dest = album_dest_folder(self.cfg, artist, album, None)
+                complete = [item for item in transfers if state_name(item) == "COMPLETE"]
+                done += len(complete)
+                staged = False
+                for transfer in complete:
+                    if await asyncio.to_thread(stage_one_file, self.cfg, dest, transfer):
+                        staged = True
+                if not staged:
+                    continue
+                self._prepare_staged_folder(dest, {"title": album, "artist": {"artistName": artist}}, [])
+                scanned, reason = self._scan_staged_folder(dest)
+                if not scanned:
+                    log.warning("Lidarr scan failed for browse download %s: %s", dest, reason)
+            self.maybe_auto_import()
+            detail = f"Downloaded {done} of {len(specs)} file(s) from {username}, {width} at a time, {pause}s apart."
+            self.store.set_meta("last_browse_download", detail)
+            log.info(detail)
+            return detail
+        finally:
+            self._paced_busy = False
+

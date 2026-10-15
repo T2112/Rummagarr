@@ -510,6 +510,25 @@ class JobStore:
             "today_bytes": int(today_row[1] or 0),
         }
 
+    def activity_summary(self) -> dict:
+        """Finished downloads and album job counts for the Stats page."""
+        with self._lock:
+            jobs = self._db.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status").fetchall()
+            users = self._db.execute(
+                """
+                SELECT username, COUNT(*) FROM completed_downloads
+                GROUP BY username
+                ORDER BY COUNT(*) DESC, username
+                LIMIT 8
+                """
+            ).fetchall()
+            total = self._db.execute("SELECT COUNT(*) FROM completed_downloads").fetchone()
+        return {
+            "jobs": {str(status): int(count) for status, count in jobs},
+            "download_total": int(total[0] or 0),
+            "by_user": [(str(name or ""), int(count)) for name, count in users],
+        }
+
     def wanted_tracks_for(self, names: list[str], folds: list[str]) -> list[dict]:
         """Enabled album and song rows for these artists only.
 

@@ -59,6 +59,7 @@ def test_shipped_changelog_has_the_published_versions():
 
     text = Path("CHANGELOG.md").read_text(encoding="utf-8")
     for version, needle in (
+        ("1.16.0", "Download all missing"),
         ("1.15.0", "Browse"),
         ("1.14.0", "qBittorrent"),
         ("1.13.0", "Search order"),
