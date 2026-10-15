@@ -123,7 +123,7 @@ def _buttons(widget):
 def test_sidebar_replaces_the_tab_strip(desktop):
     assert isinstance(desktop.notebook, PageHost)
     labels = [item._label.cget("text") for item in desktop._nav_items.values()]
-    assert labels == ["Status", "Wanted", "Dashboard", "Stats", "Health", "Search", "Browse", "Shared", "Settings"]
+    assert labels == ["Status", "Wanted", "Dashboard", "Stats", "Health", "Search", "Browse", "Messages", "Shared", "Settings"]
     assert desktop.notebook.select() == str(desktop.status_tab)
     assert desktop.status_tab.winfo_ismapped()
     desktop.notebook.select(desktop.wanted_tab)
@@ -1062,3 +1062,33 @@ def _widget_text(widget) -> list[str]:
             pass
         found.extend(_widget_text(child))
     return found
+
+
+def test_private_messages_badge_and_compose_box(desktop):
+    desktop.worker.store.add_private_message("peer", "hello", "in", soulseek_id=1)
+    desktop.worker.store.add_private_message("peer", "again", "in", soulseek_id=2)
+    desktop.refresh_status()
+    desktop.update()
+    labels = [item._label.cget("text") for item in desktop._nav_items.values()]
+    assert labels[0] == "Status"
+    assert "Messages (2)" in labels
+    desktop.notebook.select(desktop.messages_tab)
+    desktop.update()
+    page = " ".join(_widget_text(desktop.messages_tab))
+    assert "Chat rooms stay off" in page
+    assert "Join room" not in page
+    desktop.message_threads.selection_set(0)
+    desktop._on_message_thread()
+    desktop.update()
+    history = desktop.message_history.get("1.0", "end")
+    assert "hello" in history
+    assert "again" in history
+    assert desktop._nav_items[str(desktop.status_tab)]._label.cget("text") == "Status"
+    assert desktop._nav_items[str(desktop.messages_tab)]._label.cget("text") == "Messages"
+    desktop.message_compose_var.set("   ")
+    desktop._send_composed_message()
+    assert "compose box" in desktop.message_status.get()
+    assert all(row["direction"] == "in" for row in desktop.worker.store.private_history("peer"))
+    desktop.notebook.select(desktop.settings_tab)
+    desktop.update()
+    assert desktop._settings_form.fields["crash_bundle"].get() is False

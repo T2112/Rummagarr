@@ -167,6 +167,20 @@ class JobStore:
             """
         )
         self._db.commit()
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS private_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                body TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                soulseek_id INTEGER,
+                sent_at TEXT NOT NULL,
+                seen INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        self._db.commit()
         self._ensure_catalog_schema()
         self._load_catalog_flag()
 
@@ -721,6 +735,120 @@ class JobStore:
         for username, count in rows:
             if int(count or 0) >= floor:
                 self.note_good_user(str(username or ""), favorites, floor)
+
+    def add_private_message(
+        self,
+        username: str,
+        body: str,
+        direction: str,
+        soulseek_id: int | None = None,
+        seen: int | None = None,
+    ) -> bool:
+        """Store one private message. An incoming Soulseek id is kept once."""
+        name = (username or "").strip()
+        text = (body or "").strip()
+        if not name or not text:
+            return False
+        outgoing = str(direction or "").lower().startswith("o")
+        kind = "out" if outgoing else "in"
+        if seen is None:
+            seen = 1 if outgoing else 0
+        with self._lock:
+            if not outgoing and soulseek_id is not None:
+                existing = self._db.execute(
+                    """
+                    SELECT 1 FROM private_messages
+                    WHERE direction = 'in' AND soulseek_id = ? AND lower(username) = ?
+                    """,
+                    (int(soulseek_id), name.lower()),
+                ).fetchone()
+                if existing:
+                    return False
+            now = datetime.now(timezone.utc).isoformat()
+            self._db.execute(
+                """
+                INSERT INTO private_messages(username, body, direction, soulseek_id, sent_at, seen)
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    name,
+                    text,
+                    kind,
+                    None if soulseek_id is None else int(soulseek_id),
+                    now,
+                    1 if seen else 0,
+                ),
+            )
+            self._db.commit()
+        return True
+
+    def private_history(self, username: str, limit: int = 500) -> list[dict]:
+        name = (username or "").strip().lower()
+        if not name:
+            return []
+        with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT username, body, direction, sent_at, seen
+                FROM private_messages
+                WHERE lower(username) = ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (name, max(1, int(limit))),
+            ).fetchall()
+        keys = ("username", "body", "direction", "sent_at", "seen")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def private_threads(self) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT username,
+                       SUM(CASE WHEN direction = 'in' AND seen = 0 THEN 1 ELSE 0 END),
+                       MAX(id)
+                FROM private_messages
+                GROUP BY lower(username)
+                ORDER BY MAX(id) DESC
+                """
+            ).fetchall()
+            found = []
+            for username, unread, last_id in rows:
+                last = self._db.execute(
+                    "SELECT body, sent_at FROM private_messages WHERE id = ?",
+                    (last_id,),
+                ).fetchone()
+                found.append(
+                    {
+                        "username": str(username or ""),
+                        "unread": int(unread or 0),
+                        "last_body": str(last[0] if last else ""),
+                        "sent_at": str(last[1] if last else ""),
+                    }
+                )
+        return found
+
+    def mark_thread_read(self, username: str) -> None:
+        name = (username or "").strip().lower()
+        if not name:
+            return
+        with self._lock:
+            self._db.execute(
+                """
+                UPDATE private_messages
+                SET seen = 1
+                WHERE lower(username) = ? AND direction = 'in' AND seen = 0
+                """,
+                (name,),
+            )
+            self._db.commit()
+
+    def unread_private_count(self) -> int:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COUNT(*) FROM private_messages WHERE direction = 'in' AND seen = 0"
+            ).fetchone()
+        return int(row[0] or 0)
 
     def wanted_tracks_for(self, names: list[str], folds: list[str]) -> list[dict]:
         """Enabled album and song rows for these artists only.

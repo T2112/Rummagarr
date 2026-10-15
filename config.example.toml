@@ -145,6 +145,8 @@ check_updates = true
 theme = "dark"
 # Download all wanted asks before queueing. false skips that popup.
 confirm_download_all = true
+# An unexpected error can write a zip next to the log. The zip stays on this PC.
+crash_bundle = false
 
 [limits]
 # Download all missing from a browsed user. A stricter number in that user's
