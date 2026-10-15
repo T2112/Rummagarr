@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import secrets
 import shutil
 import tempfile
 import threading
@@ -29,7 +30,28 @@ from config_loader import (
     save_config,
     try_load_config,
 )
+from bridge_net import (
+    advertise_host,
+    bind_choices,
+    host_for_url,
+    is_loopback_bind,
+    is_tailscale,
+    list_ipv4_interfaces,
+    url_host_is_local,
+    windows_firewall_prompt,
+)
+from library_report import (
+    delete_inside,
+    format_summary,
+    health_from_albums,
+    queued_next,
+    research_note,
+    scan_folder,
+    wanted_summary,
+)
 from lidarr_client import LidarrClient
+from lidarr_register import LidarrRegisterError, register_with_lidarr
+from notifications import deliver
 from main import setup_logging
 from status_ui import DEFAULT_RECENT_LIMIT, RECENT_LIMITS, normalize_recent_limit
 from updater import (
@@ -770,6 +792,19 @@ _RESTART_FIELDS = frozenset(
 )
 _LAUNCH_FIELDS = frozenset({"start_on_launch", "check_updates"})
 _IMMEDIATE_FIELDS = frozenset({"theme", "confirm_download_all", "search_order", "search_order_direction"})
+_BRIDGE_FIELDS = frozenset(
+    {
+        "bridge_enabled",
+        "bridge_host",
+        "bridge_port",
+        "bridge_api_key",
+        "bridge_username",
+        "bridge_password",
+        "bridge_category",
+        "bridge_advertise_host",
+        "bridge_remote_path",
+    }
+)
 _SHARE_LIVE_FIELDS = frozenset(
     {
         "upload_slots",
@@ -880,7 +915,22 @@ def settings_apply_message(old: Config, new: Config) -> str:
         parts.append("Upload limits apply immediately.")
     if changed & _SHARE_RESCAN_FIELDS:
         parts.append("Shared folders apply after Rescan, or the next time the worker logs in.")
-    if changed - _RESTART_FIELDS - _LAUNCH_FIELDS - _SHARE_LIVE_FIELDS - _SHARE_RESCAN_FIELDS - _IMMEDIATE_FIELDS:
+    if changed & _BRIDGE_FIELDS:
+        parts.append("The Lidarr bridge uses the new listen address, port, and key now.")
+    if changed & {"dry_run"}:
+        parts.append("Dry run applies on the next search.")
+    if changed & {"quality_upgrades", "quality_upgrade_hours"}:
+        parts.append("Quality upgrades apply on the next pass.")
+    skipped = (
+        _RESTART_FIELDS
+        | _LAUNCH_FIELDS
+        | _SHARE_LIVE_FIELDS
+        | _SHARE_RESCAN_FIELDS
+        | _IMMEDIATE_FIELDS
+        | _BRIDGE_FIELDS
+        | {"dry_run", "quality_upgrades", "quality_upgrade_hours"}
+    )
+    if changed - skipped:
         parts.append("Search and download settings apply on the next pass.")
     if changed & {"search_order", "search_order_direction"}:
         parts.append("Search order applies to the next artist and the Wanted list.")
@@ -940,6 +990,42 @@ class SettingsForm(ttk.Frame):
         else:
             self.history_var = None
         self.theme_var = tk.StringVar(value=normalize_theme(getattr(source, "theme", "dark")))
+        self.instances = [dict(item) for item in (getattr(source, "lidarr_instances", None) or [])]
+        if not self.instances:
+            self.instances = [
+                {
+                    "name": getattr(source, "lidarr_active", "") or "Home",
+                    "url": self.url_var.get().strip().rstrip("/"),
+                    "api_key": self.api_var.get().strip(),
+                    "scan_path": self.scan_var.get().strip(),
+                }
+            ]
+        active_name = getattr(source, "lidarr_active", "") or self.instances[0]["name"]
+        if not any(item["name"] == active_name for item in self.instances):
+            active_name = self.instances[0]["name"]
+        self.instance_var = tk.StringVar(value=active_name)
+        self._shown_instance = active_name
+        self.bridge_enabled_var = tk.BooleanVar(value=bool(getattr(source, "bridge_enabled", False)))
+        self.bridge_host_var = tk.StringVar(value=str(getattr(source, "bridge_host", "") or "127.0.0.1"))
+        self.bridge_advertise_var = tk.StringVar(value=str(getattr(source, "bridge_advertise_host", "") or ""))
+        self.bridge_remote_var = tk.StringVar(value=str(getattr(source, "bridge_remote_path", "") or ""))
+        self.bridge_port_var = tk.StringVar(value=str(getattr(source, "bridge_port", 8788) or 8788))
+        self.bridge_key_var = tk.StringVar(value=str(getattr(source, "bridge_api_key", "") or ""))
+        self.bridge_user_var = tk.StringVar(value=str(getattr(source, "bridge_username", "") or "rummagarr"))
+        self.bridge_pass_var = tk.StringVar(value=str(getattr(source, "bridge_password", "") or ""))
+        self.bridge_category_var = tk.StringVar(value=str(getattr(source, "bridge_category", "") or "lidarr"))
+        self.dry_run_var = tk.BooleanVar(value=bool(getattr(source, "dry_run", False)))
+        self.upgrade_var = tk.BooleanVar(value=bool(getattr(source, "quality_upgrades", False)))
+        self.upgrade_hours_var = tk.StringVar(value=str(getattr(source, "quality_upgrade_hours", 24) or 24))
+        self.discord_var = tk.StringVar(value=str(getattr(source, "notify_discord_url", "") or ""))
+        self.ntfy_var = tk.StringVar(value=str(getattr(source, "notify_ntfy_url", "") or ""))
+        self.notify_import_var = tk.BooleanVar(value=bool(getattr(source, "notify_on_import", True)))
+        self.notify_review_var = tk.BooleanVar(value=bool(getattr(source, "notify_on_review", True)))
+        self.plex_url_var = tk.StringVar(value=str(getattr(source, "plex_url", "") or ""))
+        self.plex_token_var = tk.StringVar(value=str(getattr(source, "plex_token", "") or ""))
+        self.plex_section_var = tk.StringVar(value=str(getattr(source, "plex_section", "") or ""))
+        self.jellyfin_url_var = tk.StringVar(value=str(getattr(source, "jellyfin_url", "") or ""))
+        self.jellyfin_key_var = tk.StringVar(value=str(getattr(source, "jellyfin_api_key", "") or ""))
         self.message_var = tk.StringVar(value="")
         self._choice_display: dict[str, tk.StringVar] = {}
         self._behavior_canvas: tk.Canvas | None = None
@@ -1002,7 +1088,7 @@ class SettingsForm(ttk.Frame):
         ttk.Label(self, text=self.heading, style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(
             self,
-            text="Connection holds the login and folders. Behavior holds search and conversion. Sharing holds what other users can download.",
+            text="Connection holds the login and folders. Behavior holds search and conversion. Bridge is the Lidarr indexer. Sharing holds what other users can download.",
             style="Muted.TLabel",
             wraplength=900,
         ).grid(row=1, column=0, sticky="w", pady=(4, 8))
@@ -1022,14 +1108,17 @@ class SettingsForm(ttk.Frame):
         behavior = ttk.Frame(self.notebook, padding=(4, 8, 4, 4))
         sharing = ttk.Frame(self.notebook, padding=12)
         blocked = ttk.Frame(self.notebook, padding=12)
+        bridge = ttk.Frame(self.notebook, padding=(4, 8, 4, 4))
         self.notebook.add(connection, text="Connection")
         self.notebook.add(behavior, text="Behavior")
         self.notebook.add(sharing, text="Sharing")
         self.notebook.add(blocked, text="Blocklist")
+        self.notebook.add(bridge, text="Bridge")
         self._build_connection(connection)
         self._build_behavior(behavior)
         self._build_sharing(sharing)
         self._build_blocklist(blocked)
+        self._build_bridge(bridge)
         ttk.Label(self, textvariable=self.message_var, wraplength=900).grid(row=4, column=0, sticky="w", pady=(8, 4))
         buttons = ttk.Frame(self)
         buttons.grid(row=5, column=0, sticky="w")
@@ -1091,7 +1180,74 @@ class SettingsForm(ttk.Frame):
             style="Muted.TLabel",
             wraplength=760,
         ).grid(row=13, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        ttk.Label(parent, text="Lidarr instance").grid(row=14, column=0, sticky="w", pady=(12, 4))
+        names = [item["name"] for item in self.instances]
+        self._instance_box = ttk.Combobox(parent, textvariable=self.instance_var, values=names, state="readonly", width=24)
+        self._instance_box.grid(row=14, column=1, sticky="w", pady=(12, 4))
+        self._instance_box.bind("<<ComboboxSelected>>", self._on_instance_picked)
+        ttk.Button(parent, text="Add instance", command=self._add_instance).grid(row=14, column=2, sticky="w", padx=(8, 0))
+        ttk.Label(
+            parent,
+            text="Each instance keeps its own URL, API key, and scan path. The selected one is the one Rummagarr uses.",
+            style="Muted.TLabel",
+            wraplength=760,
+        ).grid(row=15, column=0, columnspan=3, sticky="w")
         parent.columnconfigure(1, weight=1)
+
+    def _refresh_instance_names(self) -> None:
+        box = getattr(self, "_instance_box", None)
+        if box is not None:
+            box.configure(values=[item["name"] for item in self.instances])
+
+    def _store_instance(self, name: str) -> None:
+        name = (name or "").strip() or "Home"
+        row = {
+            "name": name,
+            "url": self.url_var.get().strip().rstrip("/"),
+            "api_key": self.api_var.get().strip(),
+            "scan_path": self.scan_var.get().strip(),
+        }
+        for item in self.instances:
+            if item["name"] == name:
+                item.update(row)
+                return
+        self.instances.append(row)
+
+    def _load_instance(self, name: str) -> None:
+        for item in self.instances:
+            if item["name"] == name:
+                self.url_var.set(item.get("url") or "")
+                self.api_var.set(item.get("api_key") or "")
+                self.scan_var.set(item.get("scan_path") or "")
+                return
+
+    def _on_instance_picked(self, _event=None) -> None:
+        chosen = self.instance_var.get().strip()
+        previous = getattr(self, "_shown_instance", "")
+        if previous and previous != chosen:
+            self._store_instance(previous)
+        self._load_instance(chosen)
+        self._shown_instance = chosen
+
+    def _add_instance(self) -> None:
+        self._store_instance(getattr(self, "_shown_instance", "") or self.instance_var.get())
+        names = {item["name"] for item in self.instances}
+        name = "Lidarr"
+        number = 2
+        while name in names:
+            name = f"Lidarr {number}"
+            number += 1
+        self.instances.append(
+            {
+                "name": name,
+                "url": self.url_var.get().strip().rstrip("/"),
+                "api_key": self.api_var.get().strip(),
+                "scan_path": self.scan_var.get().strip(),
+            }
+        )
+        self._refresh_instance_names()
+        self.instance_var.set(name)
+        self._shown_instance = name
 
     def _build_behavior(self, parent: ttk.Frame) -> None:
         ttk.Label(
@@ -1573,6 +1729,337 @@ class SettingsForm(ttk.Frame):
         values["share_dirs"] = list(self.share_paths[1:])
         return values
 
+    def _bridge_values(self) -> dict:
+        self._store_instance(getattr(self, "_shown_instance", "") or self.instance_var.get())
+        host = self.bridge_host_var.get().strip() or "127.0.0.1"
+        try:
+            port = int(self.bridge_port_var.get().strip())
+        except ValueError as exc:
+            raise ValueError("Bridge port must be a whole number from 1 to 65535.") from exc
+        if port < 1 or port > 65535:
+            raise ValueError("Bridge port must be a whole number from 1 to 65535.")
+        try:
+            hours = int(self.upgrade_hours_var.get().strip())
+        except ValueError as exc:
+            raise ValueError("Quality upgrade hours must be a whole number of at least 1.") from exc
+        if hours < 1:
+            raise ValueError("Quality upgrade hours must be a whole number of at least 1.")
+        if self.bridge_enabled_var.get() and not self.bridge_key_var.get().strip():
+            raise ValueError("Generate an API key before enabling the Lidarr bridge.")
+        active = self.instance_var.get().strip() or "Home"
+        return {
+            "lidarr_instances": [dict(item) for item in self.instances],
+            "lidarr_active": active,
+            "bridge_enabled": bool(self.bridge_enabled_var.get()),
+            "bridge_host": host,
+            "bridge_port": port,
+            "bridge_advertise_host": self.bridge_advertise_var.get().strip(),
+            "bridge_remote_path": self.bridge_remote_var.get().strip(),
+            "bridge_api_key": self.bridge_key_var.get().strip(),
+            "bridge_username": self.bridge_user_var.get().strip() or "rummagarr",
+            "bridge_password": self.bridge_pass_var.get(),
+            "bridge_category": self.bridge_category_var.get().strip() or "lidarr",
+            "dry_run": bool(self.dry_run_var.get()),
+            "quality_upgrades": bool(self.upgrade_var.get()),
+            "quality_upgrade_hours": hours,
+            "notify_discord_url": self.discord_var.get().strip(),
+            "notify_ntfy_url": self.ntfy_var.get().strip(),
+            "notify_on_import": bool(self.notify_import_var.get()),
+            "notify_on_review": bool(self.notify_review_var.get()),
+            "plex_url": self.plex_url_var.get().strip(),
+            "plex_token": self.plex_token_var.get().strip(),
+            "plex_section": self.plex_section_var.get().strip(),
+            "jellyfin_url": self.jellyfin_url_var.get().strip(),
+            "jellyfin_api_key": self.jellyfin_key_var.get().strip(),
+        }
+
+    def _build_bridge(self, parent: ttk.Frame) -> None:
+        canvas = tk.Canvas(parent, highlightthickness=0, background=active_palette(self).main, borderwidth=0)
+        canvas._chrome_role = "page"
+        scroll = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _fit(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfigure(window_id, width=canvas.winfo_width())
+
+        inner.bind("<Configure>", _fit)
+        canvas.bind("<Configure>", _fit)
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        ttk.Label(
+            inner,
+            text=(
+                "Rummagarr speaks Torznab and the qBittorrent Web API (2.11.2) on this port. "
+                "Lidarr on another PC, including over Tailscale, cannot use 127.0.0.1. "
+                "Listen on all interfaces or on the Tailscale address, and set the address Lidarr can reach. "
+                "The standalone worker keeps running either way."
+            ),
+            style="Muted.TLabel",
+            wraplength=760,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        ttk.Checkbutton(inner, text="Enable the Lidarr indexer and download client", variable=self.bridge_enabled_var).grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=2
+        )
+        ttk.Checkbutton(inner, text="Dry run: show what would be grabbed, and do not download", variable=self.dry_run_var).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=2
+        )
+        self._bind_choices = bind_choices(list_ipv4_interfaces())
+        current_host = self.bridge_host_var.get().strip() or "127.0.0.1"
+        if not any(host == current_host for host, _label in self._bind_choices):
+            self._bind_choices.append((current_host, current_host))
+        self.bridge_bind_label = tk.StringVar(
+            value=next(label for host, label in self._bind_choices if host == current_host)
+        )
+        ttk.Label(inner, text="Listen on").grid(row=3, column=0, sticky="w", pady=3)
+        bind_box = ttk.Combobox(
+            inner,
+            textvariable=self.bridge_bind_label,
+            values=[label for _host, label in self._bind_choices],
+            state="readonly",
+            width=42,
+        )
+        bind_box.grid(row=3, column=1, columnspan=2, sticky="ew", pady=3)
+        bind_box.bind("<<ComboboxSelected>>", self._on_bind_picked)
+        ttk.Label(inner, text="Port").grid(row=4, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.bridge_port_var, width=10).grid(row=4, column=1, sticky="w", pady=3)
+        ttk.Label(inner, text="Address Lidarr uses").grid(row=5, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.bridge_advertise_var, width=42).grid(row=5, column=1, columnspan=2, sticky="ew", pady=3)
+        detected = advertise_host("0.0.0.0", "", list_ipv4_interfaces())
+        if is_tailscale(detected):
+            detected_text = f"Blank uses this PC's Tailscale address {detected} when listening on all interfaces."
+        elif detected and not is_loopback_bind(detected):
+            detected_text = f"No Tailscale address found. Blank uses {detected} when listening on all interfaces. Type a 100.x address if Lidarr uses Tailscale."
+        else:
+            detected_text = "No Tailscale address found. Type the 100.x address of this PC if Lidarr is on another machine."
+        ttk.Label(inner, text=detected_text, style="Muted.TLabel", wraplength=760).grid(
+            row=6, column=0, columnspan=3, sticky="w"
+        )
+        ttk.Label(inner, text="API key").grid(row=7, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.bridge_key_var, width=42).grid(row=7, column=1, sticky="ew", pady=3)
+        ttk.Button(inner, text="Generate key", command=self._generate_bridge_key).grid(row=7, column=2, padx=(8, 0))
+        ttk.Label(inner, text="qBittorrent username").grid(row=8, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.bridge_user_var, width=42).grid(row=8, column=1, sticky="ew", pady=3)
+        ttk.Label(inner, text="qBittorrent password").grid(row=9, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.bridge_pass_var, width=42, show="*").grid(row=9, column=1, sticky="ew", pady=3)
+        ttk.Label(inner, text="Category").grid(row=10, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.bridge_category_var, width=42).grid(row=10, column=1, sticky="ew", pady=3)
+        ttk.Label(
+            inner,
+            text="When Listen on is not this PC only, Lidarr's download-client password is the API key. The version check Lidarr sends before login stays open. Every other request needs that key.",
+            style="Muted.TLabel",
+            wraplength=760,
+        ).grid(row=11, column=0, columnspan=3, sticky="w", pady=(2, 6))
+        ttk.Label(inner, text="Path Lidarr sees").grid(row=12, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.bridge_remote_var, width=42).grid(row=12, column=1, columnspan=2, sticky="ew", pady=3)
+        ttk.Label(
+            inner,
+            text=(
+                "Leave blank when Lidarr runs on this PC. Otherwise set the path Lidarr uses for this same folder, "
+                "such as a UNC share or a mapped drive. Files still land in the Complete folder. "
+                "The qBittorrent save path uses this value, and the album folder name is added under it."
+            ),
+            style="Muted.TLabel",
+            wraplength=760,
+        ).grid(row=13, column=0, columnspan=3, sticky="w")
+        ttk.Button(inner, text="Allow in Windows Firewall", command=self.allow_firewall).grid(
+            row=14, column=0, columnspan=2, sticky="w", pady=(8, 4)
+        )
+        ttk.Checkbutton(inner, text="Re-search albums below the quality cutoff", variable=self.upgrade_var).grid(
+            row=15, column=0, columnspan=2, sticky="w", pady=(10, 2)
+        )
+        ttk.Label(inner, text="Hours between cutoff checks").grid(row=16, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.upgrade_hours_var, width=8).grid(row=16, column=1, sticky="w", pady=3)
+        ttk.Label(
+            inner,
+            text="Lidarr replaces the old file when the better copy imports. Rummagarr does not delete it.",
+            style="Muted.TLabel",
+            wraplength=760,
+        ).grid(row=17, column=0, columnspan=3, sticky="w")
+        ttk.Label(inner, text="Discord webhook").grid(row=18, column=0, sticky="w", pady=(10, 3))
+        ttk.Entry(inner, textvariable=self.discord_var, width=42).grid(row=18, column=1, columnspan=2, sticky="ew", pady=(10, 3))
+        ttk.Label(inner, text="ntfy URL").grid(row=19, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.ntfy_var, width=42).grid(row=19, column=1, columnspan=2, sticky="ew", pady=3)
+        ttk.Checkbutton(inner, text="Notify when an import finishes", variable=self.notify_import_var).grid(
+            row=20, column=0, columnspan=3, sticky="w"
+        )
+        ttk.Checkbutton(inner, text="Notify when files move to Review", variable=self.notify_review_var).grid(
+            row=21, column=0, columnspan=3, sticky="w"
+        )
+        ttk.Label(inner, text="Plex URL").grid(row=22, column=0, sticky="w", pady=(8, 3))
+        ttk.Entry(inner, textvariable=self.plex_url_var, width=42).grid(row=22, column=1, columnspan=2, sticky="ew")
+        ttk.Label(inner, text="Plex token").grid(row=23, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.plex_token_var, width=42, show="*").grid(row=23, column=1, columnspan=2, sticky="ew")
+        ttk.Label(inner, text="Plex section id").grid(row=24, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.plex_section_var, width=12).grid(row=24, column=1, sticky="w")
+        ttk.Label(inner, text="Jellyfin URL").grid(row=25, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.jellyfin_url_var, width=42).grid(row=25, column=1, columnspan=2, sticky="ew")
+        ttk.Label(inner, text="Jellyfin API key").grid(row=26, column=0, sticky="w", pady=3)
+        ttk.Entry(inner, textvariable=self.jellyfin_key_var, width=42, show="*").grid(row=26, column=1, columnspan=2, sticky="ew")
+        ttk.Label(
+            inner,
+            text="Leave the section id blank to refresh every Plex library. A test sends the webhook and refreshes the libraries.",
+            style="Muted.TLabel",
+            wraplength=760,
+        ).grid(row=27, column=0, columnspan=3, sticky="w", pady=(4, 8))
+        buttons = ttk.Frame(inner)
+        buttons.grid(row=28, column=0, columnspan=3, sticky="w")
+        ttk.Button(buttons, text="Test notification", command=self.test_notification).pack(side="left")
+        ttk.Button(buttons, text="Add to Lidarr", command=self.add_to_lidarr).pack(side="left", padx=(8, 0))
+        inner.columnconfigure(1, weight=1)
+
+    def _on_bind_picked(self, _event=None) -> None:
+        label = self.bridge_bind_label.get()
+        for host, choice in self._bind_choices:
+            if choice == label:
+                self.bridge_host_var.set(host)
+                return
+
+    def allow_firewall(self) -> None:
+        try:
+            port = int(self.bridge_port_var.get().strip())
+        except ValueError:
+            self.message_var.set("Bridge port must be a whole number from 1 to 65535.")
+            return
+        if port < 1 or port > 65535:
+            self.message_var.set("Bridge port must be a whole number from 1 to 65535.")
+            return
+        if os.name != "nt":
+            self.message_var.set("Windows Firewall rules are only added on Windows.")
+            return
+        if not messagebox.askyesno(
+            "Windows Firewall",
+            f"Windows will ask for approval to allow inbound TCP {port} for the Lidarr bridge.",
+            parent=self.winfo_toplevel(),
+        ):
+            return
+        ok, text = windows_firewall_prompt(port)
+        if ok and self.store is not None:
+            self.store.set_meta("firewall_bridge_port", str(port))
+        self.message_var.set(text)
+
+    def _maybe_firewall(self) -> str:
+        """Ask once per port when Lidarr must reach this PC. A Yes is remembered."""
+        if os.name != "nt" or is_loopback_bind(self.bridge_host_var.get().strip()):
+            return ""
+        try:
+            port = int(self.bridge_port_var.get().strip())
+        except ValueError:
+            return ""
+        if port < 1 or port > 65535:
+            return ""
+        if self.store is not None and (self.store.get_meta("firewall_bridge_port") or "") == str(port):
+            return ""
+        if not messagebox.askyesno(
+            "Windows Firewall",
+            f"Allow inbound TCP {port} so Lidarr on another PC can reach Rummagarr? Windows will ask for approval.",
+            parent=self.winfo_toplevel(),
+        ):
+            return ""
+        ok, text = windows_firewall_prompt(port)
+        if ok and self.store is not None:
+            self.store.set_meta("firewall_bridge_port", str(port))
+        return text
+
+    def _generate_bridge_key(self) -> None:
+        self.bridge_key_var.set(secrets.token_hex(16))
+
+    def test_notification(self) -> None:
+        self.message_var.set("Sending a test notification…")
+
+        def work() -> None:
+            cfg = self._notify_preview()
+            try:
+                lines = deliver(cfg, "test", "Rummagarr test", "This is a test from Rummagarr.")
+            except Exception as exc:
+                text = f"Test notification failed: {exc}"
+            else:
+                text = " ".join(lines) or "Nothing to send. Add a Discord or ntfy URL, or Plex or Jellyfin."
+            try:
+                self.after(0, lambda text=text: self.message_var.set(text))
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=work, name="notify-test", daemon=True).start()
+
+    def _notify_preview(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            notify_discord_url=self.discord_var.get().strip(),
+            notify_ntfy_url=self.ntfy_var.get().strip(),
+            notify_on_import=True,
+            notify_on_review=True,
+            plex_url=self.plex_url_var.get().strip(),
+            plex_token=self.plex_token_var.get().strip(),
+            plex_section=self.plex_section_var.get().strip(),
+            jellyfin_url=self.jellyfin_url_var.get().strip(),
+            jellyfin_api_key=self.jellyfin_key_var.get().strip(),
+        )
+
+    def add_to_lidarr(self) -> None:
+        if not self.bridge_key_var.get().strip():
+            self.message_var.set("Generate an API key first.")
+            return
+        self.bridge_enabled_var.set(True)
+        if not self.save():
+            return
+        firewall_note = self._maybe_firewall()
+        self.message_var.set("Adding Rummagarr to Lidarr…")
+
+        def work() -> None:
+            text = self._register_bridge()
+            if firewall_note:
+                text = f"{text} {firewall_note}"
+            try:
+                self.after(0, lambda text=text: self.message_var.set(text))
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=work, name="lidarr-register", daemon=True).start()
+
+    def _register_bridge(self) -> str:
+        worker = self.worker
+        if worker is None:
+            return "Save first, then open Rummagarr and use Add to Lidarr."
+        if worker.bridge_port() <= 0:
+            detail = getattr(worker, "_bridge_error", "") or "The bridge is not listening."
+            return f"Could not add Rummagarr to Lidarr: {detail}"
+        cfg = worker.cfg
+        host = advertise_host(cfg.bridge_host, getattr(cfg, "bridge_advertise_host", ""))
+        shown = host_for_url(host)
+        port = worker.bridge_port()
+        if is_loopback_bind(cfg.bridge_host):
+            password = cfg.bridge_password or cfg.bridge_api_key
+        else:
+            password = cfg.bridge_api_key
+        client = LidarrClient(cfg.lidarr_url, cfg.lidarr_api_key, timeout=30)
+        try:
+            text = register_with_lidarr(
+                client,
+                base_url=f"http://{shown}:{port}",
+                api_key=cfg.bridge_api_key,
+                host=shown,
+                port=port,
+                username=cfg.bridge_username or "rummagarr",
+                password=password,
+                category=cfg.bridge_category or "lidarr",
+            )
+        except LidarrRegisterError as exc:
+            return f"Could not add Rummagarr to Lidarr: {exc}"
+        except Exception as exc:
+            return f"Could not add Rummagarr to Lidarr: {exc}"
+        finally:
+            client.close()
+        if is_loopback_bind(host) and not url_host_is_local(cfg.lidarr_url):
+            text += (
+                " 127.0.0.1 is unreachable from that Lidarr."
+                " Set Address Lidarr uses to this PC's Tailscale address."
+            )
+        return text
+
     def build_config(self) -> Config:
         url = self.url_var.get().strip().rstrip("/")
         api_key = self.api_var.get().strip()
@@ -1604,6 +2091,7 @@ class SettingsForm(ttk.Frame):
             lidarr_url=url,
             lidarr_api_key=api_key,
             lidarr_scan_path=scan,
+            **self._bridge_values(),
             slsk_username=username,
             slsk_password=password,
             listen_port=listen,
@@ -2154,12 +2642,16 @@ class DesktopApp(tk.Tk):
         pad = self.px(12)
         self.status_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
         self.wanted_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
+        self.dashboard_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
+        self.health_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
         self.search_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
         self.shared_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
         self.settings_tab = ttk.Frame(self.content, style="Main.TFrame")
         self.notebook = PageHost(self._show_page)
         self._add_nav(self.sidebar, "Status", self.status_tab)
         self._add_nav(self.sidebar, "Wanted", self.wanted_tab)
+        self._add_nav(self.sidebar, "Dashboard", self.dashboard_tab)
+        self._add_nav(self.sidebar, "Health", self.health_tab)
         self._add_nav(self.sidebar, "Search", self.search_tab)
         self._add_nav(self.sidebar, "Shared", self.shared_tab)
         self._nav_group(self.sidebar, "SYSTEM")
@@ -2182,6 +2674,8 @@ class DesktopApp(tk.Tk):
         self._shared_rows: list[dict] = []
         self._build_status(self.status_tab)
         self._build_wanted(self.wanted_tab)
+        self._build_dashboard(self.dashboard_tab)
+        self._build_health(self.health_tab)
         self._build_search(self.search_tab)
         self._build_shared(self.shared_tab)
         apply_theme(self, self._theme_name)
@@ -2200,10 +2694,22 @@ class DesktopApp(tk.Tk):
     def _show_page(self, page: tk.Misc) -> None:
         if page is self.settings_tab:
             self._ensure_settings()
-        for frame in (self.status_tab, self.wanted_tab, self.search_tab, self.shared_tab, self.settings_tab):
+        for frame in (
+            self.status_tab,
+            self.wanted_tab,
+            self.dashboard_tab,
+            self.health_tab,
+            self.search_tab,
+            self.shared_tab,
+            self.settings_tab,
+        ):
             if frame.winfo_manager():
                 frame.pack_forget()
         page.pack(in_=self.content, fill="both", expand=True)
+        if page is self.dashboard_tab:
+            self.refresh_dashboard()
+        elif page is self.health_tab:
+            self.refresh_health()
         selected = str(page)
         for key, item in self._nav_items.items():
             item.set_selected(key == selected)
@@ -2322,7 +2828,17 @@ class DesktopApp(tk.Tk):
             message = settings_apply_message(baseline["cfg"], cfg)
             baseline["cfg"] = cfg
             self._settings_baseline = baseline
+            previous = self.worker.cfg
             self.worker.cfg = cfg
+            if (
+                previous.lidarr_url,
+                previous.lidarr_api_key,
+                previous.lidarr_track_concurrency,
+            ) != (cfg.lidarr_url, cfg.lidarr_api_key, cfg.lidarr_track_concurrency):
+                self.worker.retarget_lidarr()
+            self.worker.apply_bridge()
+            if getattr(self.worker, "_bridge_error", ""):
+                message = f"{message} {self.worker._bridge_error}"
             self.worker.store.refresh_display_order(cfg.search_order, cfg.search_order_direction)
             self._wanted_sort = None
             self._sync_order_boxes()
@@ -2392,6 +2908,176 @@ class DesktopApp(tk.Tk):
             "Help → Check for updates looks for a newer release.",
             parent=self,
         )
+
+    def _build_dashboard(self, parent: ttk.Frame) -> None:
+        self._page_header(
+            parent,
+            "Dashboard",
+            "Missing albums by artist, tag, and decade, plus how long the queue would take at the recent rate.",
+        )
+        bar = ttk.Frame(parent, style="Main.TFrame")
+        bar.pack(fill="x", pady=(self.px(12), self.px(8)))
+        ttk.Button(bar, text="Refresh", command=self.refresh_dashboard).pack(side="left")
+        self.dashboard_text = tk.Text(parent, wrap="word", height=24, bd=0, highlightthickness=0)
+        self.dashboard_text.pack(fill="both", expand=True)
+        self.dashboard_text.configure(state="disabled")
+
+    def refresh_dashboard(self) -> None:
+        widget = getattr(self, "dashboard_text", None)
+        if widget is None:
+            return
+        try:
+            albums = self.worker.store.wanted_albums()
+            finished = self.worker.store.recent_completed_downloads(400)
+            nxt = queued_next(self.worker.store, self.worker.cfg, 5)
+            text = format_summary(wanted_summary(albums, finished, nxt))
+            notes = self.worker.store.dry_run_notes()
+            if notes:
+                text += "\n\nDry run\n" + "\n".join(f"  {line}" for line in notes[:12])
+        except Exception as exc:
+            log.exception("Could not build the wanted dashboard")
+            text = f"Could not build the dashboard: {exc}"
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text)
+        widget.configure(state="disabled")
+
+    def _build_health(self, parent: ttk.Frame) -> None:
+        self._page_header(
+            parent,
+            "Library health",
+            "Missing tracks, edition titles that disagree, files sitting in the folder root, and leftovers in Review.",
+        )
+        bar = ttk.Frame(parent, style="Main.TFrame")
+        bar.pack(fill="x", pady=(self.px(12), self.px(8)))
+        ttk.Button(bar, text="Refresh", command=self.refresh_health).pack(side="left")
+        ttk.Button(bar, text="Re-search", command=self._health_research).pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="Rescan", command=self._health_rescan).pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="Delete", command=self._health_delete).pack(side="left", padx=(8, 0))
+        columns = ("kind", "artist", "album", "detail")
+        self.health_tree = ttk.Treeview(parent, columns=columns, show="headings", selectmode="browse")
+        self.health_tree.heading("kind", text="Kind")
+        self.health_tree.heading("artist", text="Artist")
+        self.health_tree.heading("album", text="Album")
+        self.health_tree.heading("detail", text="Detail")
+        self.health_tree.column("kind", width=self.px(110), stretch=False)
+        self.health_tree.column("artist", width=self.px(180), stretch=False)
+        self.health_tree.column("album", width=self.px(220), stretch=False)
+        self.health_tree.column("detail", width=self.px(420))
+        self.health_tree.pack(fill="both", expand=True)
+        self._health_rows: list[dict] = []
+
+    def _health_sources(self) -> list[dict]:
+        rows = health_from_albums(self.worker.store.wanted_albums())
+        roots = [self.worker.cfg.complete_dir]
+        scan = (self.worker.cfg.lidarr_scan_path or "").strip()
+        if scan:
+            other = Path(scan)
+            try:
+                same = other.resolve() == Path(self.worker.cfg.complete_dir).resolve()
+            except OSError:
+                same = str(other) == str(self.worker.cfg.complete_dir)
+            if not same:
+                roots.append(other)
+        for root in roots:
+            rows.extend(scan_folder(root))
+        return rows
+
+    def refresh_health(self) -> None:
+        tree = getattr(self, "health_tree", None)
+        if tree is None:
+            return
+        try:
+            rows = self._health_sources()
+        except Exception:
+            log.exception("Could not scan library health")
+            rows = []
+        self._health_rows = rows
+        tree.delete(*tree.get_children())
+        for index, row in enumerate(rows):
+            tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(row.get("kind") or "", row.get("artist") or "", row.get("album") or "", row.get("detail") or ""),
+            )
+
+    def _selected_health(self) -> dict | None:
+        tree = getattr(self, "health_tree", None)
+        if tree is None:
+            return None
+        selected = tree.selection()
+        if not selected:
+            self.notice_var.set("Select a row first.")
+            return None
+        try:
+            return self._health_rows[int(selected[0])]
+        except (ValueError, IndexError):
+            return None
+
+    def _health_research(self) -> None:
+        row = self._selected_health()
+        if row is None:
+            return
+        note = research_note(self.worker.store, row)
+        self.notice_var.set(note)
+        self.refresh_health()
+
+    def _health_rescan(self) -> None:
+        row = self._selected_health() or {}
+        path = str(row.get("path") or "")
+        target = self.worker._import_folder()
+        if path:
+            candidate = Path(path)
+            if candidate.is_dir():
+                target = str(candidate)
+            elif candidate.parent.is_dir():
+                target = str(candidate.parent)
+        self.notice_var.set(f"Asking Lidarr to rescan {target}")
+
+        def work() -> None:
+            try:
+                self.worker.lidarr.scan_downloaded(target)
+                text = f"Asked Lidarr to rescan {target}"
+            except Exception as exc:
+                text = f"Could not rescan: {exc}"
+            self._post(lambda text=text: self.notice_var.set(text))
+
+        threading.Thread(target=work, name="health-rescan", daemon=True).start()
+
+    def _health_delete(self) -> None:
+        row = self._selected_health()
+        if row is None:
+            return
+        path = str(row.get("path") or "")
+        if not path:
+            self.notice_var.set("That row has no file to delete.")
+            return
+        if not messagebox.askyesno("Delete", f"Delete {path}?", parent=self):
+            return
+        root = self._health_root_for(Path(path))
+        try:
+            delete_inside(root, Path(path))
+        except Exception as exc:
+            self.notice_var.set(str(exc))
+            return
+        self.notice_var.set(f"Deleted {path}")
+        self.refresh_health()
+
+    def _health_root_for(self, path: Path) -> Path:
+        roots = [Path(self.worker.cfg.complete_dir)]
+        scan = (self.worker.cfg.lidarr_scan_path or "").strip()
+        if scan:
+            roots.append(Path(scan))
+        resolved = path.resolve()
+        for root in roots:
+            try:
+                base = root.resolve()
+            except OSError:
+                continue
+            if resolved == base or base in resolved.parents:
+                return root
+        return Path(self.worker.cfg.complete_dir)
 
     def _build_status(self, parent: ttk.Frame) -> None:
         self._page_header(parent, "Status", "Soulseek worker for Lidarr wanted music")

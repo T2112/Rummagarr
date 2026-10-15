@@ -1,6 +1,6 @@
 # Rummagarr
 
-**Version 1.13.0** — Windows desktop app. No Docker. No slskd. The GitHub repository is still [T2112/lidarr-soulseek](https://github.com/T2112/lidarr-soulseek).
+**Version 1.14.0** — Windows desktop app. No Docker. No slskd. The GitHub repository is still [T2112/lidarr-soulseek](https://github.com/T2112/lidarr-soulseek).
 
 The worker reads Lidarr **Wanted → Missing**, searches Soulseek, downloads matching albums or individual missing tracks, converts FLAC/WAV to MP3 when needed, asks Lidarr to import and rename, then cleans leftover files.
 
@@ -58,11 +58,19 @@ dist\Rummagarr-Setup-1.11.0.exe
 
 The same steps run in GitHub Actions (`.github/workflows/windows-installer.yml`) on `windows-latest`. Pull requests and pushes to `main` upload the installer as a workflow artifact.
 
-To publish a public download, push a tag `v<version>` that matches the `VERSION` file (for example `v1.13.0`). That run creates a GitHub Release and attaches `Rummagarr-Setup-<version>.exe` and the same file as `LidarrSoulseek-Setup-<version>.exe`, so an installed 1.9.4 can still update. The release notes are the matching section of `CHANGELOG.md`, followed by the install instructions. The release fails if that section is missing. You can also publish the version already in `VERSION` without making the tag yourself: **Actions → Windows installer → Run workflow**, and choose the `main` branch. If that release already exists, the workflow replaces the installer files and the notes.
+To publish a public download, push a tag `v<version>` that matches the `VERSION` file (for example `v1.14.0`). That run creates a GitHub Release and attaches `Rummagarr-Setup-<version>.exe` and the same file as `LidarrSoulseek-Setup-<version>.exe`, so an installed 1.9.4 can still update. The release notes are the matching section of `CHANGELOG.md`, followed by the install instructions. The release fails if that section is missing. You can also publish the version already in `VERSION` without making the tag yourself: **Actions → Windows installer → Run workflow**, and choose the `main` branch. If that release already exists, the workflow replaces the installer files and the notes.
 
 This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs on, and Inno Setup is a Windows program. Push the branch and let that workflow produce the `.exe`.
 
 `python main.py` still runs the worker without the window, for the original script install below.
+
+## What's new in 1.14.0
+
+- Settings → Bridge turns Rummagarr into a Torznab indexer and a qBittorrent 2.11.2 download client, so Lidarr's own Search can grab Soulseek results. Add to Lidarr registers both. The standalone worker still runs with the bridge off.
+- Optional quality upgrades re-search albums below the cutoff on a schedule and let Lidarr replace the old file. Library health lists missing tracks, mismatched editions, loose files, and Review leftovers, with re-search, rescan, and a confirmed delete.
+- Discord, ntfy, Plex, and Jellyfin can be notified on import or Review. The dashboard counts the wanted queue by artist, tag, and decade and estimates how long it would take. More than one Lidarr instance can be saved, and dry run shows a grab without downloading.
+- Lidarr on another PC, including over Tailscale, can reach the bridge. Listen on every interface or the Tailscale address, and Add to Lidarr uses the address that PC can open. A Windows Firewall prompt is in the installer and under Settings → Bridge. Path Lidarr sees is the UNC share or mapped drive for the same complete folder.
+- Full changelog: [CHANGELOG.md](CHANGELOG.md)
 
 ## What's new in 1.13.0
 
@@ -240,7 +248,9 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\open-firewall.ps1
 ```
 
-Forward TCP `2234` and `2235` on the router to this PC.
+The script opens Soulseek TCP `2234` and `2235`, and the Lidarr bridge port (`8788` unless `[bridge]` in config says otherwise). It still runs when `config.toml` is missing. The installed app keeps that file in `%LOCALAPPDATA%\Rummagarr`, and the script reads it there. The installer can add the same rules at the end of setup. Settings → Bridge → Allow in Windows Firewall opens the bridge port from the app. Lidarr on another machine needs this PC's Tailscale address, not `127.0.0.1`.
+
+Forward TCP `2234` and `2235` on the router to this PC. Tailscale does not need those router forwards for the bridge.
 
 6. Test in the foreground:
 

@@ -36,7 +36,11 @@ from audio_check import folder_fake_reason
 from audio_tags import tag_album_folder
 from config_loader import Config
 from control import WorkerControl
+from library_report import merge_upgrade_albums, upgrade_artist
+from bridge_net import advertise_host, host_for_url, is_loopback_bind, mapped_folder, reported_root
+from lidarr_bridge import BridgeService, GrabBook, bridge_settings
 from lidarr_client import LidarrClient, LidarrUnreachable
+from notifications import deliver
 from search_model import (
     counts_for_server,
     explain_search,
@@ -703,8 +707,15 @@ class Worker:
         self._metadata_profiles: dict[int, dict] | None = None
         self.run_summary = RunSummary()
         self._summary_path: Path | None = None
+        self._bridge: BridgeService | None = None
+        self._bridge_error = ""
+        self._upgrade_cache: list[dict] = []
+        self._upgrade_at = 0.0
+        self._bridge_mutex: asyncio.Lock | None = None
+        self.apply_bridge()
 
     def close(self) -> None:
+        self.stop_bridge()
         if self._ui:
             try:
                 self._ui.shutdown()
@@ -832,6 +843,7 @@ class Worker:
             log.info("Imported %s into Lidarr from %s", artist, folder)
             self._publish_import(f"Imported {artist} into Lidarr", hold=False)
             self._summary_imported(artist)
+            self._notify("import", f"Imported {artist}", f"Lidarr imported {artist} from {folder}")
         except Exception as exc:
             detail = str(exc).strip() or exc.__class__.__name__
             log.exception("Importing %s into Lidarr failed", artist)
@@ -868,6 +880,7 @@ class Worker:
         moved = self._move_artist_to_review(artist)
         if moved:
             log.info("Moved %s to the review folder %s", artist, moved)
+        self._notify("review", f"Review: {artist}", detail or "Import did not finish")
 
     def _move_artist_to_review(self, artist: str) -> str:
         token = (artist or "").casefold().strip()
@@ -2180,6 +2193,248 @@ class Worker:
             self._apply_wait(pause, "pass")
         return pause
 
+    def stop_bridge(self) -> None:
+        service = self._bridge
+        self._bridge = None
+        if service is None:
+            return
+        try:
+            service.stop()
+        except Exception:
+            log.exception("Could not stop the Lidarr bridge")
+
+    def bridge_port(self) -> int:
+        service = self._bridge
+        if service is None:
+            return 0
+        try:
+            return int(service.port)
+        except Exception:
+            return 0
+
+    def apply_bridge(self) -> None:
+        """Start or stop the local Torznab and qBittorrent endpoint."""
+        self.stop_bridge()
+        self._bridge_error = ""
+        if not self.cfg.bridge_enabled:
+            return
+        host = self.cfg.bridge_host or "127.0.0.1"
+        port = int(self.cfg.bridge_port or 8788)
+        shown = advertise_host(host, getattr(self.cfg, "bridge_advertise_host", ""))
+        shown_url = host_for_url(shown)
+        settings = bridge_settings(
+            save_path=reported_root(self.cfg.complete_dir, getattr(self.cfg, "bridge_remote_path", "")),
+            api_key=self.cfg.bridge_api_key,
+            username=self.cfg.bridge_username,
+            password=self.cfg.bridge_password,
+            category=self.cfg.bridge_category,
+            dry_run=self.cfg.dry_run,
+            public_base=f"http://{shown_url}:{port}",
+            local_only=is_loopback_bind(host),
+        )
+        book = GrabBook(Path(self.cfg.state_db).with_name(Path(self.cfg.state_db).stem + "-bridge.sqlite3"))
+        try:
+            service = BridgeService(host, port, book, settings, self.search_for_bridge, self.on_bridge_add)
+        except OSError as exc:
+            book.close()
+            self._bridge_error = f"Could not listen on {host}:{port}: {exc}"
+            log.error(self._bridge_error)
+            return
+        settings["public_base"] = f"http://{shown_url}:{service.port}"
+        service.start()
+        self._bridge = service
+        log.info("Lidarr bridge listening on http://%s:%s", shown, service.port)
+
+    def retarget_lidarr(self) -> None:
+        """Open a new Lidarr client after the URL or API key changes."""
+        try:
+            self.lidarr.close()
+        except Exception:
+            log.exception("Could not close the Lidarr client")
+        self.lidarr = LidarrClient(
+            self.cfg.lidarr_url,
+            self.cfg.lidarr_api_key,
+            track_concurrency=self.cfg.lidarr_track_concurrency,
+        )
+        self._quality_profiles = None
+        self._metadata_profiles = None
+        self._upgrade_cache = []
+        self._upgrade_at = 0.0
+
+    def _notify(self, kind: str, title: str, body: str) -> None:
+        try:
+            deliver(self.cfg, kind, title, body)
+        except Exception:
+            log.exception("Notification failed")
+
+    def search_for_bridge(self, artist: str, album: str, query: str) -> list[dict]:
+        loop = self._loop
+        if loop is None or not loop.is_running() or not self.soulseek_logged_in():
+            raise RuntimeError("Soulseek is not logged in")
+        future = asyncio.run_coroutine_threadsafe(self._bridge_search(artist, album, query), loop)
+        timeout = min(28.0, max(8.0, float(self.cfg.search_wait_seconds or 12) + 6))
+        return future.result(timeout=timeout)
+
+    async def _bridge_search(self, artist: str, album: str, query: str) -> list[dict]:
+        if self.client is None or not self.soulseek_logged_in():
+            raise RuntimeError("Soulseek is not logged in")
+        text = " ".join(part for part in (artist, album) if part).strip() or (query or "").strip()
+        if not text:
+            return []
+        request = await self._send_search(text, cycle=False)
+        wait = min(float(self.cfg.search_wait_seconds or 12), 15.0)
+        signal = await self._await_results(request, "bridge", wait, artist or "Search", album or text, 1, 1)
+        results = list(getattr(request, "results", None) or [])
+        try:
+            self.client.searches.remove_request(request)
+        except Exception:
+            pass
+        if signal != "ok":
+            raise RuntimeError("Soulseek search did not finish")
+        releases = []
+        label_artist = artist or "Unknown Artist"
+        label_album = album or text
+        for folder in group_results(results, self.cfg.ignored_users):
+            scored = score_folder(
+                folder,
+                label_artist,
+                label_album,
+                [],
+                self.cfg.preferred_extensions,
+                self.cfg.min_filename_ratio,
+                self.cfg.track_count_tolerance,
+                self.cfg.min_mp3_bitrate,
+            )
+            if scored.score < 20:
+                continue
+            files = []
+            size = 0
+            for item in scored.files:
+                filename = getattr(item, "filename", "") or ""
+                length = int(getattr(item, "filesize", 0) or getattr(item, "size", 0) or 0)
+                size += max(0, length)
+                files.append({"filename": filename, "size": max(0, length)})
+            releases.append(
+                {
+                    "artist": label_artist,
+                    "album": label_album,
+                    "username": scored.username,
+                    "size": size or 1,
+                    "files": files,
+                    "score": int(scored.score),
+                }
+            )
+        releases.sort(key=lambda item: item["score"], reverse=True)
+        return releases[:8]
+
+    def on_bridge_add(self, row: dict) -> None:
+        name = row.get("name") or row.get("hash") or "album"
+        if row.get("state") == "pausedDL" or self.cfg.dry_run:
+            self.store.note_dry_run(f"dry run: would grab {name}")
+            return
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            book = self._bridge.book if self._bridge is not None else None
+            if book is not None:
+                book.update(str(row.get("hash") or ""), state="error", message="Start the worker before Lidarr grabs")
+            return
+        asyncio.run_coroutine_threadsafe(self.download_bridge_grab(row), loop)
+
+    async def download_bridge_grab(self, row: dict) -> None:
+        digest = str(row.get("hash") or "").lower()
+        book = self._bridge.book if self._bridge is not None else None
+        if self.cfg.dry_run or row.get("state") == "pausedDL":
+            self.store.note_dry_run(f"dry run: would grab {row.get('name') or digest}")
+            return
+        if self._bridge_mutex is None:
+            self._bridge_mutex = asyncio.Lock()
+        async with self._bridge_mutex:
+            if book is not None:
+                book.update(digest, state="downloading", progress=0)
+            if self.client is None or not self.soulseek_logged_in():
+                if book is not None:
+                    book.update(digest, state="error", message="Soulseek is not logged in")
+                return
+            files = [item for item in (row.get("files") or []) if str(item.get("filename") or "")]
+            username = str(row.get("username") or "")
+            artist = str(row.get("artist") or "Unknown Artist")
+            album = str(row.get("album") or "Unknown Album")
+            dest = album_dest_folder(self.cfg, artist, album, None)
+            done = 0
+            try:
+                for item in files:
+                    transfer = await self.client.transfers.download(username, str(item.get("filename") or ""))
+                    self.active_transfers = [transfer]
+                    deadline = asyncio.get_running_loop().time() + min(int(self.cfg.download_timeout_minutes or 30), 30) * 60
+                    while asyncio.get_running_loop().time() < deadline:
+                        if state_name(transfer) in {"COMPLETE", "FAILED", "ABORTED"}:
+                            break
+                        await asyncio.sleep(0.5)
+                    if state_name(transfer) != "COMPLETE":
+                        raise RuntimeError(state_name(transfer) or "download failed")
+                    await asyncio.to_thread(stage_one_file, self.cfg, dest, transfer)
+                    done += 1
+                    if book is not None and files:
+                        book.update(digest, state="downloading", progress=done / len(files))
+                if done == 0:
+                    raise RuntimeError("no files downloaded")
+                if book is not None:
+                    remote = getattr(self.cfg, "bridge_remote_path", "")
+                    book.update(
+                        digest,
+                        state="pausedUP",
+                        progress=1,
+                        eta=0,
+                        content_path=mapped_folder(dest, self.cfg.complete_dir, remote),
+                        save_path=reported_root(self.cfg.complete_dir, remote),
+                    )
+                self.store.add_completed_download(artist, album, dest.name, username, "bridge")
+            except Exception as exc:
+                log.exception("Bridge download failed for %s", digest)
+                if book is not None:
+                    book.update(digest, state="error", message=(str(exc).strip() or "download failed")[:240])
+            finally:
+                self.active_transfers = []
+
+    def _upgrade_candidates(self) -> list[dict]:
+        if not self.cfg.quality_upgrades:
+            return []
+        hours = max(1, int(self.cfg.quality_upgrade_hours or 24))
+        now = time.time()
+        if self._upgrade_at and now - self._upgrade_at < hours * 3600:
+            return list(self._upgrade_cache)
+        try:
+            rows = self.lidarr.wanted_cutoff() or []
+        except Exception:
+            log.exception("Could not read albums below the quality cutoff")
+            return list(self._upgrade_cache)
+        self._upgrade_cache = [row for row in rows if isinstance(row, dict)]
+        self._upgrade_at = now
+        return list(self._upgrade_cache)
+
+    def _upgrade_album(self, album: dict) -> bool:
+        if not self.cfg.quality_upgrades:
+            return False
+        album_id = album.get("id")
+        if album_id is None:
+            return False
+        return any(item.get("id") == album_id for item in self._upgrade_candidates())
+
+    def _or_upgrade_focus(self, focus: str | None) -> str | None:
+        if focus or not self.cfg.quality_upgrades:
+            return focus
+        artist = upgrade_artist(self._upgrade_candidates())
+        if not artist:
+            return None
+        self.store.set_focus_artist(artist)
+        log.info("Quality upgrade: %s is below the cutoff", artist)
+        return artist
+
+    def _with_upgrades(self, focus: str, missing: list[dict]) -> list[dict]:
+        if not self.cfg.quality_upgrades or not focus:
+            return missing
+        return merge_upgrade_albums(focus, missing, self._upgrade_candidates())
+
     async def cycle(self) -> None:
         if self.control.is_stopped():
             return
@@ -2203,7 +2458,7 @@ class Worker:
         # reading Lidarr 20 pages at a time and resume next cycle.
         if self.store.wanted_catalog_ready():
             log.info("Using saved wanted list (%s albums)", self.store.wanted_kind_count("album"))
-            focus = self.choose_focus_artist([], [])
+            focus = self._or_upgrade_focus(self.choose_focus_artist([], []))
             if not focus:
                 log.info("No artist ready (all cooled off or nothing missing)")
                 self._last_focus = ""
@@ -2226,7 +2481,7 @@ class Worker:
         elif self.catalog.synced:
             cached = self.catalog.album_payloads() or []
             log.info("Using synced wanted list (%s albums)", len(cached))
-            focus = self.choose_focus_artist([], [])
+            focus = self._or_upgrade_focus(self.choose_focus_artist([], []))
             if not focus:
                 log.info("No artist ready (all cooled off or nothing missing)")
                 self._last_focus = ""
@@ -2262,7 +2517,7 @@ class Worker:
                 "end of list" if exhausted else f"next page {next_page}",
             )
             catalog.sort(key=self._album_sort_key)
-            focus = self.choose_focus_artist(catalog, [])
+            focus = self._or_upgrade_focus(self.choose_focus_artist(catalog, []))
             if not focus:
                 log.info("No artist ready (all cooled off or nothing missing)")
                 self._last_focus = ""
@@ -2278,7 +2533,7 @@ class Worker:
         hidden = len(truly_missing) - len(checked_missing)
         if hidden:
             log.info("Left out %s unchecked album(s)", hidden)
-        missing = checked_missing
+        missing = self._with_upgrades(focus, checked_missing)
         if not missing and not holes:
             log.info("Artist %s has nothing to search; moving on without a cooldown", focus)
             self._defer_artist(focus, None)
@@ -2301,7 +2556,7 @@ class Worker:
             if skipped:
                 self._note_skip(artist_name(album), album.get("title") or "", skipped)
                 continue
-            if self.store.should_skip(int(album["id"]), self.cfg.retry_hours):
+            if self.store.should_skip(int(album["id"]), self.cfg.retry_hours) and not self._upgrade_album(album):
                 continue
             batch.append(album)
         if self._album_cap_reached() and not batch:
@@ -2541,6 +2796,12 @@ class Worker:
             best_score,
         )
         self.store.upsert_track(track_id, album_id, artist, title, "downloading", best_user)
+        if self.cfg.dry_run:
+            detail = f"dry run: would grab 1 file(s) from {best_user}"
+            self.store.upsert_track(track_id, album_id, artist, title, "skipped", detail)
+            self.store.note_dry_run(f"{artist} – {title}: {detail}")
+            log.info(detail)
+            return False
         self.cancel_requested = False
         self.set_step(Step(kind="queued", artist=artist, album=album_title, title=title, file_total=1, username=best_user))
         signal = await self.control.gate(key)
@@ -2822,6 +3083,13 @@ class Worker:
 
     async def _download_one(self, best, album, key, album_id, artist, title, year, needed_tracks):
         """Download one user's folder. ``again`` means try the next user."""
+        if self.cfg.dry_run:
+            count = len(getattr(best, "files", []) or [])
+            detail = f"dry run: would grab {count} file(s) from {best.username}"
+            self.store.upsert(album_id, artist, title, "skipped", detail)
+            self.store.note_dry_run(f"{artist} – {title}: {detail}")
+            log.info(detail)
+            return "halt", detail
         log.info(
             "Picked %s :: %s (%s files, score %.1f)",
             best.username,
@@ -3502,6 +3770,14 @@ class Worker:
         """
         if not specs:
             return ""
+        if self.cfg.dry_run:
+            username = str(specs[0].get("username") or "")
+            detail = f"dry run: would grab {len(specs)} file(s) from {username}"
+            self.store.note_dry_run(detail)
+            log.info(detail)
+            for spec in specs:
+                self._set_manual_state(str(spec.get("id") or ""), "skipped")
+            return detail
         specs = self._skip_queued_specs(specs, link)
         if not specs:
             log.info("Nothing new to queue; those files are already queued or in the download folder")

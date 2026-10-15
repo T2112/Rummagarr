@@ -92,6 +92,9 @@ class LidarrClient:
     def _post(self, path: str, payload: dict[str, Any]) -> Any:
         return self._request("POST", path, payload=payload)
 
+    def _put(self, path: str, payload: dict[str, Any]) -> Any:
+        return self._request("PUT", path, payload=payload)
+
     def ping(self) -> dict[str, Any]:
         status = self._get("/system/status")
         return status if isinstance(status, dict) else {}
@@ -310,6 +313,48 @@ class LidarrClient:
             "/command",
             {"name": "DownloadedAlbumsScan", "path": path, "importMode": "Move"},
         )
+
+    def wanted_cutoff(self, page_size: int = 50) -> list[dict[str, Any]]:
+        """Albums Lidarr already has, but below the quality profile cutoff."""
+        data = self._get(
+            "/wanted/cutoff",
+            params={
+                "page": 1,
+                "pageSize": max(1, int(page_size or 50)),
+                "monitored": True,
+                "includeArtist": True,
+                "sortKey": "releaseDate",
+                "sortDirection": "descending",
+            },
+        )
+        if not isinstance(data, dict):
+            return []
+        records = data.get("records") or []
+        return [item for item in records if isinstance(item, dict)]
+
+    def indexer_schema(self) -> Any:
+        return self._get("/indexer/schema")
+
+    def download_client_schema(self) -> Any:
+        return self._get("/downloadclient/schema")
+
+    def indexers(self) -> Any:
+        return self._get("/indexer")
+
+    def download_clients(self) -> Any:
+        return self._get("/downloadclient")
+
+    def add_indexer(self, body: dict[str, Any]) -> Any:
+        return self._post("/indexer", body)
+
+    def update_indexer(self, indexer_id: int, body: dict[str, Any]) -> Any:
+        return self._put(f"/indexer/{int(indexer_id)}", body)
+
+    def add_download_client(self, body: dict[str, Any]) -> Any:
+        return self._post("/downloadclient", body)
+
+    def update_download_client(self, client_id: int, body: dict[str, Any]) -> Any:
+        return self._put(f"/downloadclient/{int(client_id)}", body)
 
     def renames_on_import(self) -> bool | None:
         """True when Lidarr's own import already renames tracks.

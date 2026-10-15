@@ -85,6 +85,29 @@ class Config:
     allow_compilation: bool = False
     allow_single: bool = False
     allow_bootleg: bool = False
+    lidarr_instances: list[dict] = field(default_factory=list)
+    lidarr_active: str = "Home"
+    bridge_enabled: bool = False
+    bridge_host: str = "127.0.0.1"
+    bridge_port: int = 8788
+    bridge_api_key: str = ""
+    bridge_username: str = "rummagarr"
+    bridge_password: str = ""
+    bridge_category: str = "lidarr"
+    bridge_advertise_host: str = ""
+    bridge_remote_path: str = ""
+    dry_run: bool = False
+    quality_upgrades: bool = False
+    quality_upgrade_hours: int = 24
+    notify_discord_url: str = ""
+    notify_ntfy_url: str = ""
+    notify_on_import: bool = True
+    notify_on_review: bool = True
+    plex_url: str = ""
+    plex_token: str = ""
+    plex_section: str = ""
+    jellyfin_url: str = ""
+    jellyfin_api_key: str = ""
 
 
 def normalize_theme(value) -> str:
@@ -287,10 +310,72 @@ def default_config(**overrides) -> Config:
         allow_compilation=bool(overrides.pop("allow_compilation", False)),
         allow_single=bool(overrides.pop("allow_single", False)),
         allow_bootleg=bool(overrides.pop("allow_bootleg", False)),
+        lidarr_instances=list(overrides.pop("lidarr_instances", [])),
+        lidarr_active=str(overrides.pop("lidarr_active", "Home") or "Home"),
+        bridge_enabled=bool(overrides.pop("bridge_enabled", False)),
+        bridge_host=str(overrides.pop("bridge_host", "127.0.0.1") or "127.0.0.1"),
+        bridge_port=int(overrides.pop("bridge_port", 8788)),
+        bridge_api_key=str(overrides.pop("bridge_api_key", "")),
+        bridge_username=str(overrides.pop("bridge_username", "rummagarr") or "rummagarr"),
+        bridge_password=str(overrides.pop("bridge_password", "")),
+        bridge_category=str(overrides.pop("bridge_category", "lidarr") or "lidarr"),
+        bridge_advertise_host=str(overrides.pop("bridge_advertise_host", "")),
+        bridge_remote_path=str(overrides.pop("bridge_remote_path", "")),
+        dry_run=bool(overrides.pop("dry_run", False)),
+        quality_upgrades=bool(overrides.pop("quality_upgrades", False)),
+        quality_upgrade_hours=max(1, int(overrides.pop("quality_upgrade_hours", 24))),
+        notify_discord_url=str(overrides.pop("notify_discord_url", "")),
+        notify_ntfy_url=str(overrides.pop("notify_ntfy_url", "")),
+        notify_on_import=bool(overrides.pop("notify_on_import", True)),
+        notify_on_review=bool(overrides.pop("notify_on_review", True)),
+        plex_url=str(overrides.pop("plex_url", "")),
+        plex_token=str(overrides.pop("plex_token", "")),
+        plex_section=str(overrides.pop("plex_section", "")),
+        jellyfin_url=str(overrides.pop("jellyfin_url", "")),
+        jellyfin_api_key=str(overrides.pop("jellyfin_api_key", "")),
     )
     if overrides:
         cfg = replace(cfg, **overrides)
     return cfg
+
+
+def _lidarr_instances(lidarr: dict, scan_default: str) -> tuple[list[dict], str, dict]:
+    """The saved instances, the active name, and the one the worker should use.
+
+    A config with only url and api_key is one instance named Home.
+    """
+    raw = lidarr.get("instances") or []
+    instances: list[dict] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip().rstrip("/")
+            key = str(item.get("api_key") or "").strip()
+            if not url or not key:
+                continue
+            instances.append(
+                {
+                    "name": str(item.get("name") or "Home").strip() or "Home",
+                    "url": url,
+                    "api_key": key,
+                    "scan_path": str(item.get("scan_path") or scan_default),
+                }
+            )
+    if not instances:
+        instances.append(
+            {
+                "name": "Home",
+                "url": str(lidarr["url"]).strip().rstrip("/"),
+                "api_key": str(lidarr["api_key"]),
+                "scan_path": str(lidarr.get("scan_path") or scan_default),
+            }
+        )
+    active = str(lidarr.get("active") or "").strip()
+    if not any(item["name"] == active for item in instances):
+        active = instances[0]["name"]
+    chosen = next(item for item in instances if item["name"] == active)
+    return instances, active, chosen
 
 
 def _toml_str(value: str) -> str:
@@ -326,6 +411,7 @@ def save_config(path: Path, cfg: Config) -> None:
             f"api_key = {_toml_str(cfg.lidarr_api_key)}",
             f"scan_path = {_toml_str(cfg.lidarr_scan_path)}",
             f"auto_import_after_artist = {_toml_bool(cfg.auto_import_after_artist)}",
+            f"active = {_toml_str(cfg.lidarr_active or 'Home')}",
             "",
             "[soulseek]",
             f"username = {_toml_str(cfg.slsk_username)}",
@@ -353,6 +439,9 @@ def save_config(path: Path, cfg: Config) -> None:
             f"allow_compilation = {_toml_bool(cfg.allow_compilation)}",
             f"allow_single = {_toml_bool(cfg.allow_single)}",
             f"allow_bootleg = {_toml_bool(cfg.allow_bootleg)}",
+            f"dry_run = {_toml_bool(cfg.dry_run)}",
+            f"quality_upgrades = {_toml_bool(cfg.quality_upgrades)}",
+            f"quality_upgrade_hours = {max(1, int(cfg.quality_upgrade_hours or 24))}",
             f"focus_one_artist = {_toml_bool(cfg.focus_one_artist)}",
             f"artist_cooldown_days = {cfg.artist_cooldown_days}",
             f"max_missing_pages = {int(cfg.max_missing_pages)}",
@@ -370,6 +459,28 @@ def save_config(path: Path, cfg: Config) -> None:
             f"clean_incomplete_on_fail = {_toml_bool(cfg.clean_incomplete_on_fail)}",
             f"incomplete_max_age_hours = {cfg.incomplete_max_age_hours}",
             f"ignored_users = [{ignored}]",
+            "",
+            "[bridge]",
+            f"enabled = {_toml_bool(cfg.bridge_enabled)}",
+            f"host = {_toml_str(cfg.bridge_host or '127.0.0.1')}",
+            f"port = {int(cfg.bridge_port or 8788)}",
+            f"api_key = {_toml_str(cfg.bridge_api_key)}",
+            f"username = {_toml_str(cfg.bridge_username or 'rummagarr')}",
+            f"password = {_toml_str(cfg.bridge_password)}",
+            f"category = {_toml_str(cfg.bridge_category or 'lidarr')}",
+            f"advertise_host = {_toml_str(cfg.bridge_advertise_host)}",
+            f"remote_path = {_toml_str(cfg.bridge_remote_path)}",
+            "",
+            "[notify]",
+            f"discord_url = {_toml_str(cfg.notify_discord_url)}",
+            f"ntfy_url = {_toml_str(cfg.notify_ntfy_url)}",
+            f"on_import = {_toml_bool(cfg.notify_on_import)}",
+            f"on_review = {_toml_bool(cfg.notify_on_review)}",
+            f"plex_url = {_toml_str(cfg.plex_url)}",
+            f"plex_token = {_toml_str(cfg.plex_token)}",
+            f"plex_section = {_toml_str(cfg.plex_section)}",
+            f"jellyfin_url = {_toml_str(cfg.jellyfin_url)}",
+            f"jellyfin_api_key = {_toml_str(cfg.jellyfin_api_key)}",
             "",
             "[runtime]",
             f"concurrent_albums = {int(cfg.concurrent_albums)}",
@@ -399,6 +510,20 @@ def save_config(path: Path, cfg: Config) -> None:
             "",
         ]
     )
+    extra = []
+    for instance in cfg.lidarr_instances or []:
+        extra.extend(
+            [
+                "[[lidarr.instances]]",
+                f"name = {_toml_str(str(instance.get('name') or 'Home'))}",
+                f"url = {_toml_str(str(instance.get('url') or ''))}",
+                f"api_key = {_toml_str(str(instance.get('api_key') or ''))}",
+                f"scan_path = {_toml_str(str(instance.get('scan_path') or ''))}",
+                "",
+            ]
+        )
+    if extra:
+        text = text + "\n" + "\n".join(extra)
     path.write_text(text, encoding="utf-8")
 
 
@@ -435,10 +560,13 @@ def try_load_config(path: Path) -> Config:
     runtime = raw.get("runtime", {})
     sharing = raw.get("sharing", {})
     ui = raw.get("ui", {})
+    bridge = raw.get("bridge", {})
+    notify = raw.get("notify", {})
 
     base = path.parent
     download_dir = Path(paths["download_dir"])
     complete_dir = Path(paths["complete_dir"])
+    instances, active, chosen = _lidarr_instances(lidarr, str(complete_dir))
     state_db = Path(paths.get("state_db", "state.sqlite3"))
     log_file = Path(paths.get("log_file", "lidarr-soulseek.log"))
     if not state_db.is_absolute():
@@ -458,9 +586,9 @@ def try_load_config(path: Path) -> Config:
     complete_dir.mkdir(parents=True, exist_ok=True)
 
     return Config(
-        lidarr_url=lidarr["url"].rstrip("/"),
-        lidarr_api_key=lidarr["api_key"],
-        lidarr_scan_path=lidarr.get("scan_path", str(complete_dir)),
+        lidarr_url=chosen["url"],
+        lidarr_api_key=chosen["api_key"],
+        lidarr_scan_path=chosen["scan_path"],
         slsk_username=slsk["username"],
         slsk_password=slsk["password"],
         listen_port=int(slsk.get("listen_port", 2234)),
@@ -521,4 +649,27 @@ def try_load_config(path: Path) -> Config:
         allow_compilation=bool(search.get("allow_compilation", False)),
         allow_single=bool(search.get("allow_single", False)),
         allow_bootleg=bool(search.get("allow_bootleg", False)),
+        lidarr_instances=instances,
+        lidarr_active=active,
+        bridge_enabled=bool(bridge.get("enabled", False)),
+        bridge_host=str(bridge.get("host", "127.0.0.1") or "127.0.0.1"),
+        bridge_port=int(bridge.get("port", 8788)),
+        bridge_api_key=str(bridge.get("api_key", "") or ""),
+        bridge_username=str(bridge.get("username", "rummagarr") or "rummagarr"),
+        bridge_password=str(bridge.get("password", "") or ""),
+        bridge_category=str(bridge.get("category", "lidarr") or "lidarr"),
+        bridge_advertise_host=str(bridge.get("advertise_host", "") or ""),
+        bridge_remote_path=str(bridge.get("remote_path", "") or ""),
+        dry_run=bool(search.get("dry_run", False)),
+        quality_upgrades=bool(search.get("quality_upgrades", False)),
+        quality_upgrade_hours=max(1, int(search.get("quality_upgrade_hours", 24) or 24)),
+        notify_discord_url=str(notify.get("discord_url", "") or ""),
+        notify_ntfy_url=str(notify.get("ntfy_url", "") or ""),
+        notify_on_import=bool(notify.get("on_import", True)),
+        notify_on_review=bool(notify.get("on_review", True)),
+        plex_url=str(notify.get("plex_url", "") or ""),
+        plex_token=str(notify.get("plex_token", "") or ""),
+        plex_section=str(notify.get("plex_section", "") or ""),
+        jellyfin_url=str(notify.get("jellyfin_url", "") or ""),
+        jellyfin_api_key=str(notify.get("jellyfin_api_key", "") or ""),
     )
