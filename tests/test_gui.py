@@ -972,6 +972,13 @@ def test_stats_page_and_browse_limits_popup(desktop):
             score=1,
         )
     ]
+    desktop.worker.cfg = replace(
+        desktop.worker.cfg,
+        max_queued_files_per_user=3,
+        browse_max_files=25,
+        browse_max_mb=2048,
+        browse_daily_files=20,
+    )
     desktop.download_browse_missing()
     desktop.update()
     window = desktop._limits_window
@@ -979,8 +986,38 @@ def test_stats_page_and_browse_limits_popup(desktop):
     assert "2 files" in text
     assert "30 seconds" in text
     assert "1 file at a time" in text
+    assert desktop._limits_files.get() == "25"
+    assert desktop._limits_mb.get() == "2048"
+    assert desktop._limits_daily.get() == "20"
     assert any(button.cget("text") == "Download" for button in _buttons(window))
-    window.destroy()
+    assert any(button.cget("text") == "Save limits" for button in _buttons(window))
+    desktop._browse_payload["profile"]["description"] = (
+        "max 100 files. one album at a time. wait 30 seconds between downloads."
+    )
+    desktop.download_browse_missing()
+    desktop.update()
+    text = desktop._limits_text.get("1.0", "end")
+    assert "25 files" in text
+    assert "3 files" not in text
+    desktop._limits_files.set("4")
+    desktop._limits_mb.set("100")
+    desktop._limits_daily.set("6")
+    next(button for button in _buttons(desktop._limits_window) if button.cget("text") == "Save limits").invoke()
+    desktop.update()
+    assert desktop.worker.cfg.browse_max_files == 4
+    assert desktop.worker.cfg.browse_max_mb == 100
+    assert desktop.worker.cfg.browse_daily_files == 6
+    loaded = try_load_config(desktop.config_path)
+    assert loaded.browse_max_files == 4
+    assert loaded.browse_max_mb == 100
+    assert loaded.browse_daily_files == 6
+    assert "4 files" in desktop._limits_text.get("1.0", "end")
+    desktop.worker.store.add_user_day("goodpeer", 6)
+    next(button for button in _buttons(desktop._limits_window) if button.cget("text") == "Save limits").invoke()
+    desktop.update()
+    assert "already used" in desktop._limits_text.get("1.0", "end")
+    assert not any(button.cget("text") == "Download" for button in _buttons(desktop._limits_window))
+    desktop._limits_window.destroy()
 
     desktop._browse_payload["profile"]["upload_permissions"] = 0
     desktop.download_browse_missing()
@@ -988,3 +1025,40 @@ def test_stats_page_and_browse_limits_popup(desktop):
     assert "Uploads are off" in desktop._limits_text.get("1.0", "end")
     assert not any(button.cget("text") == "Download" for button in _buttons(desktop._limits_window))
     desktop._limits_window.destroy()
+
+
+def test_favorite_suggestion_is_manual(desktop):
+    desktop.notebook.select(desktop.status_tab)
+    desktop.update()
+    notice = " ".join(_widget_text(desktop.notices))
+    assert "Add peer to favorites?" in notice
+    assert "peer" not in desktop.worker.cfg.priority_users
+    next(button for button in _buttons(desktop.notices) if button.cget("text") == "Add").invoke()
+    desktop.update()
+    assert "peer" in desktop.worker.cfg.priority_users
+    assert "peer" in try_load_config(desktop.config_path).priority_users
+    assert "Add peer to favorites?" not in " ".join(_widget_text(desktop.notices))
+
+    for index in range(3):
+        desktop.worker.store.add_completed_download("Ella Langley", "Hungover", f"nope-{index}.mp3", "nope", "album")
+    desktop.refresh_status()
+    desktop.update()
+    assert "Add nope to favorites?" in " ".join(_widget_text(desktop.notices))
+    assert "nope" not in desktop.worker.cfg.priority_users
+    next(button for button in _buttons(desktop.notices) if button.cget("text") == "Not now").invoke()
+    desktop.update()
+    assert "nope" not in desktop.worker.cfg.priority_users
+    desktop.refresh_status()
+    desktop.update()
+    assert "nope" not in " ".join(_widget_text(desktop.notices)).lower()
+
+
+def _widget_text(widget) -> list[str]:
+    found = []
+    for child in widget.winfo_children():
+        try:
+            found.append(str(child.cget("text")))
+        except tk.TclError:
+            pass
+        found.extend(_widget_text(child))
+    return found

@@ -145,3 +145,11 @@ check_updates = true
 theme = "dark"
 # Download all wanted asks before queueing. false skips that popup.
 confirm_download_all = true
+
+[limits]
+# Download all missing from a browsed user. A stricter number in that user's
+# profile still wins. browse_daily_files is how many files one user can finish
+# on this PC today, for browse downloads and for the worker.
+browse_max_files = 25
+browse_max_mb = 2048
+browse_daily_files = 20
