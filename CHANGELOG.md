@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here.
 
+## [1.13.0] — 2026-10-15
+
+### Added
+
+- Settings → Behavior has Search order and an Ascending / Descending toggle. The same controls sit on Status and Wanted. The choice is saved in `config.toml`.
+- The worker's next artist follows that order: artist name, missing tracks, missing albums, recently added to Lidarr, album release date, least recently tried, or Lidarr order (monitored, then recently added). Lidarr order, descending, is the default.
+- Missing tracks, ascending, finishes a small gap before an artist who is missing hundreds of files. Albums inside that artist follow the same rule, smallest gap first, and that album's songs stay with it.
+- The Wanted list uses the same order. The tag filter and artist cooldowns are unchanged.
+
 ## [1.12.0] — 2026-10-14
 
 ### Added

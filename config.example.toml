@@ -44,6 +44,11 @@ allow_single = false
 allow_bootleg = false
 # Leave blank to search every wanted artist. Otherwise only artists with this Lidarr tag.
 wanted_tag = ""
+# Who the worker searches first, and the Wanted list order.
+# lidarr, name, missing_tracks, missing_albums, added, release, tried
+search_order = "lidarr"
+# asc or desc. Missing tracks + asc finishes small gaps first.
+search_order_direction = "desc"
 # Stay on one artist, then skip them for this many days.
 focus_one_artist = true
 artist_cooldown_days = 7

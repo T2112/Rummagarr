@@ -63,7 +63,6 @@ from match import (
     AUDIO_EXT,
     QualityGate,
     album_has_tag,
-    album_priority_key,
     aliases_from_album,
     build_queries,
     build_track_queries,
@@ -76,6 +75,7 @@ from match import (
     seconds_from_lidarr,
 )
 from process_launch import run_hidden
+from search_order import album_sort_key, normalize_search_direction, normalize_search_order, order_wanted_items
 from run_summary import RunSummary
 from sharing import (
     IDLE_FLOOR_SECONDS,
@@ -1732,7 +1732,7 @@ class Worker:
             if chosen:
                 log.info("Focusing on artist: %s", chosen)
             return chosen
-        for album in sorted(missing, key=album_priority_key):
+        for album in sorted(missing, key=self._album_sort_key):
             chosen = artist_name(album)
             if self._cooled(chosen, cooldowns, now):
                 continue
@@ -1962,13 +1962,28 @@ class Worker:
         choices = self.store.wanted_choices()
         cooldowns = self.store.artist_cooldowns()
         now = datetime.now(timezone.utc)
-        for name in self.catalog.artist_labels():
+        ordered = order_wanted_items(
+            self.catalog.items(),
+            self.cfg.search_order,
+            self.cfg.search_order_direction,
+        )
+        for item in ordered:
+            if getattr(item, "kind", "") != "artist":
+                continue
+            name = item.artist
             token = self._artist_token(name)
             if token in skip or self._cooled(name, cooldowns, now):
                 continue
             if self.catalog.has_enabled_work(name, choices):
                 return name
         return None
+
+    def _album_sort_key(self, album: dict) -> tuple:
+        return album_sort_key(
+            album,
+            normalize_search_order(self.cfg.search_order),
+            normalize_search_direction(self.cfg.search_order_direction),
+        )
 
     def _next_ready_artist(self) -> str | None:
         """The next artist who has an album or track that can be searched now."""
@@ -1980,7 +1995,13 @@ class Worker:
                 datetime.now(timezone.utc) - timedelta(hours=max(0, int(self.cfg.retry_hours or 0)))
             ).isoformat()
             for _ in range(5000):
-                name = self.store.next_ready_artist(skip, tag=self.cfg.wanted_tag, retry_before=cutoff)
+                name = self.store.next_ready_artist(
+                    skip,
+                    tag=self.cfg.wanted_tag,
+                    retry_before=cutoff,
+                    order=self.cfg.search_order,
+                    direction=self.cfg.search_order_direction,
+                )
                 if not name:
                     return None
                 ready, until = self._searchable_delay(name)
@@ -2240,7 +2261,7 @@ class Worker:
                 len(catalog),
                 "end of list" if exhausted else f"next page {next_page}",
             )
-            catalog.sort(key=album_priority_key)
+            catalog.sort(key=self._album_sort_key)
             focus = self.choose_focus_artist(catalog, [])
             if not focus:
                 log.info("No artist ready (all cooled off or nothing missing)")
@@ -2268,7 +2289,7 @@ class Worker:
         tag = (self.cfg.wanted_tag or "").strip()
         cap = int(self.cfg.max_albums_per_run or 0)
         batch = []
-        for album in sorted(missing, key=album_priority_key):
+        for album in sorted(missing, key=self._album_sort_key):
             if len(batch) >= self.cfg.max_albums_per_cycle:
                 break
             if cap and self._albums_this_run + len(batch) >= cap:
@@ -2354,6 +2375,7 @@ class Worker:
             except Exception:
                 log.exception("Could not list missing tracks")
                 return
+        holes = sorted(list(holes), key=lambda hole: album_sort_key((hole or {}).get("album") if isinstance(hole, dict) else {}, self.cfg.search_order, self.cfg.search_order_direction))
         log.info("Lidarr missing tracks on partial albums: %s", len(holes))
         use_rows = self.store.wanted_catalog_ready() or len(holes) <= 2000
         choices = {} if use_rows else self.store.wanted_choices()

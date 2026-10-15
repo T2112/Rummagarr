@@ -6,6 +6,16 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from search_order import (
+    artist_display_key,
+    artist_order_sql,
+    missing_counts,
+    normalize_search_direction,
+    normalize_search_order,
+    release_text,
+    within_display_key,
+)
+
 
 # The status page can ask for up to 250 recent files, so keep at least that many.
 COMPLETED_DOWNLOAD_LIMIT = 250
@@ -170,6 +180,7 @@ class JobStore:
             (album_id, artist, title, status, detail, now),
         )
         self._db.commit()
+        self._drop_tried_display()
 
     def should_skip(self, album_id: int, retry_hours: int) -> bool:
         job = self.get(album_id)
@@ -216,6 +227,13 @@ class JobStore:
             (track_id, album_id, artist, title, status, detail, now),
         )
         self._db.commit()
+        self._drop_tried_display()
+
+    def _drop_tried_display(self) -> None:
+        """A new attempt changes who was tried least recently."""
+        current = self.get_meta("display_order") or ""
+        if current.startswith("tried|"):
+            self.set_meta("display_order", "")
 
     def get_meta(self, key: str) -> str | None:
         row = self._db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
@@ -1381,14 +1399,24 @@ class JobStore:
                 tracks.append(data)
         return tracks or None
 
-    def next_ready_artist(self, skip: set[str] | None = None, *, tag: str = "", retry_before: str = "") -> str | None:
+    def next_ready_artist(
+        self,
+        skip: set[str] | None = None,
+        *,
+        tag: str = "",
+        retry_before: str = "",
+        order: str = "lidarr",
+        direction: str = "desc",
+    ) -> str | None:
         """The first artist who can be searched now, in one query.
 
-        Monitored and recently added still come first. The skip set is cooled
-        or deferred artists. ``retry_before`` is the ISO timestamp before which
-        a failed or no-match job may be searched again.
+        ``order`` and ``direction`` choose who comes first. The skip set is
+        cooled or deferred artists. ``retry_before`` is the ISO timestamp before
+        which a failed or no-match job may be searched again. The tag filter is
+        unchanged.
         """
         self._ensure_artist_priority()
+        order_sql = artist_order_sql(order, direction)
         skip_tokens = sorted({(item or "").casefold().strip() for item in (skip or set()) if item})
         wanted_tag = (tag or "").casefold().strip()
         cutoff = retry_before or "9999"
@@ -1401,9 +1429,18 @@ class JobStore:
                     [(token,) for token in skip_tokens],
                 )
             row = self._db.execute(
-                """
+                f"""
                 SELECT a.artist
                 FROM wanted_artists a
+                LEFT JOIN (
+                    SELECT lower(artist) AS token, MAX(updated_at) AS tried
+                    FROM (
+                        SELECT artist, updated_at FROM jobs
+                        UNION ALL
+                        SELECT artist, updated_at FROM track_jobs
+                    )
+                    GROUP BY lower(artist)
+                ) tried ON tried.token = a.artist_key
                 WHERE a.disabled_children < (a.albums + a.songs)
                   AND NOT EXISTS (SELECT 1 FROM ready_skip s WHERE s.token = a.artist_key)
                   AND (
@@ -1483,10 +1520,7 @@ class JobStore:
                         AND lower(je.value) = ?
                     )
                   )
-                ORDER BY a.monitored DESC,
-                         CASE WHEN a.added = '' THEN 1 ELSE 0 END,
-                         a.added DESC,
-                         a.sort_artist
+                ORDER BY {order_sql}
                 LIMIT 1
                 """,
                 (cutoff, cutoff, wanted_tag, wanted_tag, wanted_tag),
@@ -1495,14 +1529,111 @@ class JobStore:
 
     def _ensure_artist_priority(self) -> None:
         with self._lock:
-            if self._meta_locked("artist_priority") == "1":
+            self._add_search_columns_locked()
+            if self._meta_locked("artist_priority") == "1" and self._meta_locked("artist_search_stats") == "1":
                 return
             self._refresh_artist_priority_locked()
             self._db.commit()
 
-    def _refresh_artist_priority_locked(self) -> None:
+    def _add_search_columns_locked(self) -> None:
         self._add_column("wanted_artists", "monitored", "INTEGER NOT NULL DEFAULT 1")
         self._add_column("wanted_artists", "added", "TEXT NOT NULL DEFAULT ''")
+        self._add_column("wanted_artists", "missing_tracks", "INTEGER NOT NULL DEFAULT 0")
+        self._add_column("wanted_artists", "missing_albums", "INTEGER NOT NULL DEFAULT 0")
+        self._add_column("wanted_artists", "release_min", "TEXT NOT NULL DEFAULT ''")
+        self._add_column("wanted_artists", "release_max", "TEXT NOT NULL DEFAULT ''")
+        self._add_column("wanted_rows", "sort_group", "TEXT NOT NULL DEFAULT ''")
+        self._add_column("wanted_rows", "sort_within", "TEXT NOT NULL DEFAULT ''")
+
+    def refresh_display_order(self, order: str, direction: str) -> None:
+        """Write the Wanted list sort keys for this search order."""
+        order = normalize_search_order(order)
+        direction = normalize_search_direction(direction)
+        with self._lock:
+            self._add_search_columns_locked()
+            self._refresh_artist_priority_locked()
+            tried = {
+                token: stamp or ""
+                for token, stamp in self._db.execute(
+                    """
+                    SELECT lower(artist), MAX(updated_at)
+                    FROM (
+                        SELECT artist, updated_at FROM jobs
+                        UNION ALL
+                        SELECT artist, updated_at FROM track_jobs
+                    )
+                    GROUP BY lower(artist)
+                    """
+                )
+            }
+            artists = self._db.execute(
+                """
+                SELECT artist_key, sort_artist, monitored, added, missing_tracks, missing_albums, release_min, release_max
+                FROM wanted_artists
+                """
+            ).fetchall()
+            self._db.executemany(
+                "UPDATE wanted_rows SET sort_group = ? WHERE artist_key = ?",
+                [
+                    (
+                        artist_display_key(
+                            order=order,
+                            direction=direction,
+                            name=sort_name or "",
+                            monitored=bool(monitored),
+                            added=added or "",
+                            missing_tracks=int(missing_tracks or 0),
+                            missing_albums=int(missing_albums or 0),
+                            release_min=release_min or "",
+                            release_max=release_max or "",
+                            last_tried=tried.get(token, ""),
+                        ),
+                        token,
+                    )
+                    for token, sort_name, monitored, added, missing_tracks, missing_albums, release_min, release_max in artists
+                ],
+            )
+            gaps: dict[tuple[str, str], int] = {}
+            rows = self._db.execute(
+                """
+                SELECT key, artist_key, kind, album, sort_song, payload
+                FROM wanted_rows
+                WHERE kind != 'artist'
+                """
+            ).fetchall()
+            payloads: dict[tuple[str, str], dict] = {}
+            for key, token, kind, album, sort_song, payload in rows:
+                data = _loads(payload) if kind == "album" else None
+                if kind == "album" and isinstance(data, dict):
+                    tracks, _albums = missing_counts(data)
+                    gaps[(token, (album or "").casefold())] = tracks
+                    payloads[(token, (album or "").casefold())] = data
+            updates = []
+            for key, token, kind, album, sort_song, payload in rows:
+                data = _loads(payload) if payload else None
+                album_name = album or ""
+                parent = payloads.get((token, album_name.casefold()))
+                updates.append(
+                    (
+                        within_display_key(
+                            kind=kind,
+                            album=album_name,
+                            sort_song=sort_song or "",
+                            payload=data if kind == "album" else parent,
+                            order=order,
+                            direction=direction,
+                            album_gap=gaps.get((token, album_name.casefold()), 0),
+                        ),
+                        key,
+                    )
+                )
+            self._db.executemany("UPDATE wanted_rows SET sort_within = ? WHERE key = ?", updates)
+            self._db.execute("UPDATE wanted_rows SET sort_within = '' WHERE kind = 'artist'")
+            self._set_meta_locked("display_order", f"{order}|{direction}")
+            self._db.commit()
+
+    def _refresh_artist_priority_locked(self) -> None:
+        self._add_search_columns_locked()
         self._db.execute(
             """
             UPDATE wanted_artists
@@ -1521,7 +1652,43 @@ class JobStore:
                 ), '')
             """
         )
+        self._refresh_missing_counts_locked()
         self._set_meta_locked("artist_priority", "1")
+        self._set_meta_locked("artist_search_stats", "1")
+
+    def _refresh_missing_counts_locked(self) -> None:
+        modes = self._stat_modes_locked()
+        buckets: dict[str, dict] = {}
+        for artist_key, payload, enabled, enabled_gen in self._db.execute(
+            "SELECT artist_key, payload, enabled, enabled_gen FROM wanted_rows WHERE kind = 'album'"
+        ):
+            if not _effective(enabled, enabled_gen, "album", modes):
+                continue
+            data = _loads(payload) or {}
+            tracks, albums = missing_counts(data if isinstance(data, dict) else None)
+            stamp = release_text(data if isinstance(data, dict) else None)
+            slot = buckets.setdefault(artist_key, {"tracks": 0, "albums": 0, "min": "", "max": ""})
+            slot["tracks"] += tracks
+            slot["albums"] += albums
+            if stamp and albums:
+                if not slot["min"] or stamp < slot["min"]:
+                    slot["min"] = stamp
+                if not slot["max"] or stamp > slot["max"]:
+                    slot["max"] = stamp
+        self._db.execute(
+            "UPDATE wanted_artists SET missing_tracks = 0, missing_albums = 0, release_min = '', release_max = ''"
+        )
+        self._db.executemany(
+            """
+            UPDATE wanted_artists
+            SET missing_tracks = ?, missing_albums = ?, release_min = ?, release_max = ?
+            WHERE artist_key = ?
+            """,
+            [
+                (slot["tracks"], slot["albums"], slot["min"], slot["max"], token)
+                for token, slot in buckets.items()
+            ],
+        )
 
     def block_source(self, username: str, folder: str, reason: str) -> None:
         name = (username or "").strip()
@@ -1771,6 +1938,15 @@ class JobStore:
         self._add_column("wanted_stats", "default_enabled", "INTEGER NOT NULL DEFAULT 1")
         self._add_column("wanted_artists", "monitored", "INTEGER NOT NULL DEFAULT 1")
         self._add_column("wanted_artists", "added", "TEXT NOT NULL DEFAULT ''")
+        self._add_column("wanted_artists", "missing_tracks", "INTEGER NOT NULL DEFAULT 0")
+        self._add_column("wanted_artists", "missing_albums", "INTEGER NOT NULL DEFAULT 0")
+        self._add_column("wanted_artists", "release_min", "TEXT NOT NULL DEFAULT ''")
+        self._add_column("wanted_artists", "release_max", "TEXT NOT NULL DEFAULT ''")
+        self._add_column("wanted_rows", "sort_group", "TEXT NOT NULL DEFAULT ''")
+        self._add_column("wanted_rows", "sort_within", "TEXT NOT NULL DEFAULT ''")
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_wanted_search ON wanted_rows(sort_group, sort_within, kind_rank, key)"
+        )
         self._db.commit()
 
     def _add_column(self, table: str, column: str, declaration: str) -> None:
@@ -1977,6 +2153,8 @@ class JobStore:
         self._sync_inserted = 0
         self._refresh_artist_details_locked(None)
         self._set_meta_locked("artist_priority", "0")
+        self._set_meta_locked("artist_search_stats", "0")
+        self._set_meta_locked("display_order", "")
 
     def _rebuild_stats_locked(self) -> None:
         modes = self._stat_modes_locked()
@@ -2142,6 +2320,9 @@ class JobStore:
                 "UPDATE wanted_artists SET enabled = ? WHERE artist_key = ?",
                 (enabled, token),
             )
+        if child_delta or album_delta or song_delta or artist_enabled:
+            self._set_meta_locked("artist_search_stats", "0")
+            self._set_meta_locked("display_order", "")
 
     def _stat_modes_locked(self) -> dict[str, tuple[int, int]]:
         modes: dict[str, tuple[int, int]] = {}
@@ -2298,6 +2479,8 @@ class JobStore:
 
 _ORDER_COLUMNS = {
     "default": ("sort_artist", "kind_rank", "sort_album", "sort_song", "key"),
+    # sort_within is before kind_rank so an album's songs stay under that album.
+    "search": ("sort_group", "sort_within", "kind_rank", "key"),
     "kind": ("kind", "key"),
     "artist": ("sort_artist", "key"),
     "album": ("sort_album", "key"),

@@ -44,6 +44,14 @@ from updater import (
     wait_for_worker_stop,
 )
 from match import normalize
+from search_order import (
+    SEARCH_ORDERS,
+    default_direction,
+    direction_label,
+    normalize_search_direction,
+    normalize_search_order,
+    order_label,
+)
 from sharing import group_matches
 from search_model import (
     SearchFile,
@@ -621,6 +629,7 @@ class BehaviorField:
     low: float | None = None
     high: float | None = None
     restore: bool = True
+    choices: tuple[tuple[str, str], ...] = ()
 
 
 BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
@@ -642,6 +651,22 @@ BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
         "How long to wait after one artist before starting the next artist that is ready. 0 starts that artist immediately, with no 'Waiting for retry period' notice. This is separate from Artist retry period.",
         0,
         7200,
+    ),
+    BehaviorField(
+        "search_order",
+        "Search order",
+        "choice",
+        "",
+        "Which artists the worker searches first. The Wanted list uses the same order. Missing tracks, ascending, finishes small gaps before an artist missing hundreds of files.",
+        choices=SEARCH_ORDERS,
+    ),
+    BehaviorField(
+        "search_order_direction",
+        "Search direction",
+        "choice",
+        "",
+        "Ascending is A–Z, smallest, oldest, or least recently tried. Descending is Z–A, largest, newest, or most recently tried. Lidarr order descending keeps monitored and recently added artists first.",
+        choices=(("asc", "Ascending"), ("desc", "Descending")),
     ),
     BehaviorField("convert_to_mp3", "Convert to MP3", "bool", "", "Convert FLAC and WAV to MP3 with ffmpeg before Lidarr imports them."),
     BehaviorField("convert_bitrate", "Convert bitrate", "int", "kbps", "Bitrate ffmpeg uses for the MP3.", 128, 320),
@@ -713,6 +738,8 @@ BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
 
 _PRIMARY_BEHAVIOR = frozenset(
     {
+        "search_order",
+        "search_order_direction",
         "preferred_extensions",
         "artist_cooldown_days",
         "cycle_seconds",
@@ -742,7 +769,7 @@ _RESTART_FIELDS = frozenset(
     }
 )
 _LAUNCH_FIELDS = frozenset({"start_on_launch", "check_updates"})
-_IMMEDIATE_FIELDS = frozenset({"theme", "confirm_download_all"})
+_IMMEDIATE_FIELDS = frozenset({"theme", "confirm_download_all", "search_order", "search_order_direction"})
 _SHARE_LIVE_FIELDS = frozenset(
     {
         "upload_slots",
@@ -855,6 +882,8 @@ def settings_apply_message(old: Config, new: Config) -> str:
         parts.append("Shared folders apply after Rescan, or the next time the worker logs in.")
     if changed - _RESTART_FIELDS - _LAUNCH_FIELDS - _SHARE_LIVE_FIELDS - _SHARE_RESCAN_FIELDS - _IMMEDIATE_FIELDS:
         parts.append("Search and download settings apply on the next pass.")
+    if changed & {"search_order", "search_order_direction"}:
+        parts.append("Search order applies to the next artist and the Wanted list.")
     if changed & _LAUNCH_FIELDS:
         parts.append("The update check and start-on-launch apply the next time the app opens.")
     return " ".join(parts)
@@ -912,6 +941,7 @@ class SettingsForm(ttk.Frame):
             self.history_var = None
         self.theme_var = tk.StringVar(value=normalize_theme(getattr(source, "theme", "dark")))
         self.message_var = tk.StringVar(value="")
+        self._choice_display: dict[str, tk.StringVar] = {}
         self._behavior_canvas: tk.Canvas | None = None
         paths = []
         if source.share_dir:
@@ -934,6 +964,12 @@ class SettingsForm(ttk.Frame):
             return tk.StringVar(value=text)
         if spec.kind in {"int", "float"}:
             return tk.StringVar(value=_display_number(value))
+        if spec.kind == "choice":
+            if spec.key == "search_order":
+                return tk.StringVar(value=normalize_search_order(value))
+            if spec.key == "search_order_direction":
+                return tk.StringVar(value=normalize_search_direction(value))
+            return tk.StringVar(value="" if value is None else str(value))
         return tk.StringVar(value="" if value is None else str(value))
 
     def _set_field(self, spec: BehaviorField, value) -> None:
@@ -949,6 +985,16 @@ class SettingsForm(ttk.Frame):
             return
         if spec.kind in {"int", "float"}:
             variable.set(_display_number(value))
+            return
+        if spec.kind == "choice":
+            key = normalize_search_order(value) if spec.key == "search_order" else str(value or "")
+            if spec.key == "search_order_direction":
+                key = normalize_search_direction(value)
+            variable.set(key)
+            labels = dict(spec.choices)
+            display = getattr(self, "_choice_display", {}).get(spec.key)
+            if display is not None:
+                display.set(labels.get(key, key))
             return
         variable.set("" if value is None else str(value))
 
@@ -1360,7 +1406,27 @@ class SettingsForm(ttk.Frame):
         threading.Thread(target=work, name="share-rescan", daemon=True).start()
 
     def _behavior_row(self, parent: ttk.Frame, row: int, spec: BehaviorField) -> None:
-        if spec.kind == "bool":
+        if spec.kind == "choice":
+            ttk.Label(parent, text=spec.label).grid(row=row, column=0, sticky="w", pady=(8, 0), padx=(0, 12))
+            labels = {key: label for key, label in spec.choices}
+            reverse = {label: key for key, label in spec.choices}
+            current = str(self.fields[spec.key].get())
+            display = tk.StringVar(value=labels.get(current, current))
+            self._choice_display[spec.key] = display
+            box = ttk.Combobox(parent, textvariable=display, values=[label for _key, label in spec.choices], state="readonly", width=28)
+
+            def choose(_event=None, spec=spec, display=display, reverse=reverse) -> None:
+                self.fields[spec.key].set(reverse.get(display.get(), self.fields[spec.key].get()))
+                if spec.key == "search_order":
+                    direction = default_direction(self.fields["search_order"].get())
+                    self._set_field(
+                        next(item for item in BEHAVIOR_FIELDS if item.key == "search_order_direction"),
+                        direction,
+                    )
+
+            box.bind("<<ComboboxSelected>>", choose)
+            box.grid(row=row, column=1, sticky="w", pady=(8, 0))
+        elif spec.kind == "bool":
             ttk.Checkbutton(parent, text=spec.label, variable=self.fields[spec.key]).grid(
                 row=row, column=0, columnspan=3, sticky="w", pady=(8, 0)
             )
@@ -1464,6 +1530,10 @@ class SettingsForm(ttk.Frame):
                 values[spec.key] = bool(self.fields[spec.key].get())
             elif spec.kind in {"int", "float"}:
                 values[spec.key] = self._bounded_number(spec)
+            elif spec.key == "search_order":
+                values[spec.key] = normalize_search_order(self.fields[spec.key].get())
+            elif spec.key == "search_order_direction":
+                values[spec.key] = normalize_search_direction(self.fields[spec.key].get())
             elif spec.key == "preferred_extensions":
                 parts = [part.strip().lower().lstrip(".") for part in str(self.fields[spec.key].get()).split(",")]
                 parts = [part for part in parts if part]
@@ -2175,6 +2245,73 @@ class DesktopApp(tk.Tk):
                 anchor="w", pady=(self.px(4), 0)
             )
 
+    def _ensure_order_vars(self) -> None:
+        if getattr(self, "search_order_label_var", None) is not None:
+            return
+        cfg = self.worker.cfg
+        self.search_order_label_var = tk.StringVar(value=order_label(cfg.search_order))
+        self.search_direction_label_var = tk.StringVar(value=direction_label(cfg.search_order_direction))
+
+    def _pack_search_order(self, parent: ttk.Frame) -> None:
+        """The same Search order control on Status and Wanted."""
+        self._ensure_order_vars()
+        row = ttk.Frame(parent, style="Main.TFrame")
+        row.pack(fill="x", pady=(self.px(8), 0))
+        ttk.Label(row, text="Search order", style="Muted.TLabel").pack(side="left")
+        order = ttk.Combobox(
+            row,
+            textvariable=self.search_order_label_var,
+            values=[label for _key, label in SEARCH_ORDERS],
+            state="readonly",
+            width=24,
+        )
+        order.pack(side="left", padx=(self.px(8), 0))
+        direction = ttk.Combobox(
+            row,
+            textvariable=self.search_direction_label_var,
+            values=["Ascending", "Descending"],
+            state="readonly",
+            width=14,
+        )
+        direction.pack(side="left", padx=(self.px(8), 0))
+        order.bind("<<ComboboxSelected>>", self._on_search_order_picked)
+        direction.bind("<<ComboboxSelected>>", self._on_search_order_picked)
+
+    def _sync_order_boxes(self) -> None:
+        self._ensure_order_vars()
+        cfg = self.worker.cfg
+        self.search_order_label_var.set(order_label(cfg.search_order))
+        self.search_direction_label_var.set(direction_label(cfg.search_order_direction))
+
+    def _on_search_order_picked(self, _event=None) -> None:
+        order = normalize_search_order(self.search_order_label_var.get())
+        previous = normalize_search_order(self.worker.cfg.search_order)
+        if order != previous:
+            direction = default_direction(order)
+            self.search_direction_label_var.set(direction_label(direction))
+        else:
+            direction = normalize_search_direction(self.search_direction_label_var.get())
+        self._save_search_order(order, direction)
+
+    def _save_search_order(self, order: str, direction: str) -> None:
+        order = normalize_search_order(order)
+        direction = normalize_search_direction(direction)
+        self.worker.cfg = replace(self.worker.cfg, search_order=order, search_order_direction=direction)
+        try:
+            save_config(self.config_path, self.worker.cfg)
+        except OSError:
+            log.exception("Could not save the search order")
+        self.worker.store.refresh_display_order(order, direction)
+        self._wanted_sort = None
+        form = getattr(self, "_settings_form", None)
+        if form is not None:
+            form._set_field(next(spec for spec in BEHAVIOR_FIELDS if spec.key == "search_order"), order)
+            form._set_field(next(spec for spec in BEHAVIOR_FIELDS if spec.key == "search_order_direction"), direction)
+            form.base = self.worker.cfg
+        self._sync_order_boxes()
+        if getattr(self, "wanted", None) is not None:
+            self.refresh_wanted()
+
     def _ensure_settings(self) -> None:
         if self._settings_form is not None:
             return
@@ -2186,6 +2323,11 @@ class DesktopApp(tk.Tk):
             baseline["cfg"] = cfg
             self._settings_baseline = baseline
             self.worker.cfg = cfg
+            self.worker.store.refresh_display_order(cfg.search_order, cfg.search_order_direction)
+            self._wanted_sort = None
+            self._sync_order_boxes()
+            if getattr(self, "wanted", None) is not None:
+                self.refresh_wanted()
             self.worker.apply_share_settings(scan=False)
             saved_limit = self.worker.store.get_meta("gui_recent_limit")
             if saved_limit:
@@ -2295,6 +2437,7 @@ class DesktopApp(tk.Tk):
         self.summary_var = tk.StringVar(value="")
         self.summary_line = ttk.Label(parent, textvariable=self.summary_var, style="Muted.TLabel")
         self.summary_line.pack(fill="x", pady=(self.px(2), 0))
+        self._pack_search_order(parent)
         self.auto_import_var = tk.BooleanVar(value=bool(self.worker.cfg.auto_import_after_artist))
         self.auto_import = ttk.Checkbutton(
             parent,
@@ -2377,6 +2520,7 @@ class DesktopApp(tk.Tk):
         toolbar.pack(fill="x", pady=(self.px(14), self.px(8)))
         self.sync_button = ttk.Button(toolbar, text="Sync", style="Start.TButton", command=self.on_sync)
         self.sync_button.pack(side="left")
+        self._pack_search_order(toolbar)
         ttk.Label(toolbar, text="View", style="Muted.TLabel").pack(side="left", padx=(self.px(14), self.px(6)))
         segments = tk.Frame(toolbar, highlightthickness=1, bd=0)
         segments._chrome_role = "field"
@@ -2832,6 +2976,10 @@ class DesktopApp(tk.Tk):
         folded = normalize(self.search_var.get() or "")
         if folded:
             visible = [item for item in visible if folded in normalize(item.artist or "")]
+        if not self._wanted_sort:
+            from search_order import order_wanted_items
+
+            return order_wanted_items(visible, self.worker.cfg.search_order, self.worker.cfg.search_order_direction)
         if self._wanted_sort:
             column, reverse = self._wanted_sort
             visible = sort_items(visible, column, reverse)
@@ -2996,7 +3144,7 @@ class DesktopApp(tk.Tk):
         self._sql_mode = True
         kinds = self._view_kinds()
         search = self.search_var.get()
-        order = "default"
+        order = "search"
         reverse = False
         if self._wanted_sort:
             order, reverse = self._wanted_sort
@@ -4003,6 +4151,14 @@ class DesktopApp(tk.Tk):
 
     def refresh_wanted(self) -> None:
         if self.worker.store.wanted_catalog_ready():
+            if not self._wanted_sort:
+                cfg = self.worker.cfg
+                wanted = (
+                    f"{normalize_search_order(cfg.search_order)}|"
+                    f"{normalize_search_direction(cfg.search_order_direction)}"
+                )
+                if self.worker.store.get_meta("display_order") != wanted:
+                    self.worker.store.refresh_display_order(cfg.search_order, cfg.search_order_direction)
             self._refresh_wanted_sql()
             return
         self._sql_mode = False
