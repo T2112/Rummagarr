@@ -35,6 +35,7 @@ from activity import Step, describe_step, format_elapsed, step_from_legacy
 from audio_check import folder_fake_reason
 from audio_tags import tag_album_folder
 from config_loader import Config
+from favorites import GOOD_USER_MINIMUM, daily_room
 from control import WorkerControl
 from library_report import merge_upgrade_albums, upgrade_artist
 from bridge_net import advertise_host, host_for_url, is_loopback_bind, mapped_folder, reported_root
@@ -1501,6 +1502,7 @@ class Worker:
 
     def remember_completed(self, transfers, artist: str, title: str, kind: str) -> None:
         seen: set[int] = getattr(self, "_remembered_ids", set())
+        fresh: list[str] = []
         for transfer in transfers:
             if state_name(transfer) != "COMPLETE":
                 continue
@@ -1515,7 +1517,29 @@ class Worker:
                 transfer_username(transfer),
                 kind,
             )
+            fresh.append(transfer_username(transfer))
         self._remembered_ids = seen
+        if fresh:
+            self._count_finished(fresh)
+
+    def _count_finished(self, usernames: list[str]) -> None:
+        """One finished file counts toward today's cap and a favorite suggestion."""
+        folded: dict[str, tuple[str, int]] = {}
+        for name in usernames:
+            text = (name or "").strip()
+            if not text:
+                continue
+            key = text.lower()
+            shown, count = folded.get(key, (text, 0))
+            folded[key] = (shown, count + 1)
+        favorites = {item.lower() for item in (self.cfg.priority_users or set())}
+        for shown, count in folded.values():
+            self.store.add_user_day(shown, count)
+            self.store.note_good_user(shown, favorites, GOOD_USER_MINIMUM)
+
+    def _past_daily_cap(self, username: str) -> bool:
+        cap = max(0, int(getattr(self.cfg, "browse_daily_files", 20) or 0))
+        return daily_room(self.store.user_day_files(username), cap) <= 0
 
     async def cancel_downloads(self, all_items: bool = False, index: int | None = None) -> None:
         self.cancel_requested = True
@@ -3056,6 +3080,7 @@ class Worker:
             return False
         tried: set[tuple[str, str]] = set()
         last = "no folder passed filters"
+        capped_name = ""
         for _attempt in range(max(1, _DOWNLOAD_ATTEMPTS)):
             best = None
             for item in sorted(candidates, key=lambda row: row.score, reverse=True):
@@ -3063,9 +3088,15 @@ class Worker:
                 pair = (user, item.remote_dir or "")
                 if user in rejected or pair in tried or self.store.source_blocked(item.username, item.remote_dir):
                     continue
+                if self._past_daily_cap(item.username):
+                    capped_name = item.username or user
+                    continue
                 best = item
                 break
             if best is None:
+                if capped_name and not tried:
+                    last = f"The daily cap for {capped_name} is already used."
+                    self.store.add_event("daily", f"Daily cap for {capped_name}", last, capped_name)
                 break
             tried.add(((best.username or "").lower(), best.remote_dir or ""))
             outcome, last = await self._download_one(best, album, key, album_id, artist, title, year, needed_tracks)
@@ -3953,6 +3984,16 @@ class Worker:
         if getattr(self, "_paced_busy", False):
             return "A download from a browsed user is already running."
         username = str(specs[0].get("username") or "")
+        cap = max(0, int(getattr(self.cfg, "browse_daily_files", 20) or 0))
+        room = daily_room(self.store.user_day_files(username), cap)
+        if room <= 0:
+            used = self.store.user_day_files(username)
+            detail = f"The daily cap for {username} is already used ({used} of {cap})."
+            self.store.add_event("daily", f"Daily cap for {username}", detail, username)
+            self.store.set_meta("last_browse_download", detail)
+            return detail
+        if len(specs) > room:
+            specs = list(specs[:room])
         if self.cfg.dry_run:
             detail = f"dry run: would grab {len(specs)} file(s) from {username}, {max(1, int(files_at_once or 1))} at a time"
             self.store.note_dry_run(detail)
@@ -4033,6 +4074,7 @@ class Worker:
             self.maybe_auto_import()
             detail = f"Downloaded {done} of {len(specs)} file(s) from {username}, {width} at a time, {pause}s apart."
             self.store.set_meta("last_browse_download", detail)
+            self.store.add_event("browse", detail, detail, username)
             log.info(detail)
             return detail
         finally:

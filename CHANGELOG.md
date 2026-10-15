@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [1.17.0] — 2026-10-15
+
+### Added
+
+- The download limits window saves three numbers on this PC: max files, total size, and how many files one user can finish per day. A stricter number in that user's profile still wins. When today's cap for that user is already used, nothing else is queued from them. The worker skips that user for the rest of the day and does not add them to the blocklist.
+- A user who has finished 3 downloads is suggested as a favorite on Status. Add puts them in Priority users. Not now leaves them off and does not ask again. A favorite is never added on its own.
+- Status lists those notices: a favorite suggestion, a daily cap, and a finished browse download.
+
 ## [1.16.0] — 2026-10-15
 
 ### Added

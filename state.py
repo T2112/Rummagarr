@@ -6,6 +6,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from favorites import GOOD_USER_MINIMUM, favorite_title, should_suggest
 from search_order import (
     artist_display_key,
     artist_order_sql,
@@ -137,6 +138,31 @@ class JobStore:
                 size INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 finished_at TEXT NOT NULL
+            )
+            """
+        )
+        self._db.commit()
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_days (
+                username TEXT NOT NULL,
+                day TEXT NOT NULL,
+                files INTEGER NOT NULL,
+                PRIMARY KEY (username, day)
+            )
+            """
+        )
+        self._db.commit()
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                username TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                seen INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -528,6 +554,173 @@ class JobStore:
             "download_total": int(total[0] or 0),
             "by_user": [(str(name or ""), int(count)) for name, count in users],
         }
+
+    def add_user_day(self, username: str, files: int = 1) -> None:
+        """Count finished files for this user on the local calendar day."""
+        name = (username or "").strip().lower()
+        count = int(files or 0)
+        if not name or count <= 0:
+            return
+        day = datetime.now().astimezone().date().isoformat()
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO user_days(username, day, files) VALUES(?, ?, ?)
+                ON CONFLICT(username, day) DO UPDATE SET files = files + excluded.files
+                """,
+                (name, day, count),
+            )
+            self._db.commit()
+
+    def user_day_files(self, username: str) -> int:
+        name = (username or "").strip().lower()
+        if not name:
+            return 0
+        day = datetime.now().astimezone().date().isoformat()
+        with self._lock:
+            row = self._db.execute(
+                "SELECT files FROM user_days WHERE username = ? AND day = ?",
+                (name, day),
+            ).fetchone()
+        return int(row[0] or 0) if row else 0
+
+    def download_count(self, username: str) -> int:
+        name = (username or "").strip().lower()
+        if not name:
+            return 0
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COUNT(*) FROM completed_downloads WHERE lower(username) = ?",
+                (name,),
+            ).fetchone()
+        return int(row[0] or 0)
+
+    def add_event(self, kind: str, title: str, body: str = "", username: str = "") -> None:
+        """Record a notice. An unseen notice with the same title is kept as-is."""
+        title = (title or "").strip()
+        if not title:
+            return
+        kind = (kind or "note").strip() or "note"
+        user = (username or "").strip().lower()
+        with self._lock:
+            if user:
+                existing = self._db.execute(
+                    """
+                    SELECT 1 FROM events
+                    WHERE seen = 0 AND kind = ? AND username = ?
+                    LIMIT 1
+                    """,
+                    (kind, user),
+                ).fetchone()
+            else:
+                existing = None
+            if existing is None:
+                existing = self._db.execute(
+                    "SELECT 1 FROM events WHERE seen = 0 AND title = ? LIMIT 1",
+                    (title,),
+                ).fetchone()
+            if existing:
+                return
+            now = datetime.now(timezone.utc).isoformat()
+            self._db.execute(
+                """
+                INSERT INTO events(kind, title, body, username, created_at, seen)
+                VALUES(?, ?, ?, ?, ?, 0)
+                """,
+                (kind, title, body or "", user, now),
+            )
+            self._db.commit()
+
+    def recent_events(self, limit: int = 8) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT id, kind, title, body, username, created_at
+                FROM events
+                WHERE seen = 0
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        keys = ("id", "kind", "title", "body", "username", "created_at")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def dismiss_event(self, event_id: int) -> None:
+        with self._lock:
+            self._db.execute("UPDATE events SET seen = 1 WHERE id = ?", (int(event_id),))
+            self._db.commit()
+
+    def dismiss_user_events(self, username: str, kind: str = "") -> None:
+        user = (username or "").strip().lower()
+        if not user:
+            return
+        with self._lock:
+            if kind:
+                self._db.execute(
+                    "UPDATE events SET seen = 1 WHERE seen = 0 AND username = ? AND kind = ?",
+                    (user, kind),
+                )
+            else:
+                self._db.execute(
+                    "UPDATE events SET seen = 1 WHERE seen = 0 AND username = ?",
+                    (user,),
+                )
+            self._db.commit()
+
+    def dismissed_favorites(self) -> set[str]:
+        raw = self.get_meta("dismissed_favorites") or "[]"
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return set()
+        if not isinstance(data, list):
+            return set()
+        return {str(item).strip().lower() for item in data if str(item).strip()}
+
+    def dismiss_favorite(self, username: str) -> None:
+        """Remember Not now. This user is not suggested again."""
+        name = (username or "").strip().lower()
+        if not name:
+            return
+        current = self.dismissed_favorites()
+        current.add(name)
+        self.set_meta("dismissed_favorites", json.dumps(sorted(current)))
+        self.dismiss_user_events(name, "favorite")
+
+    def note_good_user(self, username: str, favorites: set[str], minimum: int | None = None) -> None:
+        """Suggest a favorite after enough finished files. Never edits the favorite list."""
+        name = (username or "").strip()
+        if not name:
+            return
+        floor = GOOD_USER_MINIMUM if minimum is None else int(minimum)
+        count = self.download_count(name)
+        if not should_suggest(name, count, favorites, self.dismissed_favorites(), floor):
+            return
+        self.add_event(
+            "favorite",
+            favorite_title(name),
+            (
+                f"{name} has finished {count} downloads. "
+                "Add puts them in Priority users. Nothing is added until you choose Add."
+            ),
+            name,
+        )
+
+    def suggest_from_history(self, favorites: set[str], minimum: int | None = None) -> None:
+        floor = GOOD_USER_MINIMUM if minimum is None else int(minimum)
+        with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT username, COUNT(*)
+                FROM completed_downloads
+                WHERE trim(username) != ''
+                GROUP BY lower(username)
+                """
+            ).fetchall()
+        for username, count in rows:
+            if int(count or 0) >= floor:
+                self.note_good_user(str(username or ""), favorites, floor)
 
     def wanted_tracks_for(self, names: list[str], folds: list[str]) -> list[dict]:
         """Enabled album and song rows for these artists only.

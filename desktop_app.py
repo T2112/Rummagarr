@@ -52,6 +52,7 @@ from library_report import (
 from lidarr_client import LidarrClient
 from lidarr_register import LidarrRegisterError, register_with_lidarr
 from notifications import deliver
+from favorites import daily_room
 from peer_limits import apply_limits, select_under_cap, share_file_rows
 from stats_report import format_stats
 from backup_data import create_backup, restore_backup
@@ -3319,6 +3320,8 @@ class DesktopApp(tk.Tk):
         self.summary_var = tk.StringVar(value="")
         self.summary_line = ttk.Label(parent, textvariable=self.summary_var, style="Muted.TLabel")
         self.summary_line.pack(fill="x", pady=(self.px(2), 0))
+        self.notices = ttk.Frame(parent, style="Main.TFrame")
+        self.notices.pack(fill="x", pady=(self.px(4), 0))
         self._pack_search_order(parent)
         self.auto_import_var = tk.BooleanVar(value=bool(self.worker.cfg.auto_import_after_artist))
         self.auto_import = ttk.Checkbutton(
@@ -3607,6 +3610,7 @@ class DesktopApp(tk.Tk):
             self.notice_var.set("ffmpeg was not found. Lossless files cannot be converted until it is installed.")
         self._fill_transfers(snapshot.get("transfers") or [])
         self._fill_recent(snapshot.get("recent") or [], limit)
+        self.refresh_notices()
 
     def _fill_transfers(self, transfers: list[dict]) -> None:
         yview = self.transfers.yview()
@@ -4260,12 +4264,129 @@ class DesktopApp(tk.Tk):
         else:
             self.browse_status.set(f"Browsed {username}. Saved {when}.")
 
-    def download_browse_missing(self) -> None:
-        payload = getattr(self, "_browse_payload", None)
-        username = self.browse_user_var.get().strip()
-        if not payload or not username:
-            self.browse_status.set("Browse a user first.")
+    def refresh_notices(self) -> None:
+        frame = getattr(self, "notices", None)
+        if frame is None:
             return
+        try:
+            self.worker.store.suggest_from_history(set(self.worker.cfg.priority_users))
+            events = self.worker.store.recent_events(8)
+        except Exception:
+            log.exception("Could not load notices")
+            return
+        signature = tuple(
+            (event["id"], event["kind"], event["title"], event["body"], event["username"]) for event in events
+        )
+        if signature == getattr(self, "_notice_signature", None):
+            return
+        self._notice_signature = signature
+        for child in list(frame.winfo_children()):
+            child.destroy()
+        for event in events:
+            row = ttk.Frame(frame, style="Main.TFrame")
+            row.pack(fill="x", pady=(0, self.px(4)))
+            text = str(event.get("title") or "")
+            body = str(event.get("body") or "").strip()
+            if body and body != text:
+                text = f"{text} {body}"
+            ttk.Label(
+                row,
+                text=text,
+                style="Muted.TLabel",
+                wraplength=self.px(820),
+                justify="left",
+            ).pack(side="left", fill="x", expand=True)
+            kind = str(event.get("kind") or "")
+            user = str(event.get("username") or "")
+            if kind == "favorite" and user:
+                ttk.Button(
+                    row,
+                    text="Not now",
+                    command=lambda user=user: self.dismiss_suggested_favorite(user),
+                ).pack(side="right")
+                ttk.Button(
+                    row,
+                    text="Add",
+                    command=lambda user=user: self.add_suggested_favorite(user),
+                ).pack(side="right", padx=(0, self.px(6)))
+            else:
+                event_id = int(event["id"])
+                ttk.Button(
+                    row,
+                    text="Dismiss",
+                    command=lambda event_id=event_id: self._dismiss_notice(event_id),
+                ).pack(side="right")
+
+    def _dismiss_notice(self, event_id: int) -> None:
+        self.worker.store.dismiss_event(event_id)
+        self.refresh_notices()
+
+    def add_suggested_favorite(self, username: str) -> None:
+        """Priority users is the favorite list. Add is the only way in."""
+        name = (username or "").strip().lower()
+        if not name:
+            return
+        names = {item.strip().lower() for item in self.worker.cfg.priority_users if str(item).strip()}
+        names.add(name)
+        cfg = replace(self.worker.cfg, priority_users=names)
+        self.worker.cfg = cfg
+        save_config(self.config_path, cfg)
+        form = getattr(self, "_settings_form", None)
+        if form is not None and "priority_users" in form.fields:
+            form.fields["priority_users"].set(", ".join(sorted(names)))
+            form.base = cfg
+        if self._settings_baseline is not None:
+            self._settings_baseline["cfg"] = replace(self._settings_baseline["cfg"], priority_users=set(names))
+        self.worker.store.dismiss_user_events(name, "favorite")
+        self.refresh_notices()
+
+    def dismiss_suggested_favorite(self, username: str) -> None:
+        self.worker.store.dismiss_favorite(username)
+        self.refresh_notices()
+
+    def _saved_browse_caps(self) -> tuple[int, int, int]:
+        cfg = self.worker.cfg
+        return (
+            max(1, int(getattr(cfg, "browse_max_files", 25) or 25)),
+            max(1, int(getattr(cfg, "browse_max_mb", 2048) or 2048)),
+            max(1, int(getattr(cfg, "browse_daily_files", 20) or 20)),
+        )
+
+    def _typed_cap(self, variable: tk.Variable, fallback: int) -> int:
+        try:
+            value = int(str(variable.get()).strip())
+        except (TypeError, ValueError):
+            return max(1, int(fallback))
+        return max(1, value)
+
+    def _commit_browse_limits(self) -> tuple[int, int, int]:
+        saved = self._saved_browse_caps()
+        files = self._typed_cap(self._limits_files, saved[0])
+        mb = self._typed_cap(self._limits_mb, saved[1])
+        daily = self._typed_cap(self._limits_daily, saved[2])
+        cfg = replace(
+            self.worker.cfg,
+            browse_max_files=files,
+            browse_max_mb=mb,
+            browse_daily_files=daily,
+        )
+        self.worker.cfg = cfg
+        save_config(self.config_path, cfg)
+        form = getattr(self, "_settings_form", None)
+        if form is not None:
+            form.base = cfg
+        if self._settings_baseline is not None:
+            self._settings_baseline["cfg"] = replace(
+                self._settings_baseline["cfg"],
+                browse_max_files=files,
+                browse_max_mb=mb,
+                browse_daily_files=daily,
+            )
+        return files, mb, daily
+
+    def _browse_download_plan(self, our_files: int, our_mb: int, daily: int):
+        payload = getattr(self, "_browse_payload", None) or {}
+        username = self.browse_user_var.get().strip()
         profile = payload.get("profile") or {}
         description = str(profile.get("description") or "")
         try:
@@ -4276,60 +4397,134 @@ class DesktopApp(tk.Tk):
             queue_length = int(profile.get("queue_length") or 0)
         except (TypeError, ValueError):
             queue_length = 0
-        cfg = self.worker.cfg
         limits = apply_limits(
             description,
             permission=permission,
             queue_length=queue_length,
-            our_files=int(cfg.max_queued_files_per_user or 1),
-            our_mb=int(cfg.max_queued_mb_per_user or 1),
+            our_files=max(1, int(our_files)),
+            our_mb=max(1, int(our_mb)),
         )
+        daily_cap = max(1, int(daily))
+        used = self.worker.store.user_day_files(username)
+        room = daily_room(used, daily_cap)
+        lines = list(limits.lines)
+        lines.append(f"Used today: {used} of {daily_cap}.")
         rows = share_file_rows(username, payload.get("directories") or [])
         matches = self.worker.match_user_files(rows) if rows else []
-        chosen, skipped = select_under_cap(
-            matches,
-            max_files=limits.max_files,
-            max_bytes=limits.max_mb * 1024 * 1024,
-        )
-        lines = list(limits.lines)
-        if limits.allowed:
+        chosen: list = []
+        skipped = 0
+        if limits.allowed and room <= 0:
+            lines.append(f"The daily cap for {username} is already used.")
+            skipped = len(matches)
+        elif limits.allowed:
+            file_cap = min(limits.max_files, room)
+            chosen, skipped = select_under_cap(
+                matches,
+                max_files=file_cap,
+                max_bytes=limits.max_mb * 1024 * 1024,
+            )
+            if file_cap < limits.max_files:
+                lines.append(f"{file_cap} files left today for {username}.")
             lines.append("")
             lines.append(f"{len(chosen)} missing file(s) will be queued from {username}.")
             if skipped:
                 lines.append(f"{skipped} more match, and stay out because of the cap.")
             if not chosen:
                 lines.append("Nothing in this share matches the wanted list.")
-        self._show_limits(username, lines, limits, chosen)
+        return limits, chosen, lines
 
-    def _show_limits(self, username: str, lines: list[str], limits, chosen: list) -> None:
+    def _set_limits_text(self, lines: list[str]) -> None:
+        box = self._limits_text
+        box.configure(state="normal")
+        box.delete("1.0", "end")
+        box.insert("1.0", "\n".join(lines))
+        box.configure(state="disabled")
+
+    def _set_download_button(self, show: bool) -> None:
+        current = getattr(self, "_limits_download_btn", None)
+        if current is not None:
+            current.destroy()
+            self._limits_download_btn = None
+        if not show:
+            return
+        button = ttk.Button(self._limits_download_slot, text="Download", command=self._download_from_limits)
+        button.pack(side="left")
+        self._limits_download_btn = button
+
+    def _save_limits_from_window(self) -> None:
+        files, mb, daily = self._commit_browse_limits()
+        _limits, chosen, lines = self._browse_download_plan(files, mb, daily)
+        self._set_limits_text(lines)
+        allowed = _limits.allowed and bool(chosen)
+        self._set_download_button(allowed)
+
+    def _download_from_limits(self) -> None:
+        files, mb, daily = self._commit_browse_limits()
+        limits, chosen, lines = self._browse_download_plan(files, mb, daily)
+        if not limits.allowed or not chosen:
+            self._set_limits_text(lines)
+            self._set_download_button(False)
+            return
+        window = getattr(self, "_limits_window", None)
+        if window is not None:
+            window.destroy()
+        self._start_browse_download(chosen, limits)
+
+    def download_browse_missing(self) -> None:
+        payload = getattr(self, "_browse_payload", None)
+        username = self.browse_user_var.get().strip()
+        if not payload or not username:
+            self.browse_status.set("Browse a user first.")
+            return
+        self._show_limits(username)
+
+    def _show_limits(self, username: str) -> None:
         existing = getattr(self, "_limits_window", None)
         if existing is not None:
             try:
                 existing.destroy()
             except tk.TclError:
                 pass
+        files, mb, daily = self._saved_browse_caps()
+        self._limits_files = tk.StringVar(value=str(files))
+        self._limits_mb = tk.StringVar(value=str(mb))
+        self._limits_daily = tk.StringVar(value=str(daily))
+        limits, chosen, lines = self._browse_download_plan(files, mb, daily)
         window = tk.Toplevel(self)
         window.title("Download limits")
         window.transient(self)
-        window.geometry(f"{self.px(560)}x{self.px(420)}")
+        window.geometry(f"{self.px(560)}x{self.px(560)}")
         frame = ttk.Frame(window, padding=16)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text=username, style="PageTitle.TLabel").pack(anchor="w")
-        box = tk.Text(frame, wrap="word", height=14, bd=0, highlightthickness=0)
+        box = tk.Text(frame, wrap="word", height=12, bd=0, highlightthickness=0)
         box.pack(fill="both", expand=True, pady=(8, 8))
-        box.insert("1.0", "\n".join(lines))
-        box.configure(state="disabled")
         self._limits_text = box
+        self._set_limits_text(lines)
+        form = ttk.Frame(frame)
+        form.pack(fill="x", pady=(0, 8))
+        ttk.Label(
+            form,
+            text="Saved on this PC. A stricter number in their profile still wins.",
+            style="Muted.TLabel",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        fields = (
+            (1, "Max files", self._limits_files),
+            (2, "Total size (MB)", self._limits_mb),
+            (3, "Files per user per day", self._limits_daily),
+        )
+        for row, label, variable in fields:
+            ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Entry(form, textvariable=variable, width=10).grid(row=row, column=1, sticky="w", pady=2)
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x")
-
-        def start() -> None:
-            window.destroy()
-            self._start_browse_download(chosen, limits)
-
-        if limits.allowed and chosen:
-            ttk.Button(buttons, text="Download", command=start).pack(side="left")
+        self._limits_buttons = buttons
+        self._limits_download_slot = ttk.Frame(buttons)
+        self._limits_download_slot.pack(side="left")
+        self._limits_download_btn = None
+        ttk.Button(buttons, text="Save limits", command=self._save_limits_from_window).pack(side="left", padx=(8, 0))
         ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
+        self._set_download_button(limits.allowed and bool(chosen))
         self._limits_window = window
 
     def _start_browse_download(self, chosen: list, limits) -> None:
@@ -4365,7 +4560,12 @@ class DesktopApp(tk.Tk):
                 text = future.result(timeout=max(60, limits.pace_seconds * max(1, len(specs)) + 120))
             except Exception as exc:
                 text = str(exc).strip() or "Download failed."
-            self._post(lambda text=text: self.browse_status.set(text))
+
+            def apply(text=text) -> None:
+                self.browse_status.set(text)
+                self.refresh_notices()
+
+            self._post(apply)
 
         threading.Thread(target=done, name="browse-missing", daemon=True).start()
 

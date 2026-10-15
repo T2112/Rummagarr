@@ -108,6 +108,9 @@ class Config:
     plex_section: str = ""
     jellyfin_url: str = ""
     jellyfin_api_key: str = ""
+    browse_max_files: int = 25
+    browse_max_mb: int = 2048
+    browse_daily_files: int = 20
 
 
 def normalize_theme(value) -> str:
@@ -333,6 +336,9 @@ def default_config(**overrides) -> Config:
         plex_section=str(overrides.pop("plex_section", "")),
         jellyfin_url=str(overrides.pop("jellyfin_url", "")),
         jellyfin_api_key=str(overrides.pop("jellyfin_api_key", "")),
+        browse_max_files=max(1, int(overrides.pop("browse_max_files", 25) or 25)),
+        browse_max_mb=max(1, int(overrides.pop("browse_max_mb", 2048) or 2048)),
+        browse_daily_files=max(1, int(overrides.pop("browse_daily_files", 20) or 20)),
     )
     if overrides:
         cfg = replace(cfg, **overrides)
@@ -508,6 +514,11 @@ def save_config(path: Path, cfg: Config) -> None:
             f"theme = {_toml_str(normalize_theme(cfg.theme))}",
             f"confirm_download_all = {_toml_bool(cfg.confirm_download_all)}",
             "",
+            "[limits]",
+            f"browse_max_files = {int(cfg.browse_max_files)}",
+            f"browse_max_mb = {int(cfg.browse_max_mb)}",
+            f"browse_daily_files = {int(cfg.browse_daily_files)}",
+            "",
         ]
     )
     extra = []
@@ -562,6 +573,7 @@ def try_load_config(path: Path) -> Config:
     ui = raw.get("ui", {})
     bridge = raw.get("bridge", {})
     notify = raw.get("notify", {})
+    limits = raw.get("limits", {})
 
     base = path.parent
     download_dir = Path(paths["download_dir"])
@@ -672,4 +684,7 @@ def try_load_config(path: Path) -> Config:
         plex_section=str(notify.get("plex_section", "") or ""),
         jellyfin_url=str(notify.get("jellyfin_url", "") or ""),
         jellyfin_api_key=str(notify.get("jellyfin_api_key", "") or ""),
+        browse_max_files=max(1, int(limits.get("browse_max_files", 25) or 25)),
+        browse_max_mb=max(1, int(limits.get("browse_max_mb", 2048) or 2048)),
+        browse_daily_files=max(1, int(limits.get("browse_daily_files", 20) or 20)),
     )
