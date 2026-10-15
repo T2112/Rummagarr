@@ -5,7 +5,8 @@ import asyncio
 import logging
 from pathlib import Path
 
-from config_loader import load_config
+from config_loader import app_version, load_config
+from crash_bundle import crash_directory, install_crash_hook
 from status_ui import start_status_ui
 from worker import Worker
 
@@ -37,6 +38,13 @@ async def amain(config_path: Path) -> None:
     cfg = load_config(config_path)
     setup_logging(cfg.log_file)
     worker = Worker(cfg)
+    install_crash_hook(
+        lambda: bool(getattr(worker.cfg, "crash_bundle", False)),
+        lambda: crash_directory(worker.cfg.log_file),
+        lambda: worker.cfg.log_file,
+        lambda: config_path,
+        app_version(),
+    )
     server = start_status_ui(worker, cfg.status_bind, cfg.status_port)
     try:
         await worker.run_forever()

@@ -14,9 +14,12 @@ from pathlib import Path
 from aioslsk.client import SoulSeekClient
 from aioslsk.exceptions import FileNotFoundError as SlskFileNotFoundError
 from aioslsk.exceptions import FileNotSharedError
+from aioslsk.commands import PrivateMessageCommand
+from aioslsk.events import PrivateMessageEvent
 from aioslsk.settings import (
     CredentialsSettings,
     NetworkSettings,
+    RoomsSettings,
     Settings,
     SharesSettings,
     SharedDirectorySettingEntry,
@@ -36,6 +39,7 @@ from audio_check import folder_fake_reason
 from audio_tags import tag_album_folder
 from config_loader import Config
 from favorites import GOOD_USER_MINIMUM, daily_room
+from messages import MAX_PRIVATE_MESSAGE
 from control import WorkerControl
 from library_report import merge_upgrade_albums, upgrade_artist
 from bridge_net import advertise_host, host_for_url, is_loopback_bind, mapped_folder, reported_root
@@ -267,6 +271,9 @@ def build_slsk_settings(cfg: Config) -> Settings:
         transfers=TransfersSettings(
             limits=TransferLimitSettings(upload_slots=max(1, int(cfg.upload_slots or 1)))
         ),
+        # aioslsk joins favorite rooms only when auto_join is false. True, an empty
+        # list, and declined invites keep chat rooms off.
+        rooms=RoomsSettings(auto_join=True, private_room_invites=False, favorites=set()),
     )
 
 
@@ -1644,10 +1651,43 @@ class Worker:
         if not self.soulseek_logged_in():
             raise RuntimeError("Soulseek login returned but session is not active")
         log.info("Logged in to Soulseek as %s", self.cfg.slsk_username)
+        self._install_private_messages()
         self._install_upload_guard()
         self.apply_share_settings(scan=False)
         self._schedule_share_scan()
         self._schedule_housekeeping()
+
+    def _install_private_messages(self) -> None:
+        client = self.client
+        if client is None:
+            return
+        client.events.register(PrivateMessageEvent, self._on_private_message)
+
+    def _on_private_message(self, event) -> None:
+        message = getattr(event, "message", None)
+        if message is None:
+            return
+        user = getattr(getattr(message, "user", None), "name", "") or ""
+        body = str(getattr(message, "message", "") or "")
+        chat_id = getattr(message, "id", None)
+        self.store.add_private_message(user, body, "in", soulseek_id=chat_id, seen=0)
+
+    async def send_private_message(self, username: str, body: str) -> str:
+        """Send one private message. Rooms are not used."""
+        name = (username or "").strip()
+        text = (body or "").strip()
+        if not name:
+            return "Enter a Soulseek username."
+        if not text:
+            return "Type a message in the compose box."
+        if len(text) > MAX_PRIVATE_MESSAGE:
+            return "That message is too long."
+        if self.control.is_stopped() or not self.soulseek_logged_in():
+            return "Start the worker to send a private message."
+        assert self.client is not None
+        await self.client.execute(PrivateMessageCommand(name, text))
+        self.store.add_private_message(name, text, "out")
+        return f"Sent to {name}."
 
     async def ensure_soulseek(self) -> bool:
         if self.control.is_stopped():

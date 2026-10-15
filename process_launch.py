@@ -69,6 +69,14 @@ def windowed_executable() -> str:
     return sys.executable
 
 
+def open_path(path: Path) -> None:
+    """Open a file or folder. Windows uses the shell association, which does not spawn python.exe."""
+    if os.name == "nt":
+        os.startfile(path)  # type: ignore[attr-defined]
+        return
+    run_hidden(["xdg-open", os.fspath(path)], check=False)
+
+
 def configure_child_processes() -> None:
     """Frozen spawn support, and multiprocessing children launched as the windowed exe."""
     import multiprocessing

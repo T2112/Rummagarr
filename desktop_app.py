@@ -52,6 +52,7 @@ from library_report import (
 from lidarr_client import LidarrClient
 from lidarr_register import LidarrRegisterError, register_with_lidarr
 from notifications import deliver
+from crash_bundle import crash_directory, install_crash_hook, open_folder, write_crash_bundle
 from favorites import daily_room
 from peer_limits import apply_limits, select_under_cap, share_file_rows
 from stats_report import format_stats
@@ -762,6 +763,13 @@ BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
     BehaviorField("allow_compilation", "Include compilations", "bool", "", "Search compilation albums even when the metadata profile does not list them."),
     BehaviorField("allow_single", "Include singles", "bool", "", "Search singles even when the metadata profile does not list them."),
     BehaviorField("allow_bootleg", "Include bootlegs", "bool", "", "Search bootlegs even when the metadata profile does not list them."),
+    BehaviorField(
+        "crash_bundle",
+        "Save a local crash bundle",
+        "bool",
+        "",
+        "When this is on, an unexpected error writes a zip next to the log. The zip stays on this PC and is not uploaded. Passwords and API keys are removed.",
+    ),
 )
 
 _PRIMARY_BEHAVIOR = frozenset(
@@ -2489,6 +2497,9 @@ class NavItem(tk.Frame):
         self._bar.configure(bg=bar)
         self._label.configure(bg=bg, fg=fg, font=_sized_font(palette, 10))
 
+    def set_text(self, text: str) -> None:
+        self._label.configure(text=text)
+
 
 class DesktopApp(tk.Tk):
     def __init__(
@@ -2504,6 +2515,13 @@ class DesktopApp(tk.Tk):
         super().__init__()
         self.worker = worker
         self.config_path = config_path
+        install_crash_hook(
+            lambda: bool(getattr(self.worker.cfg, "crash_bundle", False)),
+            lambda: crash_directory(self.worker.cfg.log_file),
+            lambda: self.worker.cfg.log_file,
+            lambda: self.config_path,
+            app_version(),
+        )
         self.poll_ms = poll_ms
         self._run_lock = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -2661,6 +2679,7 @@ class DesktopApp(tk.Tk):
         self.health_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
         self.search_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
         self.browse_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
+        self.messages_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
         self.shared_tab = ttk.Frame(self.content, style="Main.TFrame", padding=(self.px(22), self.px(18), self.px(22), self.px(14)))
         self.settings_tab = ttk.Frame(self.content, style="Main.TFrame")
         self.notebook = PageHost(self._show_page)
@@ -2671,6 +2690,7 @@ class DesktopApp(tk.Tk):
         self._add_nav(self.sidebar, "Health", self.health_tab)
         self._add_nav(self.sidebar, "Search", self.search_tab)
         self._add_nav(self.sidebar, "Browse", self.browse_tab)
+        self._add_nav(self.sidebar, "Messages", self.messages_tab)
         self._add_nav(self.sidebar, "Shared", self.shared_tab)
         self._nav_group(self.sidebar, "SYSTEM")
         self._add_nav(self.sidebar, "Settings", self.settings_tab)
@@ -2697,6 +2717,7 @@ class DesktopApp(tk.Tk):
         self._build_health(self.health_tab)
         self._build_search(self.search_tab)
         self._build_browse(self.browse_tab)
+        self._build_messages(self.messages_tab)
         self._build_shared(self.shared_tab)
         apply_theme(self, self._theme_name)
         self.notebook.select(self.status_tab)
@@ -2722,6 +2743,7 @@ class DesktopApp(tk.Tk):
             self.health_tab,
             self.search_tab,
             self.browse_tab,
+            self.messages_tab,
             self.shared_tab,
             self.settings_tab,
         ):
@@ -2734,6 +2756,9 @@ class DesktopApp(tk.Tk):
             self.refresh_stats()
         elif page is self.health_tab:
             self.refresh_health()
+        elif page is self.messages_tab:
+            self._message_signature = None
+            self.refresh_messages()
         selected = str(page)
         for key, item in self._nav_items.items():
             item.set_selected(key == selected)
@@ -2921,11 +2946,34 @@ class DesktopApp(tk.Tk):
         help_menu.add_command(label="Setup check", command=self.show_setup_check)
         help_menu.add_command(label="Backup settings", command=self.backup_settings)
         help_menu.add_command(label="Restore settings", command=self.restore_settings)
+        help_menu.add_command(label="Open crash folder", command=self.open_crash_folder)
         menu.add_cascade(label="Help", menu=help_menu)
         self.configure(menu=menu)
         self.help_menu = help_menu
         self._theme_menus.append(help_menu)
         self._theme_menus.append(menu)
+
+    def report_callback_exception(self, exc, val, tb) -> None:
+        try:
+            if bool(getattr(self.worker.cfg, "crash_bundle", False)):
+                import traceback
+
+                write_crash_bundle(
+                    crash_directory(self.worker.cfg.log_file),
+                    version=app_version(),
+                    error_text="".join(traceback.format_exception(exc, val, tb)),
+                    log_path=self.worker.cfg.log_file,
+                    config_path=self.config_path,
+                    enabled=True,
+                )
+        except Exception:
+            log.exception("Could not write the crash bundle")
+        super().report_callback_exception(exc, val, tb)
+
+    def open_crash_folder(self) -> None:
+        note = open_folder(crash_directory(self.worker.cfg.log_file))
+        if note and getattr(self, "notice_var", None) is not None:
+            self.notice_var.set(note)
 
     def show_about(self) -> None:
         existing = getattr(self, "_about_window", None)
@@ -3611,6 +3659,7 @@ class DesktopApp(tk.Tk):
         self._fill_transfers(snapshot.get("transfers") or [])
         self._fill_recent(snapshot.get("recent") or [], limit)
         self.refresh_notices()
+        self.refresh_messages()
 
     def _fill_transfers(self, transfers: list[dict]) -> None:
         yview = self.transfers.yview()
@@ -5004,6 +5053,146 @@ class DesktopApp(tk.Tk):
         file_ids = {board.row_files[iid].id for iid in tree.selection() if iid in board.row_files}
         users = {board.row_users[iid] for iid in tree.selection() if iid in board.row_users}
         return file_ids, users
+
+    def _build_messages(self, parent: ttk.Frame) -> None:
+        self._page_header(
+            parent,
+            "Messages",
+            "Private messages only. Chat rooms stay off. A message leaves this PC only when you press Send in the box below.",
+        )
+        self.message_status = tk.StringVar(value="")
+        ttk.Label(parent, textvariable=self.message_status, style="Muted.TLabel").pack(anchor="w", pady=(self.px(8), 0))
+        body = ttk.Frame(parent, style="Main.TFrame")
+        body.pack(fill="both", expand=True, pady=(self.px(8), 0))
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+        self.message_threads = tk.Listbox(body, height=12, activestyle="none", exportselection=False)
+        self.message_threads.grid(row=0, column=0, sticky="ns", padx=(0, self.px(8)))
+        self.message_threads.bind("<<ListboxSelect>>", self._on_message_thread)
+        self._message_names: list[str] = []
+        self.message_history = tk.Text(body, wrap="word", height=12, bd=0, highlightthickness=0)
+        self.message_history.grid(row=0, column=1, sticky="nsew")
+        self.message_history.configure(state="disabled")
+        compose = ttk.Frame(parent, style="Main.TFrame")
+        compose.pack(fill="x", pady=(self.px(8), 0))
+        self.message_user_var = tk.StringVar()
+        ttk.Label(compose, text="To").pack(side="left")
+        ttk.Entry(compose, textvariable=self.message_user_var, width=18).pack(side="left", padx=(self.px(6), self.px(8)))
+        self.message_compose_var = tk.StringVar()
+        entry = ttk.Entry(compose, textvariable=self.message_compose_var)
+        entry.pack(side="left", fill="x", expand=True)
+        entry.bind("<Return>", lambda _event: self._send_composed_message())
+        self.message_compose = entry
+        ttk.Button(compose, text="Send", command=self._send_composed_message).pack(side="left", padx=(self.px(8), 0))
+        self._message_signature = None
+
+    def _refresh_message_badge(self) -> None:
+        item = self._nav_items.get(str(getattr(self, "messages_tab", None)))
+        if item is None:
+            return
+        try:
+            count = self.worker.store.unread_private_count()
+        except Exception:
+            log.exception("Could not count private messages")
+            return
+        item.set_text("Messages" if count <= 0 else f"Messages ({count})")
+
+    def refresh_messages(self) -> None:
+        self._refresh_message_badge()
+        threads_box = getattr(self, "message_threads", None)
+        if threads_box is None or not self.messages_tab.winfo_manager():
+            return
+        try:
+            threads = self.worker.store.private_threads()
+        except Exception:
+            log.exception("Could not load private messages")
+            return
+        signature = tuple((row["username"], row["unread"], row["last_body"]) for row in threads)
+        if signature != getattr(self, "_message_signature", None):
+            self._message_signature = signature
+            self._fill_message_threads(threads)
+        self._fill_message_history()
+
+    def _fill_message_threads(self, threads: list[dict]) -> None:
+        box = self.message_threads
+        current = self.message_user_var.get().strip().lower()
+        box.delete(0, "end")
+        self._message_names = []
+        pick = None
+        for index, thread in enumerate(threads):
+            name = str(thread.get("username") or "")
+            unread = int(thread.get("unread") or 0)
+            label = f"{name} ({unread})" if unread else name
+            box.insert("end", label)
+            self._message_names.append(name)
+            if name.lower() == current:
+                pick = index
+        if pick is not None:
+            box.selection_set(pick)
+
+    def _fill_message_history(self) -> None:
+        username = self.message_user_var.get().strip()
+        lines = []
+        if username:
+            for row in self.worker.store.private_history(username):
+                who = "You" if row.get("direction") == "out" else row.get("username") or username
+                lines.append(f"{who}: {row.get('body') or ''}")
+        text = "\n".join(lines)
+        box = self.message_history
+        if box.get("1.0", "end").strip() == text:
+            return
+        box.configure(state="normal")
+        box.delete("1.0", "end")
+        if text:
+            box.insert("1.0", text)
+        box.configure(state="disabled")
+
+    def _on_message_thread(self, _event=None) -> None:
+        box = self.message_threads
+        selected = box.curselection()
+        if not selected:
+            return
+        try:
+            name = self._message_names[selected[0]]
+        except IndexError:
+            return
+        self.message_user_var.set(name)
+        self.worker.store.mark_thread_read(name)
+        self._message_signature = None
+        self.refresh_messages()
+
+    def _send_composed_message(self) -> None:
+        username = self.message_user_var.get().strip()
+        body = str(self.message_compose_var.get() or "")
+        if not username:
+            self.message_status.set("Enter a Soulseek username.")
+            return
+        if not body.strip():
+            self.message_status.set("Type a message in the compose box.")
+            return
+        loop = getattr(self.worker, "_loop", None)
+        if loop is None or not loop.is_running():
+            self.message_status.set("Start the worker to send a private message.")
+            return
+        self.message_status.set(f"Sending to {username}…")
+        future = asyncio.run_coroutine_threadsafe(self.worker.send_private_message(username, body), loop)
+
+        def done() -> None:
+            try:
+                text = future.result(timeout=30)
+            except Exception as exc:
+                text = str(exc).strip() or "The message was not sent."
+
+            def apply(text=text) -> None:
+                self.message_status.set(text)
+                if text.startswith("Sent"):
+                    self.message_compose_var.set("")
+                self._message_signature = None
+                self.refresh_messages()
+
+            self._post(apply)
+
+        threading.Thread(target=done, name="private-message", daemon=True).start()
 
     def _build_shared(self, parent: ttk.Frame) -> None:
         self._page_header(parent, "Shared", "Uploads from other Soulseek users. Pause keeps sharing up. Stop closes it.")

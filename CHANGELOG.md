@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [1.18.0] — 2026-10-15
+
+### Added
+
+- Messages shows private Soulseek messages. The list keeps who wrote, and an unread count sits on the Messages item in the sidebar. Opening a conversation marks it read. Send works from the compose box only. Chat rooms stay off.
+- Settings can save a local crash bundle. It is off until turned on. An unexpected error then writes a zip next to the log. The zip stays on this PC and is not uploaded. Passwords and API keys are removed. Help → Open crash folder shows that folder.
+
 ## [1.17.0] — 2026-10-15
 
 ### Added
