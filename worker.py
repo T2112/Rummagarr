@@ -3902,3 +3902,35 @@ class Worker:
                     }
                 )
         return records
+
+    async def browse_user(self, username: str) -> dict:
+        """Profile and share list for one peer. One Soulseek login, the worker's."""
+        from aioslsk.commands import (
+            GetUserStatsCommand,
+            GetUserStatusCommand,
+            PeerGetSharesCommand,
+            PeerGetUserInfoCommand,
+        )
+
+        from user_browse import profile_from_reply, shares_from_reply
+
+        name = (username or "").strip()
+        if not name:
+            raise RuntimeError("Enter a Soulseek username.")
+        if not self.soulseek_logged_in():
+            raise RuntimeError("Soulseek is not connected")
+        assert self.client is not None
+        client = self.client
+        status = await client.execute(GetUserStatusCommand(name), response=True, timeout=15)
+        stats = await client.execute(GetUserStatsCommand(name), response=True, timeout=15)
+        info = await client.execute(PeerGetUserInfoCommand(name), response=True, timeout=20)
+        shares = await client.execute(PeerGetSharesCommand(name), response=True, timeout=90)
+        if isinstance(shares, tuple) and len(shares) == 2:
+            directories, locked = shares
+        else:
+            directories, locked = shares, []
+        return {
+            "username": name,
+            "profile": profile_from_reply(info, status, stats),
+            "directories": shares_from_reply(directories, locked),
+        }

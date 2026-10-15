@@ -122,7 +122,7 @@ def _buttons(widget):
 def test_sidebar_replaces_the_tab_strip(desktop):
     assert isinstance(desktop.notebook, PageHost)
     labels = [item._label.cget("text") for item in desktop._nav_items.values()]
-    assert labels == ["Status", "Wanted", "Dashboard", "Health", "Search", "Shared", "Settings"]
+    assert labels == ["Status", "Wanted", "Dashboard", "Health", "Search", "Browse", "Shared", "Settings"]
     assert desktop.notebook.select() == str(desktop.status_tab)
     assert desktop.status_tab.winfo_ismapped()
     desktop.notebook.select(desktop.wanted_tab)
@@ -875,3 +875,68 @@ def test_closed_window_does_not_stall_another_thread(tmp_path):
     finally:
         gc.enable()
         gc.collect()
+
+
+def test_browse_page_opens_the_saved_copy_one_folder_at_a_time(desktop):
+    desktop.notebook.select(desktop.browse_tab)
+    desktop.update()
+    assert desktop.browse_tree.winfo_ismapped()
+    desktop._browse_cache().put(
+        "goodpeer",
+        {
+            "description": "hello",
+            "status": 2,
+            "has_slots_free": True,
+            "upload_slots": 2,
+            "queue_length": 1,
+            "upload_permissions": 1,
+            "shared_file_count": 3,
+            "shared_folder_count": 1,
+            "avg_speed": 10,
+        },
+        [
+            {
+                "name": r"Music\Ella Langley\Hungover",
+                "files": [{"filename": "01 Blue.flac", "size": 2048, "extension": "flac"}],
+            }
+        ],
+    )
+    desktop.browse_user_var.set("goodpeer")
+    desktop.load_browse(False)
+    desktop.update()
+    assert "Online" in desktop.browse_profile.get("1.0", "end")
+    roots = desktop.browse_tree.get_children()
+    assert [desktop.browse_tree.item(item, "text") for item in roots] == ["Music"]
+    desktop.browse_tree.focus(roots[0])
+    desktop._browse_open()
+    children = [desktop.browse_tree.item(item, "text") for item in desktop.browse_tree.get_children(roots[0])]
+    assert children == ["Ella Langley"]
+    assert "Saved copy" in desktop.browse_status.get()
+
+
+def test_about_donate_is_a_placeholder_and_setup_check_opens(desktop):
+    desktop.show_about()
+    desktop.update()
+    window = desktop._about_window
+    assert window is not None
+    donate = next(button for button in _buttons(window) if button.cget("text") == "Donate")
+    donate.invoke()
+    desktop.update()
+    texts = []
+
+    def walk(widget):
+        for child in widget.winfo_children():
+            try:
+                texts.append(child.cget("text"))
+            except tk.TclError:
+                pass
+            walk(child)
+
+    walk(window)
+    assert "A donate link is not set yet." in texts
+    window.destroy()
+
+    desktop.show_setup_check()
+    desktop.update()
+    assert "Setup looks ready." in desktop._setup_text.get("1.0", "end")
+    desktop._setup_window.destroy()
