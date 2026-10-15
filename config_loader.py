@@ -8,6 +8,8 @@ import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from search_order import normalize_search_direction, normalize_search_order
+
 log = logging.getLogger("lidarr_slsk")
 
 APP_NAME = "Rummagarr"
@@ -76,6 +78,8 @@ class Config:
     confirm_download_all: bool = True
     max_albums_per_run: int = 40
     wanted_tag: str = ""
+    search_order: str = "lidarr"
+    search_order_direction: str = "desc"
     follow_metadata_profile: bool = True
     allow_live: bool = False
     allow_compilation: bool = False
@@ -276,6 +280,8 @@ def default_config(**overrides) -> Config:
         confirm_download_all=bool(overrides.pop("confirm_download_all", True)),
         max_albums_per_run=int(overrides.pop("max_albums_per_run", 40)),
         wanted_tag=str(overrides.pop("wanted_tag", "")),
+        search_order=normalize_search_order(overrides.pop("search_order", "lidarr")),
+        search_order_direction=normalize_search_direction(overrides.pop("search_order_direction", "desc")),
         follow_metadata_profile=bool(overrides.pop("follow_metadata_profile", True)),
         allow_live=bool(overrides.pop("allow_live", False)),
         allow_compilation=bool(overrides.pop("allow_compilation", False)),
@@ -340,6 +346,8 @@ def save_config(path: Path, cfg: Config) -> None:
             f"max_albums_per_cycle = {int(cfg.max_albums_per_cycle)}",
             f"max_albums_per_run = {int(cfg.max_albums_per_run)}",
             f"wanted_tag = {_toml_str(cfg.wanted_tag)}",
+            f"search_order = {_toml_str(normalize_search_order(cfg.search_order))}",
+            f"search_order_direction = {_toml_str(normalize_search_direction(cfg.search_order_direction))}",
             f"follow_metadata_profile = {_toml_bool(cfg.follow_metadata_profile)}",
             f"allow_live = {_toml_bool(cfg.allow_live)}",
             f"allow_compilation = {_toml_bool(cfg.allow_compilation)}",
@@ -467,6 +475,8 @@ def try_load_config(path: Path) -> Config:
         max_albums_per_cycle=int(search.get("max_albums_per_cycle", 1)),
         max_albums_per_run=int(search.get("max_albums_per_run", 40)),
         wanted_tag=str(search.get("wanted_tag", "") or ""),
+        search_order=normalize_search_order(search.get("search_order", "lidarr")),
+        search_order_direction=normalize_search_direction(search.get("search_order_direction", "desc")),
         max_tracks_per_cycle=int(search.get("max_tracks_per_cycle", 5)),
         fill_missing_tracks=bool(search.get("fill_missing_tracks", True)),
         focus_one_artist=bool(search.get("focus_one_artist", True)),
