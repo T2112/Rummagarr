@@ -785,6 +785,13 @@ BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
         "",
         "When this is on, an unexpected error writes a zip next to the log. The zip stays on this PC and is not uploaded. Passwords and API keys are removed.",
     ),
+    BehaviorField(
+        "suggest_favorites",
+        "Suggest favorite users",
+        "bool",
+        "",
+        "When this is on, a user who has finished 3 downloads is offered in one prompt. Add puts them in Priority users. Turn this off to stop those prompts. Don't ask again on the prompt turns this off.",
+    ),
 )
 
 _PRIMARY_BEHAVIOR = frozenset(
@@ -797,6 +804,7 @@ _PRIMARY_BEHAVIOR = frozenset(
         "convert_to_mp3",
         "convert_bitrate",
         "confirm_download_all",
+        "suggest_favorites",
     }
 )
 
@@ -820,7 +828,9 @@ _RESTART_FIELDS = frozenset(
     }
 )
 _LAUNCH_FIELDS = frozenset({"start_on_launch", "check_updates"})
-_IMMEDIATE_FIELDS = frozenset({"theme", "confirm_download_all", "search_order", "search_order_direction"})
+_IMMEDIATE_FIELDS = frozenset(
+    {"theme", "confirm_download_all", "search_order", "search_order_direction", "suggest_favorites"}
+)
 _BRIDGE_FIELDS = frozenset(
     {
         "bridge_enabled",
@@ -2461,6 +2471,153 @@ class WantedPreview(tk.Toplevel):
             callback(picked)
 
 
+class FavoritePrompt(tk.Toplevel):
+    """One window for every favorite suggestion that is still waiting."""
+
+    def __init__(self, master: tk.Misc, on_add, on_skip, on_never, on_hide) -> None:
+        super().__init__(master)
+        self.title("Favorite suggestions")
+        self.transient(master)
+        self.resizable(True, True)
+        self.minsize(420, 280)
+        self.on_add = on_add
+        self.on_skip = on_skip
+        self.on_never = on_never
+        self.on_hide = on_hide
+        self.events: list[dict] = []
+        apply_theme(self)
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame,
+            text=(
+                "These users finished enough downloads to suggest as favorites. "
+                "Add puts the selected user in Priority users. Nothing is added until you choose Add."
+            ),
+            wraplength=460,
+        ).pack(anchor="w", pady=(0, 8))
+        self.names = tk.Listbox(frame, height=6, activestyle="dotbox", exportselection=False)
+        self.names.pack(fill="both", expand=True)
+        self.names.bind("<<ListboxSelect>>", lambda _event: self._show_body())
+
+        def paint(palette: Palette) -> None:
+            self.names.configure(
+                bg=palette.field,
+                fg=palette.fg,
+                selectbackground=palette.nav_on_bg,
+                selectforeground=palette.nav_on_fg,
+                font=_sized_font(palette, 10),
+                highlightbackground=palette.field_border,
+                highlightcolor=palette.field_border,
+            )
+
+        self.names._chrome_paint = paint
+        paint(active_palette(self))
+        self.detail = ttk.Label(frame, text="", wraplength=460, justify="left")
+        self.detail.pack(anchor="w", fill="x", pady=(8, 0))
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(8, 0))
+        ttk.Button(buttons, text="Add", style="Start.TButton", command=self._add).pack(side="left")
+        ttk.Button(buttons, text="Not now", command=self._skip).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Don't ask again", command=self._never).pack(side="right")
+        self.protocol("WM_DELETE_WINDOW", self._hide)
+        self.geometry(f"+{master.winfo_rootx() + 80}+{master.winfo_rooty() + 80}")
+
+    def show(self, events: list[dict]) -> None:
+        incoming = [
+            (str(event.get("username") or ""), str(event.get("title") or ""), str(event.get("body") or ""))
+            for event in events
+        ]
+        current = [
+            (str(event.get("username") or ""), str(event.get("title") or ""), str(event.get("body") or ""))
+            for event in self.events
+        ]
+        if incoming == current and self.names.size() == len(incoming):
+            return
+        previous = self._selected_name()
+        grew = tuple(item[0] for item in incoming) != tuple(item[0] for item in current)
+        self.events = list(events)
+        self.names.delete(0, "end")
+        for event in self.events:
+            self.names.insert("end", str(event.get("title") or event.get("username") or ""))
+        if not self.events:
+            self.detail.configure(text="")
+            return
+        index = 0
+        if previous:
+            for position, event in enumerate(self.events):
+                if event.get("username") == previous:
+                    index = position
+                    break
+        self.names.selection_clear(0, "end")
+        self.names.selection_set(index)
+        self.names.activate(index)
+        self.names.see(index)
+        self._show_body()
+        if grew:
+            self.deiconify()
+            self.lift()
+
+    def _selected_name(self) -> str:
+        if not self.events:
+            return ""
+        try:
+            picked = self.names.curselection()
+        except tk.TclError:
+            return ""
+        index = int(picked[0]) if picked else 0
+        if index < 0 or index >= len(self.events):
+            return ""
+        return str(self.events[index].get("username") or "")
+
+    def _show_body(self) -> None:
+        name = self._selected_name()
+        body = ""
+        for event in self.events:
+            if event.get("username") == name:
+                body = str(event.get("body") or "").strip()
+                break
+        self.detail.configure(text=body)
+
+    def _add(self) -> None:
+        name = self._selected_name()
+        if name:
+            self.on_add(name)
+
+    def _skip(self) -> None:
+        name = self._selected_name()
+        if name:
+            self.on_skip(name)
+
+    def _never(self) -> None:
+        # Destroying the button inside its own click makes Tk raise. Close after the click returns.
+        self.after(0, self._finish_never)
+
+    def _finish_never(self) -> None:
+        try:
+            alive = bool(self.winfo_exists())
+        except tk.TclError:
+            alive = False
+        if not alive:
+            return
+        callback = self.on_never
+        self.destroy()
+        callback()
+
+    def _hide(self) -> None:
+        names = tuple(str(event.get("username") or "") for event in self.events)
+        callback = self.on_hide
+        self.destroy()
+        callback(names)
+
+    def destroy(self) -> None:
+        try:
+            super().destroy()
+        except tk.TclError:
+            pass
+        _release_tk_objects(self)
+
+
 class PageHost:
     """Sidebar pages with the select() calls the old main notebook used."""
 
@@ -2590,6 +2747,8 @@ class DesktopApp(tk.Tk):
             worker.ensure_status_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(poll_ms, self._tick)
+        self._favorite_prompt: FavoritePrompt | None = None
+        self._favorite_prompt_key: tuple[str, ...] | None = None
         self.refresh_status()
         self.refresh_wanted()
         if honor_start_on_launch and worker.cfg.start_on_launch:
@@ -2916,6 +3075,7 @@ class DesktopApp(tk.Tk):
             if self._settings_form is not None:
                 self._settings_form.base = cfg
                 self._settings_form.message_var.set(message)
+            self.refresh_notices()
 
         def on_cancel() -> None:
             form = self._settings_form
@@ -4332,12 +4492,16 @@ class DesktopApp(tk.Tk):
         frame = getattr(self, "notices", None)
         if frame is None:
             return
+        enabled = bool(getattr(self.worker.cfg, "suggest_favorites", True))
         try:
-            self.worker.store.suggest_from_history(set(self.worker.cfg.priority_users))
-            events = self.worker.store.recent_events(8)
+            if enabled:
+                self.worker.store.suggest_from_history(set(self.worker.cfg.priority_users))
+            events = self.worker.store.recent_events(8, exclude_kind="favorite")
+            favorites = self.worker.store.unseen_events("favorite") if enabled else []
         except Exception:
             log.exception("Could not load notices")
             return
+        self._sync_favorite_prompt(favorites)
         signature = tuple(
             (event["id"], event["kind"], event["title"], event["body"], event["username"]) for event in events
         )
@@ -4360,26 +4524,72 @@ class DesktopApp(tk.Tk):
                 wraplength=self.px(820),
                 justify="left",
             ).pack(side="left", fill="x", expand=True)
-            kind = str(event.get("kind") or "")
-            user = str(event.get("username") or "")
-            if kind == "favorite" and user:
-                ttk.Button(
-                    row,
-                    text="Not now",
-                    command=lambda user=user: self.dismiss_suggested_favorite(user),
-                ).pack(side="right")
-                ttk.Button(
-                    row,
-                    text="Add",
-                    command=lambda user=user: self.add_suggested_favorite(user),
-                ).pack(side="right", padx=(0, self.px(6)))
-            else:
-                event_id = int(event["id"])
-                ttk.Button(
-                    row,
-                    text="Dismiss",
-                    command=lambda event_id=event_id: self._dismiss_notice(event_id),
-                ).pack(side="right")
+            event_id = int(event["id"])
+            ttk.Button(
+                row,
+                text="Dismiss",
+                command=lambda event_id=event_id: self._dismiss_notice(event_id),
+            ).pack(side="right")
+
+    def _sync_favorite_prompt(self, events: list[dict]) -> None:
+        """One prompt lists everyone waiting. A closed prompt stays closed until that list changes."""
+        waiting = [event for event in events if str(event.get("username") or "").strip()]
+        key = tuple(str(event.get("username") or "") for event in waiting)
+        if not key:
+            self._favorite_prompt_key = None
+            self._close_favorite_prompt()
+            return
+        prompt = getattr(self, "_favorite_prompt", None)
+        alive = False
+        if prompt is not None:
+            try:
+                alive = bool(prompt.winfo_exists())
+            except tk.TclError:
+                alive = False
+        if not alive:
+            if key == getattr(self, "_favorite_prompt_key", None):
+                return
+            self._favorite_prompt = FavoritePrompt(
+                self,
+                self.add_suggested_favorite,
+                self.dismiss_suggested_favorite,
+                self.stop_favorite_suggestions,
+                self._remember_closed_favorite_prompt,
+            )
+        self._favorite_prompt_key = None
+        self._favorite_prompt.show(waiting)
+
+    def _close_favorite_prompt(self) -> None:
+        prompt = getattr(self, "_favorite_prompt", None)
+        self._favorite_prompt = None
+        if prompt is None:
+            return
+        try:
+            if prompt.winfo_exists():
+                prompt.destroy()
+        except tk.TclError:
+            pass
+
+    def _remember_closed_favorite_prompt(self, names: tuple[str, ...]) -> None:
+        self._favorite_prompt = None
+        self._favorite_prompt_key = names
+
+    def stop_favorite_suggestions(self) -> None:
+        """Don't ask again. Later saves keep the checkbox off."""
+        cfg = replace(self.worker.cfg, suggest_favorites=False)
+        self.worker.cfg = cfg
+        try:
+            save_config(self.config_path, cfg)
+        except OSError:
+            log.exception("Could not save favorite suggestions")
+        form = getattr(self, "_settings_form", None)
+        if form is not None and "suggest_favorites" in form.fields:
+            form.fields["suggest_favorites"].set(False)
+            form.base = cfg
+        if self._settings_baseline is not None:
+            self._settings_baseline["cfg"] = replace(self._settings_baseline["cfg"], suggest_favorites=False)
+        self._favorite_prompt_key = None
+        self._close_favorite_prompt()
 
     def _dismiss_notice(self, event_id: int) -> None:
         self.worker.store.dismiss_event(event_id)

@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here.
 
+## [1.18.2] — 2026-10-16
+
+### Added
+
+- Settings → Behavior → Suggest favorite users turns favorite suggestions off. The choice is saved in config.toml. Suggestions stay on until this is turned off.
+
+### Fixed
+
+- Favorite suggestions no longer stack a window per user. One prompt lists everyone who is waiting. Add and Not now apply to the selected user. Closing the prompt leaves the rest queued until someone new qualifies, and then one prompt shows the whole list. Don't ask again turns Suggest favorite users off.
+
 ## [1.18.1] — 2026-10-15
 
 ### Fixed
