@@ -1,48 +1,67 @@
 # Rummagarr
 
-**Version 1.18.2** — Windows desktop app. No Docker. No slskd. The GitHub repository is still [T2112/lidarr-soulseek](https://github.com/T2112/lidarr-soulseek).
+Rummagarr fills the albums and tracks Lidarr still wants. It searches Soulseek, downloads the files, and asks Lidarr to import and rename them. It is a Windows desktop app. No Docker. No slskd.
 
-The worker reads Lidarr **Wanted → Missing**, searches Soulseek, downloads matching albums or individual missing tracks, converts FLAC/WAV to MP3 when needed, asks Lidarr to import and rename, then cleans leftover files.
+**Version 1.18.3.** The GitHub repository is [T2112/lidarr-soulseek](https://github.com/T2112/lidarr-soulseek).
 
-Custom Lidarr import list (MusicBrainz IDs):  
-https://raw.githubusercontent.com/T2112/lidarr-soulseek/main/lists/lidarr-custom-list.json
+Only download music you have the rights to. Soulseek is a peer-to-peer network, and you are responsible for what you download and what you share.
 
-## Download / Install
+[Sponsor Rummagarr](https://github.com/sponsors/T2112)
 
-The Windows installer is on the [latest release](https://github.com/T2112/lidarr-soulseek/releases/latest). No GitHub account is required.
+## Screenshots
 
-Run `Rummagarr-Setup-<version>.exe`. It installs the app for your user and adds a Start Menu shortcut and a desktop shortcut, both named Rummagarr. The first window asks for the Lidarr URL, API key, Soulseek username and password, and the folders. An older Lidarr Soulseek install is upgraded in place.
+![Status](docs/status.png)
 
-ffmpeg is separate if you want FLAC converted to MP3:
+![Wanted](docs/wanted.png)
+
+![Settings](docs/settings.png)
+
+## Install on Windows
+
+Download `Rummagarr-Setup-<version>.exe` from the [latest release](https://github.com/T2112/lidarr-soulseek/releases/latest). No GitHub account is required. The installer adds a Start Menu shortcut and a desktop shortcut, both named Rummagarr. An older Lidarr Soulseek install is upgraded in place.
+
+### Windows SmartScreen
+
+Windows may say “Windows protected your PC” because the installer is not signed with a paid certificate. Click **More info**, then **Run anyway**.
+
+If the file is blocked, unblock it in PowerShell from the folder that contains the installer:
 
 ```powershell
-winget install Gyan.FFmpeg
+Unblock-File .\Rummagarr-Setup-<version>.exe
 ```
 
-## Desktop app
+## Set up Lidarr and Soulseek
 
-Most people should install the desktop app instead of setting up Python.
+1. Lidarr is already running. In Lidarr, open **Settings → General → Security** and copy the API key. On this PC the URL is usually `http://127.0.0.1:8686`. If Lidarr is on another computer, use the address this PC can reach, including a Tailscale address.
+2. You need a Soulseek username and password. Close Nicotine+, the official Soulseek client, and slskd while Rummagarr is running. One login can only be online in one place.
+3. Create an Incomplete folder and a Complete folder. The first window asks for the Lidarr URL, the API key, the Soulseek username and password, and those two folders. Click **Test Lidarr**, then **Save**. You do not edit `config.toml` by hand.
+4. The sidebar opens on **Status**. **Start** begins searching. Open **Wanted** and click **Sync** to load missing music from Lidarr. Checked rows are the ones the worker searches.
+5. Optional: `winget install Gyan.FFmpeg` if you want FLAC and WAV converted to MP3 before Lidarr imports them. Status says so when ffmpeg is missing.
 
-1. Download `Rummagarr-Setup-<version>.exe` from the [latest release](https://github.com/T2112/lidarr-soulseek/releases/latest).
-2. Run the installer. It copies the app into your user programs folder and adds a **Start Menu** shortcut and a **desktop** shortcut, both named Rummagarr. Add/Remove Programs lists it as Rummagarr. An optional task can also start the app when you sign in. If Lidarr Soulseek is already installed, this installer replaces it.
-3. The first window asks for the Lidarr URL, the Lidarr API key, the Soulseek username and password, and the Incomplete / Complete folders. Use **Test Lidarr**, then **Save**. You do not edit `config.toml` by hand.
-4. The sidebar opens on **Status**. **Start** begins searching. The line in the status card names the current search, wait, or download, and it says Idle only when nothing is selected. **Pause** holds the current work and resumes it later. **Stop** ends the run and keeps your place. **Skip** drops the album or song it is on and moves to the next one. **Auto-import to Lidarr after each artist** is off until you check it. When it is on, an empty download queue after an artist asks Lidarr to import and rename that artist's files.
-5. Open **Wanted**. The saved list opens immediately. **Sync** reads Lidarr and fills the list as each page arrives; you can search and check rows while that is still running. **Artist** filters by name. Uncheck anything the worker should leave alone. **Select all** applies to the current view: Everything, Incomplete artists, Incomplete albums, or Incomplete songs. The magnifying glass on a row opens **Search** for that artist, album, or song. The list and the checkboxes are kept in the local database.
-6. Open **Search** to type a Soulseek query yourself. Results are grouped by user. Download sends the file through the same queue, conversion, and Lidarr import as an automatic grab. Search uses the login from **Start** and does not sign in a second time.
+## Using the app
 
-The browser page at `http://127.0.0.1:8787` still works while the worker is running. The desktop window does not need a browser.
+**Start** begins searching. The line in the status card names the current search, wait, or download, and it says Idle only when nothing is selected. **Pause** holds the current work and resumes it later. **Stop** ends the run and keeps your place. **Skip** drops the album or song it is on and moves to the next one. **Auto-import to Lidarr after each artist** is off until you check it. When it is on, an empty download queue after an artist asks Lidarr to import and rename that artist's files.
 
-The installed app checks GitHub Releases when it opens. **Help → Check for updates** runs that check immediately. A newer version can be installed from the dialog. **Skip this version** remembers that release, and Settings → Behavior can turn the automatic check off. A copy started from source only shows the new version and opens the release page.
+**Wanted** opens the saved list immediately. **Sync** reads Lidarr and fills the list as each page arrives. **Artist** filters by name. Uncheck anything the worker should leave alone. The magnifying glass on a row opens **Search** for that artist, album, or song.
 
-**Settings → Behavior** edits the rest of `config.toml`: how many albums run at once, how long an artist is skipped, formats, MP3 conversion, timeouts, and the status page. Restore defaults puts those options back. Search and download changes apply on the next pass. Login, folders, and the status page address apply after you stop and start the worker. **Settings** also has Dark and Light. Dark is the default. Light applies immediately and is saved, and the label next to it is honest about the experience.
+**Search** runs a query you type. Results are grouped by user. Download uses the same queue, conversion, and Lidarr import as an automatic grab, and it uses the login from **Start**.
 
-The version is on the window title and under **Help → About**.
+**Settings → Behavior** edits formats, how long an artist is skipped, MP3 conversion, and the rest of the saved options. Dark is the default theme. Light applies immediately and is saved. The version is on the window title and under **Help → About**. **Help → About → Donate** opens the [GitHub Sponsors](https://github.com/sponsors/T2112) page.
 
-ffmpeg is still separate if you want FLAC converted to MP3: `winget install Gyan.FFmpeg`. The Status tab says so when it is missing.
+The installed app checks GitHub Releases when it opens. **Help → Check for updates** runs that check immediately. Config, the database, and the log live in `%LOCALAPPDATA%\Rummagarr\`.
 
-Config, the database, and the log for an installed copy live in `%LOCALAPPDATA%\Rummagarr\`. The first launch after an upgrade copies them from `%LOCALAPPDATA%\Lidarr Soulseek\` when the new folder has no `config.toml` yet, and leaves the old folder in place.
+A custom Lidarr import list of MusicBrainz IDs is at  
+https://raw.githubusercontent.com/T2112/lidarr-soulseek/main/lists/lidarr-custom-list.json
 
-### Build the installer
+## Help
+
+Questions, bugs, and ideas go to [GitHub Issues](https://github.com/T2112/lidarr-soulseek/issues). Include the app version from **Help → About**. For a crash, attach the zip from **Help → Open crash folder**.
+
+## Sponsor
+
+[Sponsor on GitHub](https://github.com/sponsors/T2112)
+
+## Build the installer
 
 On a Windows machine, from this folder:
 
@@ -58,11 +77,17 @@ dist\Rummagarr-Setup-1.11.0.exe
 
 The same steps run in GitHub Actions (`.github/workflows/windows-installer.yml`) on `windows-latest`. Pull requests and pushes to `main` upload the installer as a workflow artifact.
 
-To publish a public download, push a tag `v<version>` that matches the `VERSION` file (for example `v1.18.2`). That run creates a GitHub Release and attaches `Rummagarr-Setup-<version>.exe` and the same file as `LidarrSoulseek-Setup-<version>.exe`, so an installed 1.9.4 can still update. The release notes are the matching section of `CHANGELOG.md`, followed by the install instructions. The release fails if that section is missing. You can also publish the version already in `VERSION` without making the tag yourself: **Actions → Windows installer → Run workflow**, and choose the `main` branch. If that release already exists, the workflow replaces the installer files and the notes.
+To publish a public download, push a tag `v<version>` that matches the `VERSION` file (for example `v1.18.3`). That run creates a GitHub Release and attaches `Rummagarr-Setup-<version>.exe` and the same file as `LidarrSoulseek-Setup-<version>.exe`, so an installed 1.9.4 can still update. The release notes are the matching section of `CHANGELOG.md`, followed by the install instructions. The release fails if that section is missing. You can also publish the version already in `VERSION` without making the tag yourself: **Actions → Windows installer → Run workflow**, and choose the `main` branch. If that release already exists, the workflow replaces the installer files and the notes.
 
 This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs on, and Inno Setup is a Windows program. Push the branch and let that workflow produce the `.exe`.
 
 `python main.py` still runs the worker without the window, for the original script install below.
+
+## What's new in 1.18.3
+
+- Help → About → Donate opens the GitHub Sponsors page.
+- The install notes cover Lidarr, Soulseek, and the Windows SmartScreen prompt. Questions go to GitHub Issues.
+- Full changelog: [CHANGELOG.md](CHANGELOG.md)
 
 ## What's new in 1.18.2
 
@@ -380,4 +405,4 @@ Uninstall the logon task:
 
 ## Legal
 
-Soulseek is a peer-to-peer network. Only download and share files you have the right to download and share.
+Only download music you have the rights to. Soulseek is a peer-to-peer network. Only download and share files you have the right to download and share.

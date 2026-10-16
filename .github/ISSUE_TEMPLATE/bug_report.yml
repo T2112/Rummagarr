@@ -1,0 +1,41 @@
+name: Bug report
+description: Something in Rummagarr did not work
+title: ""
+body:
+  - type: input
+    id: app-version
+    attributes:
+      label: App version
+      description: The version in the window title, or under Help → About.
+      placeholder: "1.18.3"
+    validations:
+      required: true
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows version
+      description: For example, Windows 11 24H2.
+      placeholder: Windows 11
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps
+      description: What you did, what you expected, and what happened instead.
+      placeholder: |
+        1. Start the worker
+        2. Open Wanted and click Sync
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: crash-bundle
+    attributes:
+      label: Crash bundle
+      description: >
+        If the app closed or showed an error, attach the newest zip from Help → Open crash folder.
+        Settings → Behavior → Save a local crash bundle has to be on before the error, or the folder is empty.
+        The zip stays on your PC until you attach it. Passwords and API keys are removed.
+    validations:
+      required: false

@@ -160,6 +160,7 @@ def hold_single_instance() -> None:
 
 
 LIGHT_MODE_HINT = "Light mode: for beginners and people who enjoy staring into the sun."
+DONATE_URL = "https://github.com/sponsors/T2112"
 
 
 def ui_font() -> str:
@@ -3169,12 +3170,14 @@ class DesktopApp(tk.Tk):
             text="Downloads missing music from Soulseek into Lidarr.\nHelp → Check for updates looks for a newer release.",
             wraplength=420,
         ).pack(anchor="w", pady=(8, 12))
-        note = tk.StringVar(value="")
-        ttk.Button(frame, text="Donate", command=lambda: note.set("A donate link is not set yet.")).pack(anchor="w")
-        ttk.Label(frame, textvariable=note, style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
+        ttk.Button(frame, text="Donate", command=self.open_donate).pack(anchor="w")
+        ttk.Label(frame, text="Opens the GitHub Sponsors page.", style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
         ttk.Button(frame, text="Close", command=window.destroy).pack(anchor="e", pady=(12, 0))
         self._about_window = window
         window.bind("<Destroy>", lambda _event: setattr(self, "_about_window", None), add="+")
+
+    def open_donate(self) -> None:
+        webbrowser.open(DONATE_URL)
 
     def show_setup_check(self) -> None:
         checks = local_setup_checks(self.worker.cfg)

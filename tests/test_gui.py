@@ -985,7 +985,11 @@ def test_browse_page_opens_the_saved_copy_one_folder_at_a_time(desktop):
     assert "Saved copy" in desktop.browse_status.get()
 
 
-def test_about_donate_is_a_placeholder_and_setup_check_opens(desktop):
+def test_about_donate_opens_sponsors_and_setup_check_opens(desktop, monkeypatch):
+    from desktop_app import DONATE_URL
+
+    opened: list[str] = []
+    monkeypatch.setattr("desktop_app.webbrowser.open", lambda url: opened.append(url) or True)
     desktop.show_about()
     desktop.update()
     window = desktop._about_window
@@ -993,6 +997,8 @@ def test_about_donate_is_a_placeholder_and_setup_check_opens(desktop):
     donate = next(button for button in _buttons(window) if button.cget("text") == "Donate")
     donate.invoke()
     desktop.update()
+    assert opened == [DONATE_URL]
+    assert DONATE_URL == "https://github.com/sponsors/T2112"
     texts = []
 
     def walk(widget):
@@ -1004,7 +1010,8 @@ def test_about_donate_is_a_placeholder_and_setup_check_opens(desktop):
             walk(child)
 
     walk(window)
-    assert "A donate link is not set yet." in texts
+    assert "A donate link is not set yet." not in texts
+    assert "GitHub Sponsors" in " ".join(texts)
     window.destroy()
 
     desktop.show_setup_check()

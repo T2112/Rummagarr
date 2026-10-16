@@ -1,0 +1,18 @@
+name: Feature request
+description: An idea for Rummagarr
+title: ""
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What should Rummagarr do?
+      description: The job you want done, and how you would use it.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: Optional. A screenshot or the app version helps.
+    validations:
+      required: false

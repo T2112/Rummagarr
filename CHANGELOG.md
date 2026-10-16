@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [1.18.3] — 2026-10-16
+
+### Changed
+
+- Help → About → Donate opens https://github.com/sponsors/T2112.
+- The README explains what Rummagarr does, shows the app, and walks through Lidarr and Soulseek setup. It also covers the Windows SmartScreen prompt (More info, then Run anyway, or Unblock-File) and says to download only music you have the rights to. Questions go to GitHub Issues. The Sponsor link is on that page.
+- GitHub Issues has a bug report and a feature request. The bug report asks for the app version, the Windows version, the steps, and the crash bundle from Help → Open crash folder.
+
 ## [1.18.2] — 2026-10-16
 
 ### Added

@@ -59,6 +59,7 @@ def test_shipped_changelog_has_the_published_versions():
 
     text = Path("CHANGELOG.md").read_text(encoding="utf-8")
     for version, needle in (
+        ("1.18.3", "sponsors/T2112"),
         ("1.18.2", "Suggest favorite users"),
         ("1.18.1", "high-contrast"),
         ("1.18.0", "Messages"),
