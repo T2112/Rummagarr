@@ -471,10 +471,17 @@ def _file_matches(
     min_filename_ratio: float,
     preferred_extensions: list[str],
     min_mp3_bitrate: int,
+    progress=None,
+    cancel=None,
 ) -> tuple[_WantedIndex, list[tuple[RemoteFile, WantedTrack, float]]]:
     index = _WantedIndex(tracks)
     found: list[tuple[RemoteFile, WantedTrack, float]] = []
-    for remote in files:
+    total = len(files)
+    for step, remote in enumerate(files, start=1):
+        if cancel is not None and cancel():
+            if progress is not None:
+                progress(step - 1, total)
+            break
         chosen = _choose_track(
             remote,
             index,
@@ -482,10 +489,11 @@ def _file_matches(
             preferred_extensions=preferred_extensions,
             min_mp3_bitrate=min_mp3_bitrate,
         )
-        if chosen is None:
-            continue
-        score, track = chosen
-        found.append((remote, track, score))
+        if chosen is not None:
+            score, track = chosen
+            found.append((remote, track, score))
+        if progress is not None:
+            progress(step, total)
     return index, found
 
 
@@ -496,6 +504,8 @@ def match_files_to_wanted(
     min_filename_ratio: float,
     preferred_extensions: list[str],
     min_mp3_bitrate: int,
+    progress=None,
+    cancel=None,
 ) -> list[WantedMatch]:
     """Best wanted row for each remote file.
 
@@ -511,6 +521,8 @@ def match_files_to_wanted(
         min_filename_ratio=min_filename_ratio,
         preferred_extensions=preferred_extensions,
         min_mp3_bitrate=min_mp3_bitrate,
+        progress=progress,
+        cancel=cancel,
     )
     best: dict[str, WantedMatch] = {}
     for remote, track, score in found:
@@ -681,6 +693,8 @@ def choose_wanted_downloads(
     min_filename_ratio: float,
     preferred_extensions: list[str],
     min_mp3_bitrate: int,
+    progress=None,
+    cancel=None,
 ) -> WantedPick:
     """Best source for every wanted album and track across every user's files.
 
@@ -696,6 +710,8 @@ def choose_wanted_downloads(
         min_filename_ratio=min_filename_ratio,
         preferred_extensions=preferred_extensions,
         min_mp3_bitrate=min_mp3_bitrate,
+        progress=progress,
+        cancel=cancel,
     )
     deduped: dict[tuple[str, str], tuple[RemoteFile, WantedTrack, float]] = {}
     for remote, track, score in found:

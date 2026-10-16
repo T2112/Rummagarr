@@ -22,7 +22,7 @@ def install_instructions(version: str) -> str:
         "\n"
         f"Download Rummagarr-Setup-{version}.exe and run it. The first window asks for the Lidarr URL, API key, and Soulseek login.\n"
         "\n"
-        f"The same installer is also attached as LidarrSoulseek-Setup-{version}.exe so an installed copy of 1.9.4 can update from Help → Check for updates. Both .sha256 files are the installer checksum.\n"
+        f"Rummagarr-Setup-{version}.exe.sha256 is the installer checksum.\n"
         "\n"
         "ffmpeg is separate if you want FLAC converted to MP3: winget install Gyan.FFmpeg."
     )

@@ -161,6 +161,8 @@ def hold_single_instance() -> None:
 
 LIGHT_MODE_HINT = "Light mode: for beginners and people who enjoy staring into the sun."
 DONATE_URL = "https://github.com/sponsors/T2112"
+# A handful of files stays on the button's thread. A long queue gets a count and Cancel.
+BULK_QUEUE_AT = 25
 
 
 def ui_font() -> str:
@@ -2285,6 +2287,115 @@ class DownloadProgress(tk.Toplevel):
             self.bar.configure(mode="indeterminate")
             self.bar.start(12)
         self.label_var.set(f"Downloaded {format_bytes(done)}")
+
+
+class BulkProgress(tk.Toplevel):
+    """A count such as 120/480, and Cancel, while a lookup or a queue runs."""
+
+    def __init__(self, master: tk.Misc, title: str, on_cancel) -> None:
+        super().__init__(master)
+        self.title(title)
+        self.transient(master)
+        self.resizable(False, False)
+        apply_theme(self)
+        self._closed = False
+        self._on_cancel = on_cancel
+        frame = ttk.Frame(self, padding=16)
+        frame.pack(fill="both", expand=True)
+        self.label_var = tk.StringVar(value="0/0")
+        ttk.Label(frame, textvariable=self.label_var).pack(anchor="w")
+        self.bar = ttk.Progressbar(frame, length=360, mode="determinate", maximum=1, value=0)
+        self.bar.pack(fill="x", pady=(10, 12))
+        self.cancel_button = ttk.Button(frame, text="Cancel", command=self._cancel)
+        self.cancel_button.pack(anchor="e")
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Escape>", lambda _event: self._cancel())
+
+    def _cancel(self) -> None:
+        if self._closed:
+            return
+        try:
+            self.cancel_button.configure(state="disabled")
+        except tk.TclError:
+            pass
+        self._on_cancel()
+
+    def set_count(self, done: int, total: int) -> None:
+        if self._closed:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        done = max(0, int(done))
+        total = max(0, int(total))
+        self.label_var.set(f"{done}/{total}")
+        ceiling = max(1, total)
+        self.bar.configure(maximum=ceiling, value=min(done, ceiling))
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+        _release_tk_objects(self)
+
+
+class BulkJob:
+    """Look up or queue files off the Tk thread. The window stays responsive."""
+
+    def __init__(self, app, title: str, work, on_done) -> None:
+        self.app = app
+        self.cancel_event = threading.Event()
+        self.done = threading.Event()
+        self.done_count = 0
+        self.total_count = 0
+        self.result = None
+        self.error = None
+        self._applied = False
+        self._on_done = on_done
+        self.window = BulkProgress(app, title, self.cancel)
+        self._thread = threading.Thread(target=self._run, args=(work,), name="bulk-job", daemon=True)
+        self._thread.start()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+        try:
+            self.window.label_var.set(f"Stopping at {self.done_count}/{self.total_count}")
+        except tk.TclError:
+            pass
+
+    def cancelled(self) -> bool:
+        return self.cancel_event.is_set()
+
+    def report(self, done: int, total: int) -> None:
+        """Record the count. The Tk thread paints it; this can run on a worker."""
+        self.done_count = max(0, int(done))
+        self.total_count = max(0, int(total))
+
+    def _run(self, work) -> None:
+        try:
+            self.result = work(self)
+        except Exception as exc:
+            self.error = exc
+        finally:
+            self.done.set()
+
+    def _finish(self) -> None:
+        if self._applied:
+            return
+        self._applied = True
+        self.window.close()
+        if getattr(self.app, "_bulk_job", None) is self:
+            self.app._bulk_job = None
+        try:
+            self._on_done(self.result, self.error, self.cancel_event.is_set())
+        except Exception:
+            log.exception("Bulk job could not finish")
 
 
 @dataclass
@@ -4661,7 +4772,47 @@ class DesktopApp(tk.Tk):
             )
         return files, mb, daily
 
-    def _browse_download_plan(self, our_files: int, our_mb: int, daily: int):
+    def _begin_bulk(self, title: str, work, on_done):
+        current = getattr(self, "_bulk_job", None)
+        if current is not None and not current._applied:
+            current.cancel()
+            current._applied = True
+            current.window.close()
+        job = BulkJob(self, title, work, on_done)
+        self._bulk_job = job
+        if not getattr(self, "_bulk_watching", False):
+            self._bulk_watching = True
+            self.after(50, self._watch_bulk)
+        return job
+
+    def _watch_bulk(self) -> None:
+        """Paint the count and apply a finished job. Scheduled on the Tk thread."""
+        self._bulk_watching = False
+        job = getattr(self, "_bulk_job", None)
+        if job is None or job._applied:
+            return
+        try:
+            job.window.set_count(job.done_count, job.total_count)
+        except tk.TclError:
+            pass
+        if job.done.is_set():
+            job._finish()
+            return
+        self._bulk_watching = True
+        try:
+            self.after(50, self._watch_bulk)
+        except tk.TclError:
+            self._bulk_watching = False
+
+    def finish_bulk(self, timeout: float = 5.0) -> None:
+        """Wait until a background lookup or queue has finished, then apply it."""
+        job = getattr(self, "_bulk_job", None)
+        if job is not None:
+            job.done.wait(timeout)
+        self._watch_bulk()
+        self.update()
+
+    def _browse_download_plan(self, our_files: int, our_mb: int, daily: int, matches=None):
         payload = getattr(self, "_browse_payload", None) or {}
         username = self.browse_user_var.get().strip()
         profile = payload.get("profile") or {}
@@ -4686,8 +4837,9 @@ class DesktopApp(tk.Tk):
         room = daily_room(used, daily_cap)
         lines = list(limits.lines)
         lines.append(f"Used today: {used} of {daily_cap}.")
-        rows = share_file_rows(username, payload.get("directories") or [])
-        matches = self.worker.match_user_files(rows) if rows else []
+        if matches is None:
+            rows = share_file_rows(username, payload.get("directories") or [])
+            matches = self.worker.match_user_files(rows) if rows else []
         chosen: list = []
         skipped = 0
         if limits.allowed and room <= 0:
@@ -4730,14 +4882,24 @@ class DesktopApp(tk.Tk):
 
     def _save_limits_from_window(self) -> None:
         files, mb, daily = self._commit_browse_limits()
-        _limits, chosen, lines = self._browse_download_plan(files, mb, daily)
+        _limits, chosen, lines = self._browse_download_plan(
+            files,
+            mb,
+            daily,
+            matches=getattr(self, "_browse_matches", []) or [],
+        )
         self._set_limits_text(lines)
         allowed = _limits.allowed and bool(chosen)
         self._set_download_button(allowed)
 
     def _download_from_limits(self) -> None:
         files, mb, daily = self._commit_browse_limits()
-        limits, chosen, lines = self._browse_download_plan(files, mb, daily)
+        limits, chosen, lines = self._browse_download_plan(
+            files,
+            mb,
+            daily,
+            matches=getattr(self, "_browse_matches", []) or [],
+        )
         if not limits.allowed or not chosen:
             self._set_limits_text(lines)
             self._set_download_button(False)
@@ -4753,20 +4915,50 @@ class DesktopApp(tk.Tk):
         if not payload or not username:
             self.browse_status.set("Browse a user first.")
             return
-        self._show_limits(username)
+        files, mb, daily = self._saved_browse_caps()
+        directories = list(payload.get("directories") or [])
 
-    def _show_limits(self, username: str) -> None:
+        def work(job):
+            rows = share_file_rows(username, directories)
+            matches = []
+            if rows and not job.cancelled():
+                matches = self.worker.match_user_files(rows, progress=job.report, cancel=job.cancelled)
+            else:
+                job.report(0, len(rows))
+            return {"matches": matches, "done": job.done_count, "total": job.total_count}
+
+        def on_done(result, error, cancelled) -> None:
+            if error is not None:
+                self.browse_status.set(str(error).strip() or "Could not check this user's files.")
+                return
+            payload_result = result if isinstance(result, dict) else {}
+            if cancelled:
+                self.browse_status.set(f"Stopped at {payload_result.get('done', 0)}/{payload_result.get('total', 0)}.")
+                return
+            self._browse_matches = list(payload_result.get("matches") or [])
+            self._browse_match_user = username
+            self._show_limits(username, files, mb, daily)
+
+        self._begin_bulk("Checking files", work, on_done)
+
+    def _show_limits(self, username: str, files: int | None = None, mb: int | None = None, daily: int | None = None) -> None:
         existing = getattr(self, "_limits_window", None)
         if existing is not None:
             try:
                 existing.destroy()
             except tk.TclError:
                 pass
-        files, mb, daily = self._saved_browse_caps()
+        if files is None or mb is None or daily is None:
+            files, mb, daily = self._saved_browse_caps()
         self._limits_files = tk.StringVar(value=str(files))
         self._limits_mb = tk.StringVar(value=str(mb))
         self._limits_daily = tk.StringVar(value=str(daily))
-        limits, chosen, lines = self._browse_download_plan(files, mb, daily)
+        limits, chosen, lines = self._browse_download_plan(
+            files,
+            mb,
+            daily,
+            matches=getattr(self, "_browse_matches", []) or [],
+        )
         window = tk.Toplevel(self)
         window.title("Download limits")
         window.transient(self)
@@ -4823,28 +5015,31 @@ class DesktopApp(tk.Tk):
         self.browse_status.set(
             f"Downloading {len(specs)} file(s), {limits.files_at_once} at a time, {limits.pace_seconds}s apart."
         )
-        future = asyncio.run_coroutine_threadsafe(
-            self.worker.download_paced(
-                specs,
-                pace_seconds=limits.pace_seconds,
-                files_at_once=limits.files_at_once,
-            ),
-            loop,
-        )
 
-        def done() -> None:
-            try:
-                text = future.result(timeout=max(60, limits.pace_seconds * max(1, len(specs)) + 120))
-            except Exception as exc:
-                text = str(exc).strip() or "Download failed."
+        def work(job):
+            future = asyncio.run_coroutine_threadsafe(
+                self.worker.download_paced(
+                    specs,
+                    pace_seconds=limits.pace_seconds,
+                    files_at_once=limits.files_at_once,
+                    on_progress=job.report,
+                    should_cancel=job.cancelled,
+                ),
+                loop,
+            )
+            return future.result(timeout=max(60, limits.pace_seconds * max(1, len(specs)) + 120))
 
-            def apply(text=text) -> None:
-                self.browse_status.set(text)
-                self.refresh_notices()
+        def on_done(result, error, cancelled) -> None:
+            if cancelled:
+                text = f"Stopped at {job.done_count}/{job.total_count}."
+            elif error is not None:
+                text = str(error).strip() or "Download failed."
+            else:
+                text = str(result or "")
+            self.browse_status.set(text)
+            self.refresh_notices()
 
-            self._post(apply)
-
-        threading.Thread(target=done, name="browse-missing", daemon=True).start()
+        job = self._begin_bulk("Queueing downloads", work, on_done)
 
     def _insert_browse_children(self, parent: str, path: str) -> None:
         if path in self._browse_opened:
@@ -5608,22 +5803,46 @@ class DesktopApp(tk.Tk):
 
     def _download_wanted_from_user(self, board: SearchBoard, username: str) -> None:
         files = [item for item in board.files if item.username == username]
-        matches = self.worker.match_user_files(files)
-        if not matches:
-            text = f"No wanted matches in {username}'s results."
+        query = board.query
+
+        def work(job):
+            matches = []
+            if files and not job.cancelled():
+                matches = self.worker.match_user_files(files, progress=job.report, cancel=job.cancelled)
+            else:
+                job.report(0, len(files))
+            return {"matches": matches, "done": job.done_count, "total": job.total_count}
+
+        def on_done(result, error, cancelled) -> None:
+            if board.closed:
+                return
+            if error is not None:
+                if board.status is not None:
+                    board.status.set(str(error).strip() or "Could not check these files.")
+                return
+            payload = result if isinstance(result, dict) else {}
+            if cancelled:
+                if board.status is not None:
+                    board.status.set(f"Stopped at {payload.get('done', 0)}/{payload.get('total', 0)}.")
+                return
+            matches = list(payload.get("matches") or [])
+            if not matches:
+                text = f"No wanted matches in {username}'s results."
+                if board.status is not None:
+                    board.status.set(text)
+                log.info("Download all wanted from %s for %r: %s", username, query, text)
+                return
+            text = f"{len(matches)} wanted {_wanted_word(len(matches))} matched from {username}."
             if board.status is not None:
                 board.status.set(text)
-            log.info("Download all wanted from %s for %r: %s", username, board.query, text)
-            return
-        text = f"{len(matches)} wanted {_wanted_word(len(matches))} matched from {username}."
-        if board.status is not None:
-            board.status.set(text)
-        log.info("Download all wanted from %s for %r: %s", username, board.query, text)
-        self._confirm_wanted(
-            matches,
-            lambda picked, board=board: self._queue_matches(board, picked),
-            summary=text,
-        )
+            log.info("Download all wanted from %s for %r: %s", username, query, text)
+            self._confirm_wanted(
+                matches,
+                lambda picked, board=board: self._queue_matches(board, picked),
+                summary=text,
+            )
+
+        self._begin_bulk("Checking files", work, on_done)
 
     def _download_wanted_from_everyone(self, board: SearchBoard) -> None:
         scope = self._search_wanted_scope(board)
@@ -5632,23 +5851,50 @@ class DesktopApp(tk.Tk):
             if board.status is not None:
                 board.status.set("Search for an artist first.")
             return
-        plan = self.worker.plan_wanted_downloads(board.files, **scope)
-        text = plan.line()
-        extra = ""
-        if plan.skipped and plan.matched == 0 and plan.missing == 0:
-            extra = f" {plan.skipped} already downloaded or queued."
-        elif plan.matched == 0 and plan.missing == 0:
-            extra = " No wanted rows for this artist."
-        if board.status is not None:
-            board.status.set(text + extra)
-        log.info("Download all wanted for %r: %s%s", artist, text, extra)
-        if not plan.matches:
-            return
-        self._confirm_wanted(
-            plan.matches,
-            lambda picked, board=board, text=text: self._queue_matches(board, picked, note=text),
-            summary=text,
-        )
+        files = list(board.files)
+
+        def work(job):
+            plan = self.worker.plan_wanted_downloads(
+                files,
+                progress=job.report,
+                cancel=job.cancelled,
+                **scope,
+            )
+            return {"plan": plan, "done": job.done_count, "total": job.total_count}
+
+        def on_done(result, error, cancelled) -> None:
+            if board.closed:
+                return
+            if error is not None:
+                if board.status is not None:
+                    board.status.set(str(error).strip() or "Could not check these files.")
+                return
+            payload = result if isinstance(result, dict) else {}
+            if cancelled:
+                if board.status is not None:
+                    board.status.set(f"Stopped at {payload.get('done', 0)}/{payload.get('total', 0)}.")
+                return
+            plan = payload.get("plan")
+            if plan is None:
+                return
+            text = plan.line()
+            extra = ""
+            if plan.skipped and plan.matched == 0 and plan.missing == 0:
+                extra = f" {plan.skipped} already downloaded or queued."
+            elif plan.matched == 0 and plan.missing == 0:
+                extra = " No wanted rows for this artist."
+            if board.status is not None:
+                board.status.set(text + extra)
+            log.info("Download all wanted for %r: %s%s", artist, text, extra)
+            if not plan.matches:
+                return
+            self._confirm_wanted(
+                plan.matches,
+                lambda picked, board=board, text=text: self._queue_matches(board, picked, note=text),
+                summary=text,
+            )
+
+        self._begin_bulk("Checking files", work, on_done)
 
     def _confirm_wanted(self, matches, on_queue, summary: str = "") -> None:
         """Ask before queueing Download all wanted, unless that popup was turned off."""
@@ -5715,16 +5961,6 @@ class DesktopApp(tk.Tk):
             if board.status is not None:
                 board.status.set("Start the worker to download. Downloads use that Soulseek connection.")
             return
-        for item in files:
-            item.state = "queued"
-        self._paint_search(board)
-        if board.status is not None:
-            message = f"Queued {len(files)} file(s)"
-            if note:
-                message = f"{message}. {note}"
-            board.status.set(message)
-            if note:
-                log.info("%s", message)
         link = None
         if board.link is not None:
             link = {
@@ -5741,6 +5977,19 @@ class DesktopApp(tk.Tk):
             if link is not None:
                 for spec in specs:
                     spec["link"] = link
+        if len(specs) >= BULK_QUEUE_AT:
+            self._queue_specs_in_background(board, files, specs, note, link, loop)
+            return
+        for item in files:
+            item.state = "queued"
+        self._paint_search(board)
+        if board.status is not None:
+            message = f"Queued {len(files)} file(s)"
+            if note:
+                message = f"{message}. {note}"
+            board.status.set(message)
+            if note:
+                log.info("%s", message)
         future = asyncio.run_coroutine_threadsafe(self.worker.download_manual(specs, link), loop)
 
         def done() -> None:
@@ -5752,6 +6001,71 @@ class DesktopApp(tk.Tk):
             self._post(lambda: self._refresh_open_search_states())
 
         threading.Thread(target=done, name="manual-download", daemon=True).start()
+
+    def _queue_specs_in_background(self, board, files, specs, note, link, loop) -> None:
+        """Hand a long list to Soulseek off the Tk thread, with a count and Cancel."""
+        ready = threading.Event()
+        outcome = {"queued": 0, "total": len(specs)}
+
+        def on_queued(done_count, total) -> None:
+            outcome["queued"] = int(done_count)
+            outcome["total"] = int(total)
+            ready.set()
+
+        def work(job):
+            job.report(0, len(specs))
+            future = asyncio.run_coroutine_threadsafe(
+                self.worker.download_manual(
+                    specs,
+                    link,
+                    on_progress=job.report,
+                    should_cancel=job.cancelled,
+                    on_queued=on_queued,
+                ),
+                loop,
+            )
+            while not ready.wait(0.05):
+                if future.done():
+                    break
+            if future.done():
+                error = future.exception()
+                if error is not None:
+                    raise error
+            else:
+                def watch() -> None:
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        self._post(lambda exc=exc: self._search_failed(board, exc))
+                        return
+                    self._post(lambda: self._refresh_open_search_states())
+
+                threading.Thread(target=watch, name="manual-download", daemon=True).start()
+            return {"queued": outcome["queued"], "total": outcome["total"], "done": job.done_count}
+
+        def on_done(result, error, cancelled) -> None:
+            if board.closed:
+                return
+            if error is not None:
+                self._search_failed(board, error)
+                return
+            payload = result if isinstance(result, dict) else {}
+            count = int(payload.get("queued") or 0)
+            for item in files[:count]:
+                item.state = "queued"
+            self._paint_search(board)
+            if board.status is None:
+                return
+            if cancelled:
+                board.status.set(f"Stopped at {payload.get('done', count)}/{payload.get('total', len(specs))}.")
+                return
+            message = f"Queued {count} file(s)"
+            if note:
+                message = f"{message}. {note}"
+                log.info("%s", message)
+            board.status.set(message)
+
+        self._begin_bulk("Queueing downloads", work, on_done)
 
     def browse_selected_folder(self) -> None:
         board = self._current_board()

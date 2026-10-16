@@ -35,9 +35,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Rummagarr-Setup
-          path: |
-            dist/Rummagarr-Setup-*.exe
-            dist/LidarrSoulseek-Setup-*.exe
+          path: dist/Rummagarr-Setup-*.exe
           if-no-files-found: error
 
   # contents: write is only on this job. Pull requests and ordinary pushes
@@ -74,34 +72,27 @@ jobs:
             exit 1
           fi
           asset="dist/Rummagarr-Setup-${version}.exe"
-          legacy="dist/LidarrSoulseek-Setup-${version}.exe"
           if [ ! -f "$asset" ]; then
             echo "Installer not found: $asset" >&2
             ls -la dist >&2 || true
             exit 1
           fi
-          if [ ! -f "$legacy" ]; then
-            cp "$asset" "$legacy"
-          fi
           (
             cd dist
             sha256sum "Rummagarr-Setup-${version}.exe" > "Rummagarr-Setup-${version}.exe.sha256"
-            sha256sum "LidarrSoulseek-Setup-${version}.exe" > "LidarrSoulseek-Setup-${version}.exe.sha256"
           )
           notes_file=$(mktemp)
           python3 scripts/release_notes.py --version "$version" > "$notes_file"
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" \
               "$asset" "${asset}.sha256" \
-              "$legacy" "${legacy}.sha256" \
               --clobber
             gh release edit "$tag" --notes-file "$notes_file"
           else
             gh release create "$tag" \
               "$asset" "${asset}.sha256" \
-              "$legacy" "${legacy}.sha256" \
               --title "Rummagarr ${version}" \
               --notes-file "$notes_file" \
               --target "${{ github.sha }}"
           fi
-          echo "Published Rummagarr-Setup and LidarrSoulseek-Setup on ${tag}"
+          echo "Published Rummagarr-Setup on ${tag}"

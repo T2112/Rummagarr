@@ -2,7 +2,7 @@
 
 Rummagarr fills the albums and tracks Lidarr still wants. It searches Soulseek, downloads the files, and asks Lidarr to import and rename them. It is a Windows desktop app. No Docker. No slskd.
 
-**Version 1.18.3.** The GitHub repository is [T2112/lidarr-soulseek](https://github.com/T2112/lidarr-soulseek).
+**Version 1.19.0.** The GitHub repository is [T2112/rummagarr](https://github.com/T2112/rummagarr).
 
 Only download music you have the rights to. Soulseek is a peer-to-peer network, and you are responsible for what you download and what you share.
 
@@ -18,7 +18,7 @@ Only download music you have the rights to. Soulseek is a peer-to-peer network, 
 
 ## Install on Windows
 
-Download `Rummagarr-Setup-<version>.exe` from the [latest release](https://github.com/T2112/lidarr-soulseek/releases/latest). No GitHub account is required. The installer adds a Start Menu shortcut and a desktop shortcut, both named Rummagarr. An older Lidarr Soulseek install is upgraded in place.
+Download `Rummagarr-Setup-<version>.exe` from the [latest release](https://github.com/T2112/rummagarr/releases/latest). No GitHub account is required. The installer adds a Start Menu shortcut and a desktop shortcut, both named Rummagarr. An older install is upgraded in place.
 
 ### Windows SmartScreen
 
@@ -51,11 +51,11 @@ Unblock-File .\Rummagarr-Setup-<version>.exe
 The installed app checks GitHub Releases when it opens. **Help → Check for updates** runs that check immediately. Config, the database, and the log live in `%LOCALAPPDATA%\Rummagarr\`.
 
 A custom Lidarr import list of MusicBrainz IDs is at  
-https://raw.githubusercontent.com/T2112/lidarr-soulseek/main/lists/lidarr-custom-list.json
+https://raw.githubusercontent.com/T2112/rummagarr/main/lists/lidarr-custom-list.json
 
 ## Help
 
-Questions, bugs, and ideas go to [GitHub Issues](https://github.com/T2112/lidarr-soulseek/issues). Include the app version from **Help → About**. For a crash, attach the zip from **Help → Open crash folder**.
+Questions, bugs, and ideas go to [GitHub Issues](https://github.com/T2112/rummagarr/issues). Include the app version from **Help → About**. For a crash, attach the zip from **Help → Open crash folder**.
 
 ## Sponsor
 
@@ -77,11 +77,17 @@ dist\Rummagarr-Setup-1.11.0.exe
 
 The same steps run in GitHub Actions (`.github/workflows/windows-installer.yml`) on `windows-latest`. Pull requests and pushes to `main` upload the installer as a workflow artifact.
 
-To publish a public download, push a tag `v<version>` that matches the `VERSION` file (for example `v1.18.3`). That run creates a GitHub Release and attaches `Rummagarr-Setup-<version>.exe` and the same file as `LidarrSoulseek-Setup-<version>.exe`, so an installed 1.9.4 can still update. The release notes are the matching section of `CHANGELOG.md`, followed by the install instructions. The release fails if that section is missing. You can also publish the version already in `VERSION` without making the tag yourself: **Actions → Windows installer → Run workflow**, and choose the `main` branch. If that release already exists, the workflow replaces the installer files and the notes.
+To publish a public download, push a tag `v<version>` that matches the `VERSION` file (for example `v1.19.0`). That run creates a GitHub Release and attaches `Rummagarr-Setup-<version>.exe`. The release notes are the matching section of `CHANGELOG.md`, followed by the install instructions. The release fails if that section is missing. You can also publish the version already in `VERSION` without making the tag yourself: **Actions → Windows installer → Run workflow**, and choose the `main` branch. If that release already exists, the workflow replaces the installer and the notes.
 
 This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs on, and Inno Setup is a Windows program. Push the branch and let that workflow produce the `.exe`.
 
 `python main.py` still runs the worker without the window, for the original script install below.
+
+## What's new in 1.19.0
+
+- Download all missing, Download all wanted, and a long queue show a progress count, such as 120/480, with Cancel. The check and the queue run in the background, so the window stays responsive. Cancel stops the rest. Files already queued stay queued.
+- Releases publish `Rummagarr-Setup-<version>.exe` only. An older install still upgrades in place. The update check looks at [T2112/rummagarr](https://github.com/T2112/rummagarr) and, if that repository is not there yet, the previous repository.
+- Full changelog: [CHANGELOG.md](CHANGELOG.md)
 
 ## What's new in 1.18.3
 
@@ -155,7 +161,7 @@ This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs 
 
 ## What's new in 1.10.0
 
-- The app is named Rummagarr: the window title, About box, Start menu shortcut, desktop shortcut, and Add/Remove Programs entry. The installer is `Rummagarr-Setup-<version>.exe`. An existing Lidarr Soulseek install upgrades in place, and its settings are copied into the Rummagarr data folder.
+- The app is named Rummagarr: the window title, About box, Start menu shortcut, desktop shortcut, and Add/Remove Programs entry. The installer is `Rummagarr-Setup-<version>.exe`. An existing install upgrades in place, and its settings are copied into the Rummagarr data folder.
 - Status has **Auto-import to Lidarr after each artist**. It is off until checked. When it is on, and the download queue empties after an artist finishes, Lidarr imports that download folder and renames the artist's files. The status line says when that import is running, done, or failed.
 - The window is a dark sidebar dashboard: Status, Wanted, Search, Shared, and Settings. Settings can switch to Light without a restart. The installer and the window use the teal R icon.
 - Full changelog: [CHANGELOG.md](CHANGELOG.md)
@@ -265,7 +271,7 @@ This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs 
 
 ## Install
 
-1. Unzip this folder somewhere permanent, for example `C:\Tools\lidarr-soulseek`.  
+1. Unzip this folder somewhere permanent, for example `C:\Tools\rummagarr`.  
    A network drive like `Z:` works but PowerShell may block scripts there.
 2. Open PowerShell **in this folder**:
 

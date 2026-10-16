@@ -790,7 +790,7 @@ def test_download_all_wanted_can_skip_the_confirmation(desktop):
     )
     desktop.update()
     desktop.download_all_wanted()
-    desktop.update()
+    desktop.finish_bulk()
     previews = [child for child in desktop.winfo_children() if isinstance(child, WantedPreview)]
     assert len(previews) == 1
     preview = previews[0]
@@ -803,7 +803,7 @@ def test_download_all_wanted_can_skip_the_confirmation(desktop):
     assert not [child for child in desktop.winfo_children() if isinstance(child, WantedPreview)]
 
     desktop.download_all_wanted()
-    desktop.update()
+    desktop.finish_bulk()
     assert not [child for child in desktop.winfo_children() if isinstance(child, WantedPreview)]
     assert "Start the worker" in board.status.get()
 
@@ -818,7 +818,7 @@ def test_download_all_wanted_can_skip_the_confirmation(desktop):
     desktop.notebook.select(desktop.search_tab)
     desktop.searches.select(board.frame)
     desktop.download_all_wanted()
-    desktop.update()
+    desktop.finish_bulk()
     again = [child for child in desktop.winfo_children() if isinstance(child, WantedPreview)]
     assert len(again) == 1
     again[0].destroy()
@@ -869,7 +869,7 @@ def test_download_all_wanted_without_a_selected_user(desktop, caplog):
     desktop.update()
     with caplog.at_level(logging.INFO, logger="lidarr_slsk.desktop"):
         desktop.download_all_wanted()
-    desktop.update()
+        desktop.finish_bulk()
     summary = "2 wanted items matched from 2 users, and 0 wanted items not found."
     assert board.status.get() == summary
     assert summary in caplog.text
@@ -885,14 +885,14 @@ def test_download_all_wanted_without_a_selected_user(desktop, caplog):
     noise = next(iid for iid, name in board.row_users.items() if name == "noise")
     board.tree.selection_set(noise)
     desktop.download_all_wanted()
-    desktop.update()
+    desktop.finish_bulk()
     assert board.status.get() == "No wanted matches in noise's results."
     assert not [child for child in desktop.winfo_children() if isinstance(child, WantedPreview)]
 
     slow = next(iid for iid, name in board.row_users.items() if name == "slow")
     board.tree.selection_set(slow)
     desktop.download_all_wanted()
-    desktop.update()
+    desktop.finish_bulk()
     assert board.status.get() == "1 wanted item matched from slow."
     selected = [child for child in desktop.winfo_children() if isinstance(child, WantedPreview)]
     assert len(selected) == 1
@@ -1034,7 +1034,7 @@ def test_stats_page_and_browse_limits_popup(desktop):
         "directories": [{"name": "Music", "files": [{"filename": "01 Blue.flac", "size": 100, "extension": "flac"}]}],
     }
     desktop.browse_user_var.set("goodpeer")
-    desktop.worker.match_user_files = lambda files: [
+    desktop.worker.match_user_files = lambda files, **_kwargs: [
         WantedMatch(
             username="goodpeer",
             filename="01 Blue.flac",
@@ -1057,7 +1057,7 @@ def test_stats_page_and_browse_limits_popup(desktop):
         browse_daily_files=20,
     )
     desktop.download_browse_missing()
-    desktop.update()
+    desktop.finish_bulk()
     window = desktop._limits_window
     text = desktop._limits_text.get("1.0", "end")
     assert "2 files" in text
@@ -1072,7 +1072,7 @@ def test_stats_page_and_browse_limits_popup(desktop):
         "max 100 files. one album at a time. wait 30 seconds between downloads."
     )
     desktop.download_browse_missing()
-    desktop.update()
+    desktop.finish_bulk()
     text = desktop._limits_text.get("1.0", "end")
     assert "25 files" in text
     assert "3 files" not in text
@@ -1098,7 +1098,7 @@ def test_stats_page_and_browse_limits_popup(desktop):
 
     desktop._browse_payload["profile"]["upload_permissions"] = 0
     desktop.download_browse_missing()
-    desktop.update()
+    desktop.finish_bulk()
     assert "Uploads are off" in desktop._limits_text.get("1.0", "end")
     assert not any(button.cget("text") == "Download" for button in _buttons(desktop._limits_window))
     desktop._limits_window.destroy()
@@ -1238,3 +1238,152 @@ def test_private_messages_badge_and_compose_box(desktop):
     desktop.notebook.select(desktop.settings_tab)
     desktop.update()
     assert desktop._settings_form.fields["crash_bundle"].get() is False
+
+
+def test_download_all_missing_checks_off_the_ui_thread_and_cancel_stops(desktop):
+    started = threading.Event()
+    release = threading.Event()
+    seen = {}
+
+    def match(files, progress=None, cancel=None):
+        seen["thread"] = threading.current_thread().name
+        total = 8
+        for index in range(1, total + 1):
+            if cancel is not None and cancel():
+                seen["stopped"] = index - 1
+                return []
+            if progress is not None:
+                progress(index, total)
+            if index == 1:
+                started.set()
+                if not release.wait(3):
+                    return []
+        return []
+
+    desktop._browse_payload = {
+        "username": "goodpeer",
+        "profile": {"description": "", "upload_permissions": 1, "queue_length": 0},
+        "directories": [{"name": "Music", "files": [{"filename": "01 Blue.flac", "size": 100, "extension": "flac"}]}],
+    }
+    desktop.browse_user_var.set("goodpeer")
+    desktop.worker.match_user_files = match
+    desktop.download_browse_missing()
+    assert started.wait(2)
+    assert seen["thread"] == "bulk-job"
+    desktop._watch_bulk()
+    window = desktop._bulk_job.window
+    assert window.label_var.get() == "1/8"
+    assert any(button.cget("text") == "Cancel" for button in _buttons(window))
+    next(button for button in _buttons(window) if button.cget("text") == "Cancel").invoke()
+    release.set()
+    desktop.finish_bulk()
+    assert desktop.browse_status.get() == "Stopped at 1/8."
+    limits = getattr(desktop, "_limits_window", None)
+    assert limits is None or not limits.winfo_exists()
+
+
+def test_download_all_wanted_plans_off_the_ui_thread(desktop):
+    from sharing import WantedPick
+
+    started = threading.Event()
+    release = threading.Event()
+    seen = {}
+
+    def plan(files, **kwargs):
+        seen["thread"] = threading.current_thread().name
+        progress = kwargs.get("progress")
+        cancel = kwargs.get("cancel")
+        total = 4
+        for index in range(1, total + 1):
+            if cancel is not None and cancel():
+                break
+            if progress is not None:
+                progress(index, total)
+            if index == 1:
+                started.set()
+                if not release.wait(3):
+                    break
+        return WantedPick()
+
+    desktop.worker.plan_wanted_downloads = plan
+    board = desktop._add_search_board("Ella Langley", None)
+    desktop.searches.select(board.frame)
+    from search_model import SearchFile
+
+    desktop.show_search_files(
+        board,
+        [SearchFile(username="fast", filename=r"Ella Langley\Hungover\01 Blue.flac", extension="flac", size=1000)],
+    )
+    desktop.download_all_wanted()
+    assert started.wait(2)
+    assert seen["thread"] == "bulk-job"
+    desktop._watch_bulk()
+    assert desktop._bulk_job.window.label_var.get() == "1/4"
+    desktop._bulk_job.cancel()
+    release.set()
+    desktop.finish_bulk()
+    assert board.status.get() == "Stopped at 1/4."
+    from desktop_app import WantedPreview
+
+    assert not [child for child in desktop.winfo_children() if isinstance(child, WantedPreview)]
+
+
+def test_a_long_queue_shows_a_count_and_cancel_stops_the_rest(desktop):
+    from search_model import SearchFile
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, name="queue-loop", daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 2
+    while not loop.is_running() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    desktop.worker._loop = loop
+    started = threading.Event()
+    release = threading.Event()
+
+    async def fake(specs, link=None, *, on_progress=None, should_cancel=None, on_queued=None):
+        total = len(specs)
+        queued = 0
+        try:
+            for index in range(1, total + 1):
+                if should_cancel is not None and should_cancel():
+                    break
+                queued = index
+                if on_progress is not None:
+                    on_progress(index, total)
+                if index == 1:
+                    started.set()
+                    while not release.is_set():
+                        if should_cancel is not None and should_cancel():
+                            break
+                        await asyncio.sleep(0.01)
+                    if should_cancel is not None and should_cancel():
+                        break
+            return "done"
+        finally:
+            if on_queued is not None:
+                on_queued(queued, total)
+
+    desktop.worker.download_manual = fake
+    board = desktop._add_search_board("bulk", None)
+    desktop.searches.select(board.frame)
+    files = [
+        SearchFile(username="peer", filename=f"song-{index}.flac", extension="flac", size=10)
+        for index in range(30)
+    ]
+    desktop.show_search_files(board, files)
+    desktop.queue_search_files(board, list(files))
+    try:
+        assert started.wait(2)
+        desktop._watch_bulk()
+        window = desktop._bulk_job.window
+        assert window.label_var.get() == "1/30"
+        assert any(button.cget("text") == "Cancel" for button in _buttons(window))
+        next(button for button in _buttons(window) if button.cget("text") == "Cancel").invoke()
+        release.set()
+        desktop.finish_bulk()
+        assert board.status.get() == "Stopped at 1/30."
+        assert sum(1 for item in files if item.state == "queued") == 1
+    finally:
+        release.set()
+        loop.call_soon_threadsafe(loop.stop)

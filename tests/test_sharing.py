@@ -378,6 +378,31 @@ def test_plan_wanted_downloads_uses_the_artist_and_skips_queued_files(tmp_path):
         worker.close()
 
 
+def test_browse_share_dicts_match_wanted_tracks(tmp_path):
+    worker = make_worker(tmp_path)
+    try:
+        items = build_catalog(
+            [album(1, "Ella Langley", "Hungover", files=0, total=1)],
+            [hole(11, 1, "Ella Langley", "Hungover", "Hungover")],
+        )
+        worker.store.write_wanted_page(items_to_rows(items))
+        matches = worker.match_user_files(
+            [
+                {
+                    "username": "goodpeer",
+                    "filename": r"Music\Ella Langley\Hungover\01 Hungover.flac",
+                    "size": 100,
+                    "extension": "flac",
+                    "folder": "Music",
+                }
+            ]
+        )
+        assert [match.song for match in matches] == ["Hungover"]
+        assert matches[0].username == "goodpeer"
+    finally:
+        worker.close()
+
+
 def test_store_lookup_does_not_return_other_artists(tmp_path):
     worker = make_worker(tmp_path)
     try:
