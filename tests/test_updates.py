@@ -154,6 +154,59 @@ def test_skip_version_is_remembered_until_a_newer_release(tmp_path):
         store.close()
 
 
+def test_update_check_tries_rummagarr_then_the_previous_repository():
+    from updater import RELEASE_API_URLS
+
+    assert RELEASE_API_URLS[0].endswith("/T2112/rummagarr/releases/latest")
+    assert RELEASE_API_URLS[1].endswith("/T2112/lidarr-soulseek/releases/latest")
+    seen = []
+
+    def missing_new_name(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if "rummagarr" in str(request.url):
+            return httpx.Response(404, json={"message": "Not Found"})
+        return httpx.Response(200, json=_payload("v1.5.0"))
+
+    with httpx.Client(transport=httpx.MockTransport(missing_new_name)) as client:
+        status = check_for_update("1.4.0", client=client)
+    assert seen[0].startswith("https://api.github.com/repos/T2112/rummagarr/")
+    assert "lidarr-soulseek" in seen[1]
+    assert status.latest == "1.5.0"
+    assert status.error is None
+
+    seen.clear()
+
+    def published(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(200, json=_payload("v1.6.0"))
+
+    with httpx.Client(transport=httpx.MockTransport(published)) as client:
+        status = check_for_update("1.4.0", client=client)
+    assert len(seen) == 1
+    assert "rummagarr" in seen[0]
+    assert status.latest == "1.6.0"
+
+    def both_missing(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    seen.clear()
+    with httpx.Client(transport=httpx.MockTransport(both_missing)) as client:
+        status = check_for_update("1.4.0", client=client)
+    assert len(seen) == 2
+    assert "No GitHub release" in (status.error or "")
+
+    def limited(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(403, json={"message": "API rate limit exceeded"})
+
+    seen.clear()
+    with httpx.Client(transport=httpx.MockTransport(limited)) as client:
+        status = check_for_update("1.4.0", client=client)
+    assert len(seen) == 1
+    assert status.error == "GitHub rate limit reached. Try again in a little while."
+
+
 def test_check_reports_rate_limit_and_network_errors():
     def rate_limit(request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, json={"message": "API rate limit exceeded for 203.0.113.4."})

@@ -57,8 +57,4 @@ $setup = Join-Path $Root "dist\Rummagarr-Setup-$version.exe"
 if (-not (Test-Path $setup)) {
     throw "Installer was not written: $setup"
 }
-# 1.9.4's updater asks GitHub for this exact file name.
-$legacy = Join-Path $Root "dist\LidarrSoulseek-Setup-$version.exe"
-Copy-Item -Path $setup -Destination $legacy -Force
 Write-Host "Installer: $setup"
-Write-Host "Legacy updater name: $legacy"

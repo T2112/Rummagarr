@@ -18,11 +18,17 @@ import httpx
 from config_loader import app_version
 from process_launch import popen_hidden
 
-LATEST_RELEASE_URL = "https://api.github.com/repos/T2112/lidarr-soulseek/releases/latest"
-RELEASES_PAGE_URL = "https://github.com/T2112/lidarr-soulseek/releases/latest"
+# The repository is moving to T2112/rummagarr. Until that rename, the old URL
+# still serves the release, so the check tries the new name and then the old one.
+RELEASE_API_URLS = (
+    "https://api.github.com/repos/T2112/rummagarr/releases/latest",
+    "https://api.github.com/repos/T2112/lidarr-soulseek/releases/latest",
+)
+LATEST_RELEASE_URL = RELEASE_API_URLS[0]
+RELEASES_PAGE_URL = "https://github.com/T2112/rummagarr/releases/latest"
 SKIPPED_UPDATE_META = "skipped_update_version"
-# Rummagarr-Setup is the name new releases publish. LidarrSoulseek-Setup is the
-# name 1.9.4 and earlier ask GitHub for, so a release keeps that file too.
+# New releases publish Rummagarr-Setup only. LidarrSoulseek-Setup is still
+# accepted when an older release is the one GitHub returns.
 INSTALLER_PREFIXES = ("Rummagarr-Setup-", "LidarrSoulseek-Setup-")
 INSTALLER_PREFIX = INSTALLER_PREFIXES[0]
 
@@ -201,7 +207,7 @@ def parse_release(
     except ValueError as exc:
         raise UpdateError(f"Could not compare versions: {exc}") from exc
     published = version_text(tag)
-    page = str(payload.get("html_url") or f"https://github.com/T2112/lidarr-soulseek/releases/tag/{tag}")
+    page = str(payload.get("html_url") or f"https://github.com/T2112/rummagarr/releases/tag/{tag}")
     notes = str(payload.get("body") or "").strip()
     assets = _asset_map(payload)
     names = installer_names_for(published)
@@ -272,43 +278,75 @@ def check_for_update(
     client: httpx.Client | None = None,
     installed: bool | None = None,
     platform: str | None = None,
-    url: str = LATEST_RELEASE_URL,
+    url: str | None = None,
 ) -> UpdateStatus:
-    """GET the latest release. Network and API failures become ``status.error``."""
+    """GET the latest release. Network and API failures become ``status.error``.
+
+    The new repository name is tried first. A 404 there tries the previous
+    repository. Any other failure stops, so a rate limit is not hidden.
+    """
     if installed is None:
         installed = running_installed()
+    urls = (url,) if url else RELEASE_API_URLS
     own_client = client is None
     if own_client:
         client = httpx.Client(follow_redirects=True, headers=github_headers(), timeout=20.0)
     try:
-        try:
-            response = client.get(url, headers=github_headers(), timeout=20.0)
-        except httpx.HTTPError:
-            return _error_status(current, "Could not reach GitHub to check for updates.")
-        body = response.text
-        if response.status_code == 404:
-            return _error_status(current, "No GitHub release has been published yet.")
-        if _rate_limited(response.status_code, body):
-            return _error_status(current, "GitHub rate limit reached. Try again in a little while.")
-        if response.status_code != 200:
-            return _error_status(current, f"GitHub returned HTTP {response.status_code} while checking for updates.")
-        try:
-            payload = response.json()
-        except ValueError:
-            return _error_status(current, "GitHub returned something that is not a release.")
-        try:
-            return parse_release(
-                payload,
-                current=current,
-                skipped=skipped,
+        last = _error_status(current, "No GitHub release has been published yet.")
+        for index, candidate in enumerate(urls):
+            status = _check_one_release(
+                current,
+                skipped,
+                client=client,
                 installed=installed,
                 platform=platform,
+                url=candidate,
             )
-        except UpdateError as exc:
-            return _error_status(current, str(exc))
+            last = status
+            missing = bool(status.error) and status.error.startswith("No GitHub release")
+            if missing and index < len(urls) - 1:
+                continue
+            return status
+        return last
     finally:
         if own_client:
             client.close()
+
+
+def _check_one_release(
+    current: str,
+    skipped: str | None,
+    *,
+    client: httpx.Client,
+    installed: bool,
+    platform: str | None,
+    url: str,
+) -> UpdateStatus:
+    try:
+        response = client.get(url, headers=github_headers(), timeout=20.0)
+    except httpx.HTTPError:
+        return _error_status(current, "Could not reach GitHub to check for updates.")
+    body = response.text
+    if response.status_code == 404:
+        return _error_status(current, "No GitHub release has been published yet.")
+    if _rate_limited(response.status_code, body):
+        return _error_status(current, "GitHub rate limit reached. Try again in a little while.")
+    if response.status_code != 200:
+        return _error_status(current, f"GitHub returned HTTP {response.status_code} while checking for updates.")
+    try:
+        payload = response.json()
+    except ValueError:
+        return _error_status(current, "GitHub returned something that is not a release.")
+    try:
+        return parse_release(
+            payload,
+            current=current,
+            skipped=skipped,
+            installed=installed,
+            platform=platform,
+        )
+    except UpdateError as exc:
+        return _error_status(current, str(exc))
 
 
 def parse_sha256_text(text: str) -> str:

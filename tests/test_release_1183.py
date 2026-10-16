@@ -28,13 +28,13 @@ def test_issue_forms_ask_for_a_crash_bundle_and_a_feature():
 
 def test_readme_is_written_for_someone_new():
     text = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "Version 1.18.3" in text
+    assert "Version 1.19.0" in text
     assert "Only download music you have the rights to" in text
     assert "https://github.com/sponsors/T2112" in text
     assert "More info" in text
     assert "Run anyway" in text
     assert "Unblock-File" in text
-    assert "https://github.com/T2112/lidarr-soulseek/issues" in text
+    assert "https://github.com/T2112/rummagarr/issues" in text
     assert "Soulseek username" in text
     assert "API key" in text
     for name in ("docs/status.png", "docs/wanted.png", "docs/settings.png"):

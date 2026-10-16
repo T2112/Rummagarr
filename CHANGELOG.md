@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [1.19.0] — 2026-10-16
+
+### Added
+
+- Download all missing, Download all wanted, and any queue of many files checks and queues on a background task. The window stays responsive. A progress window shows the count, such as 120/480, and Cancel stops the rest. Files already queued stay queued.
+
+### Changed
+
+- New releases publish `Rummagarr-Setup-<version>.exe` only. Check for updates still installs an older setup file when that is the one attached to a release. The installer id is unchanged, so an older install upgrades in place, and settings are still copied from the previous data folder.
+- Help → Check for updates and the README use https://github.com/T2112/rummagarr. If that repository is not published yet, the update check tries https://github.com/T2112/lidarr-soulseek.
+
 ## [1.18.3] — 2026-10-16
 
 ### Changed

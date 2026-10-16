@@ -643,6 +643,16 @@ def stage_one_file(cfg: Config, dest: Path, transfer) -> Path | None:
     return src
 
 
+def _file_field(item, name: str, default=None):
+    """A browse row is a dict. A search row is an object. Either can be matched."""
+    if isinstance(item, dict):
+        if name not in item or item[name] is None:
+            return default
+        return item[name]
+    value = getattr(item, name, default)
+    return default if value is None else value
+
+
 def stage_album_folder(cfg: Config, artist: str, title: str, year: str | None, transfers) -> tuple[Path, list[Path]]:
     dest = album_dest_folder(cfg, artist, title, year)
     removable: list[Path] = []
@@ -3714,21 +3724,21 @@ class Worker:
     def _remote_files(self, files: list) -> list[RemoteFile]:
         remotes: list[RemoteFile] = []
         for item in files:
-            filename = str(getattr(item, "filename", "") or "")
+            filename = str(_file_field(item, "filename", "") or "")
             if not filename:
                 continue
             remotes.append(
                 RemoteFile(
-                    username=str(getattr(item, "username", "") or ""),
+                    username=str(_file_field(item, "username", "") or ""),
                     filename=filename,
-                    size=int(getattr(item, "size", 0) or 0),
-                    bitrate=int(getattr(item, "bitrate", 0) or 0),
-                    extension=str(getattr(item, "extension", "") or ""),
-                    free_slot=bool(getattr(item, "free_slot", False)),
-                    speed=int(getattr(item, "speed", 0) or 0),
-                    queue=int(getattr(item, "queue", 0) or 0),
-                    state=str(getattr(item, "state", "") or ""),
-                    folder=str(getattr(item, "folder", "") or ""),
+                    size=int(_file_field(item, "size", 0) or 0),
+                    bitrate=int(_file_field(item, "bitrate", 0) or 0),
+                    extension=str(_file_field(item, "extension", "") or ""),
+                    free_slot=bool(_file_field(item, "free_slot", False)),
+                    speed=int(_file_field(item, "speed", 0) or 0),
+                    queue=int(_file_field(item, "queue", 0) or 0),
+                    state=str(_file_field(item, "state", "") or ""),
+                    folder=str(_file_field(item, "folder", "") or ""),
                 )
             )
         return remotes
@@ -3751,16 +3761,20 @@ class Worker:
             ]
         return self._tracks_from_memory(names, folds)
 
-    def match_user_files(self, files: list) -> list:
+    def match_user_files(self, files: list, *, progress=None, cancel=None) -> list:
         remotes = self._remote_files(files)
         names, folds = candidate_names(remotes)
         tracks = self._wanted_tracks(names, folds)
+        if progress is not None:
+            progress(0, len(remotes))
         return match_files_to_wanted(
             remotes,
             tracks,
             min_filename_ratio=float(self.cfg.min_filename_ratio),
             preferred_extensions=list(self.cfg.preferred_extensions),
             min_mp3_bitrate=int(self.cfg.min_mp3_bitrate),
+            progress=progress,
+            cancel=cancel,
         )
 
     def plan_wanted_downloads(
@@ -3773,6 +3787,8 @@ class Worker:
         album_id: int | None = None,
         track_id: int | None = None,
         title: str = "",
+        progress=None,
+        cancel=None,
     ) -> WantedPick:
         """Wanted albums and tracks for this artist, best source across every result."""
         artist_name = (artist or "").strip()
@@ -3787,12 +3803,16 @@ class Worker:
             track_id=track_id,
             title=title,
         )
+        if progress is not None:
+            progress(0, len(remotes))
         return choose_wanted_downloads(
             remotes,
             tracks,
             min_filename_ratio=float(self.cfg.min_filename_ratio),
             preferred_extensions=list(self.cfg.preferred_extensions),
             min_mp3_bitrate=int(self.cfg.min_mp3_bitrate),
+            progress=progress,
+            cancel=cancel,
         )
 
     def _tracks_from_memory(self, names: list[str], folds: list[str]) -> list[WantedTrack]:
@@ -3834,13 +3854,36 @@ class Worker:
                 )
         return tracks
 
-    async def download_manual(self, specs: list[dict], link: dict | None = None) -> str:
+    async def download_manual(
+        self,
+        specs: list[dict],
+        link: dict | None = None,
+        *,
+        on_progress=None,
+        should_cancel=None,
+        on_queued=None,
+    ) -> str:
         """Queue files from a manual search through the same download and import path.
 
         Manual searches share the worker's Soulseek login. This does not pause
         the worker's own searches; it only adds transfers on that connection.
+        ``on_queued`` runs once the queue loop stops, before the wait for transfers.
         """
+        total = len(specs)
+        announced = False
+
+        def queued(done: int) -> None:
+            nonlocal announced
+            if announced:
+                return
+            announced = True
+            if on_progress is not None:
+                on_progress(done, total)
+            if on_queued is not None:
+                on_queued(done, total)
+
         if not specs:
+            queued(0)
             return ""
         if self.cfg.dry_run:
             username = str(specs[0].get("username") or "")
@@ -3849,12 +3892,15 @@ class Worker:
             log.info(detail)
             for spec in specs:
                 self._set_manual_state(str(spec.get("id") or ""), "skipped")
+            queued(0)
             return detail
         specs = self._skip_queued_specs(specs, link)
         if not specs:
             log.info("Nothing new to queue; those files are already queued or in the download folder")
+            queued(0)
             return ""
         if not await self.ensure_soulseek():
+            queued(0)
             raise RuntimeError("Start the worker to download. Downloads use that Soulseek connection.")
         assert self.client is not None
         link = link or {}
@@ -3870,6 +3916,8 @@ class Worker:
             )
         paired: list[tuple[str, object, dict]] = []
         for spec in specs:
+            if should_cancel is not None and should_cancel():
+                break
             file_id = str(spec.get("id") or "")
             spec_link = spec.get("link") if isinstance(spec.get("link"), dict) else link
             self._set_manual_state(file_id, "queued")
@@ -3877,6 +3925,9 @@ class Worker:
             paired.append((file_id, transfer, spec_link or {}))
             self.manual_transfers.append(transfer)
             self._set_manual_state(file_id, "downloading")
+            if on_progress is not None:
+                on_progress(len(paired), total)
+        queued(len(paired))
         if announce:
             self.set_step(
                 Step(
@@ -4013,6 +4064,8 @@ class Worker:
         *,
         pace_seconds: int = 5,
         files_at_once: int = 1,
+        on_progress=None,
+        should_cancel=None,
     ) -> str:
         """Queue a browsed user's missing files one batch at a time, then wait.
 
@@ -4059,13 +4112,19 @@ class Worker:
             width = max(1, int(files_at_once or 1))
             pause = max(0, int(pace_seconds or 0))
             paired: list[tuple[str, object, dict]] = []
+            started_count = 0
+            total = len(specs)
+            if on_progress is not None:
+                on_progress(0, total)
             per_file = max(30, int(self.cfg.download_timeout_minutes or 1) * 60)
             for start in range(0, len(specs), width):
-                if self.control.is_stopped():
+                if self.control.is_stopped() or (should_cancel is not None and should_cancel()):
                     break
                 chunk = specs[start : start + width]
                 started: list[tuple[str, object, dict]] = []
                 for spec in chunk:
+                    if should_cancel is not None and should_cancel():
+                        break
                     file_id = str(spec.get("id") or "")
                     spec_link = spec.get("link") if isinstance(spec.get("link"), dict) else {}
                     self._set_manual_state(file_id, "queued")
@@ -4073,6 +4132,9 @@ class Worker:
                     started.append((file_id, transfer, spec_link or {}))
                     self.manual_transfers.append(transfer)
                     self._set_manual_state(file_id, "downloading")
+                    started_count += 1
+                    if on_progress is not None:
+                        on_progress(started_count, total)
                 deadline = time.monotonic() + per_file
                 while time.monotonic() < deadline:
                     names = [state_name(item) for _, item, _link in started]
@@ -4083,11 +4145,17 @@ class Worker:
                             if state_name(transfer) not in {"COMPLETE", "FAILED", "ABORTED"}:
                                 await abort_transfer(self.client, transfer)
                         break
+                    if should_cancel is not None and should_cancel():
+                        break
                     await asyncio.sleep(0.05)
                 paired.extend(started)
+                if self.control.is_stopped() or (should_cancel is not None and should_cancel()):
+                    break
                 if start + width < len(specs) and pause and not self.control.is_stopped():
                     remaining = pause
                     while remaining > 0 and not self.control.is_stopped():
+                        if should_cancel is not None and should_cancel():
+                            break
                         step = min(0.25, remaining)
                         await asyncio.sleep(step)
                         remaining -= step
