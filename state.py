@@ -645,18 +645,41 @@ class JobStore:
             )
             self._db.commit()
 
-    def recent_events(self, limit: int = 8) -> list[dict]:
+    def recent_events(self, limit: int = 8, *, exclude_kind: str = "") -> list[dict]:
+        query = """
+            SELECT id, kind, title, body, username, created_at
+            FROM events
+            WHERE seen = 0
+        """
+        params: list = []
+        skipped = (exclude_kind or "").strip()
+        if skipped:
+            query += " AND kind != ?"
+            params.append(skipped)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._db.execute(query, params).fetchall()
+        return self._event_rows(rows)
+
+    def unseen_events(self, kind: str) -> list[dict]:
+        """Every unseen notice of this kind, oldest first."""
+        name = (kind or "").strip()
+        if not name:
+            return []
         with self._lock:
             rows = self._db.execute(
                 """
                 SELECT id, kind, title, body, username, created_at
                 FROM events
-                WHERE seen = 0
-                ORDER BY id DESC
-                LIMIT ?
+                WHERE seen = 0 AND kind = ?
+                ORDER BY id ASC
                 """,
-                (max(1, int(limit)),),
+                (name,),
             ).fetchall()
+        return self._event_rows(rows)
+
+    def _event_rows(self, rows) -> list[dict]:
         keys = ("id", "kind", "title", "body", "username", "created_at")
         return [dict(zip(keys, row)) for row in rows]
 

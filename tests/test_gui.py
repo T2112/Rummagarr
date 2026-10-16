@@ -1097,30 +1097,99 @@ def test_stats_page_and_browse_limits_popup(desktop):
     desktop._limits_window.destroy()
 
 
+def _favorite_prompts(desktop):
+    from desktop_app import FavoritePrompt
+
+    return [widget for widget in desktop.winfo_children() if isinstance(widget, FavoritePrompt)]
+
+
+def _prompt_items(prompt) -> list[str]:
+    return [str(item) for item in prompt.names.get(0, "end")]
+
+
 def test_favorite_suggestion_is_manual(desktop):
     desktop.notebook.select(desktop.status_tab)
     desktop.update()
-    notice = " ".join(_widget_text(desktop.notices))
-    assert "Add peer to favorites?" in notice
+    prompts = _favorite_prompts(desktop)
+    assert len(prompts) == 1
+    assert "Add peer to favorites?" in _prompt_items(prompts[0])
+    assert "Add peer to favorites?" not in " ".join(_widget_text(desktop.notices))
     assert "peer" not in desktop.worker.cfg.priority_users
-    next(button for button in _buttons(desktop.notices) if button.cget("text") == "Add").invoke()
+    next(button for button in _buttons(prompts[0]) if button.cget("text") == "Add").invoke()
     desktop.update()
     assert "peer" in desktop.worker.cfg.priority_users
     assert "peer" in try_load_config(desktop.config_path).priority_users
-    assert "Add peer to favorites?" not in " ".join(_widget_text(desktop.notices))
+    assert not _favorite_prompts(desktop)
 
     for index in range(3):
         desktop.worker.store.add_completed_download("Ella Langley", "Hungover", f"nope-{index}.mp3", "nope", "album")
     desktop.refresh_status()
     desktop.update()
-    assert "Add nope to favorites?" in " ".join(_widget_text(desktop.notices))
+    prompts = _favorite_prompts(desktop)
+    assert len(prompts) == 1
+    assert "Add nope to favorites?" in _prompt_items(prompts[0])
     assert "nope" not in desktop.worker.cfg.priority_users
-    next(button for button in _buttons(desktop.notices) if button.cget("text") == "Not now").invoke()
+    next(button for button in _buttons(prompts[0]) if button.cget("text") == "Not now").invoke()
     desktop.update()
     assert "nope" not in desktop.worker.cfg.priority_users
     desktop.refresh_status()
     desktop.update()
-    assert "nope" not in " ".join(_widget_text(desktop.notices)).lower()
+    assert not _favorite_prompts(desktop)
+    assert "nope" in desktop.worker.store.dismissed_favorites()
+
+
+def test_favorite_suggestions_share_one_prompt(desktop):
+    for index in range(3):
+        desktop.worker.store.add_completed_download("Ella Langley", "Hungover", f"other-{index}.mp3", "other", "album")
+    desktop.refresh_status()
+    desktop.update()
+    prompts = _favorite_prompts(desktop)
+    assert len(prompts) == 1
+    items = _prompt_items(prompts[0])
+    assert "Add peer to favorites?" in items
+    assert "Add other to favorites?" in items
+    prompts[0]._hide()
+    desktop.update()
+    assert not _favorite_prompts(desktop)
+    desktop.refresh_status()
+    desktop.update()
+    assert not _favorite_prompts(desktop)
+    for index in range(3):
+        desktop.worker.store.add_completed_download("Ella Langley", "Hungover", f"third-{index}.mp3", "third", "album")
+    desktop.refresh_status()
+    desktop.update()
+    prompts = _favorite_prompts(desktop)
+    assert len(prompts) == 1
+    items = _prompt_items(prompts[0])
+    assert "Add peer to favorites?" in items
+    assert "Add other to favorites?" in items
+    assert "Add third to favorites?" in items
+
+
+def test_dont_ask_again_turns_favorite_suggestions_off(desktop):
+    prompt = _favorite_prompts(desktop)[0]
+    next(button for button in _buttons(prompt) if button.cget("text") == "Don't ask again").invoke()
+    desktop.update()
+    assert desktop.worker.cfg.suggest_favorites is False
+    assert try_load_config(desktop.config_path).suggest_favorites is False
+    assert not _favorite_prompts(desktop)
+    for index in range(3):
+        desktop.worker.store.add_completed_download("Ella Langley", "Hungover", f"later-{index}.mp3", "later", "album")
+    desktop.refresh_status()
+    desktop.update()
+    assert not _favorite_prompts(desktop)
+    assert not any(event["username"] == "later" for event in desktop.worker.store.unseen_events("favorite"))
+    desktop.notebook.select(desktop.settings_tab)
+    desktop.update()
+    assert desktop._settings_form.fields["suggest_favorites"].get() is False
+    assert "Suggest favorite users" in _widget_text(desktop._settings_form)
+    desktop._settings_form.fields["suggest_favorites"].set(True)
+    assert desktop._settings_form.save()
+    desktop.update()
+    prompts = _favorite_prompts(desktop)
+    assert len(prompts) == 1
+    assert "Add peer to favorites?" in _prompt_items(prompts[0])
+    assert try_load_config(desktop.config_path).suggest_favorites is True
 
 
 def _widget_text(widget) -> list[str]:

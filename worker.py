@@ -1542,7 +1542,8 @@ class Worker:
         favorites = {item.lower() for item in (self.cfg.priority_users or set())}
         for shown, count in folded.values():
             self.store.add_user_day(shown, count)
-            self.store.note_good_user(shown, favorites, GOOD_USER_MINIMUM)
+            if bool(getattr(self.cfg, "suggest_favorites", True)):
+                self.store.note_good_user(shown, favorites, GOOD_USER_MINIMUM)
 
     def _past_daily_cap(self, username: str) -> bool:
         cap = max(0, int(getattr(self.cfg, "browse_daily_files", 20) or 0))

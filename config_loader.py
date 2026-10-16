@@ -112,6 +112,7 @@ class Config:
     browse_max_mb: int = 2048
     browse_daily_files: int = 20
     crash_bundle: bool = False
+    suggest_favorites: bool = True
 
 
 def normalize_theme(value) -> str:
@@ -341,6 +342,7 @@ def default_config(**overrides) -> Config:
         browse_max_mb=max(1, int(overrides.pop("browse_max_mb", 2048) or 2048)),
         browse_daily_files=max(1, int(overrides.pop("browse_daily_files", 20) or 20)),
         crash_bundle=bool(overrides.pop("crash_bundle", False)),
+        suggest_favorites=bool(overrides.pop("suggest_favorites", True)),
     )
     if overrides:
         cfg = replace(cfg, **overrides)
@@ -516,6 +518,7 @@ def save_config(path: Path, cfg: Config) -> None:
             f"theme = {_toml_str(normalize_theme(cfg.theme))}",
             f"confirm_download_all = {_toml_bool(cfg.confirm_download_all)}",
             f"crash_bundle = {_toml_bool(cfg.crash_bundle)}",
+            f"suggest_favorites = {_toml_bool(cfg.suggest_favorites)}",
             "",
             "[limits]",
             f"browse_max_files = {int(cfg.browse_max_files)}",
@@ -691,4 +694,5 @@ def try_load_config(path: Path) -> Config:
         browse_max_mb=max(1, int(limits.get("browse_max_mb", 2048) or 2048)),
         browse_daily_files=max(1, int(limits.get("browse_daily_files", 20) or 20)),
         crash_bundle=bool(ui.get("crash_bundle", False)),
+        suggest_favorites=bool(ui.get("suggest_favorites", True)),
     )
