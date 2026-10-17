@@ -2,15 +2,15 @@
 
 ## Main custom list
 
-https://raw.githubusercontent.com/T2112/rummagarr/main/lists/lidarr-custom-list.json
+https://raw.githubusercontent.com/T2112/lidarr-soulseek/main/lists/lidarr-custom-list.json
 
 Curated popular / widely recorded artists across rock, pop, hip-hop, country, jazz, blues, metal, R&B/soul, electronic, folk, punk, indie, reggae, Latin, funk, classical, goth, emo, women artists, game soundtracks, electro-swing, and more.
 
-**Current status (2026-10-13):** **1056** unique MusicBrainz artist IDs. Added 22 new artists this run (Cat Power, Feist, Regina Spektor, Neko Case, Lucinda Williams, Anuel AA, Don Omar, Thalía, Paulina Rubio, Jamie Berry, G‐Swing, Balkan Beat Box, Imagine Dragons, OneRepublic, twenty one pilots, Halsey, Charli xcx, Grimes, FKA twigs, Lizzo, Ice Spice, Post Malone). Prior names covered via exact/accent/alias. 0 from artists.txt still pending.
+**Current status (2026-10-17):** **1056** unique MusicBrainz artist IDs. All names from artists.txt are covered via exact match, accent/variant, or known alias (e.g. Jackson 5 = The Jacksons, Debbie Harry = Deborah Harry, Mos Def = Yasiin Bey, Charlie Pride = Charley Pride, Damian Marley = Damian “Jr. Gong” Marley, Tchaikovsky = Пётр Ильич Чайковский, etc.). 0 new IDs added this run (MusicBrainz returning frequent 503s; remaining name variants already map to existing IDs).
 
 ## Festival list (Woodstock + Qlimax + Ozzfest)
 
-https://raw.githubusercontent.com/T2112/rummagarr/main/lists/festivals-woodstock-qlimax-ozzfest.json
+https://raw.githubusercontent.com/T2112/lidarr-soulseek/main/lists/festivals-woodstock-qlimax-ozzfest.json
 
 Separate import list of musicians, DJs, and groups that played:
 - Woodstock 1969, 1994, and 1999
