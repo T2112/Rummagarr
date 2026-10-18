@@ -28,7 +28,7 @@ def test_issue_forms_ask_for_a_crash_bundle_and_a_feature():
 
 def test_readme_is_written_for_someone_new():
     text = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "Version 1.19.0" in text
+    assert "Version 1.19.1" in text
     assert "Only download music you have the rights to" in text
     assert "https://github.com/sponsors/T2112" in text
     assert "More info" in text

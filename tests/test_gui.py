@@ -70,6 +70,44 @@ def _row(app, **match):
     raise AssertionError(f"no wanted row matching {match}")
 
 
+def test_status_offers_retry_and_skip_for_one_artist(desktop):
+    desktop.worker._flag_import("Adele", "Lidarr import timed out after 10 min")
+    desktop.refresh_status()
+    desktop.update()
+    labels = [button.cget("text") for button in _buttons(desktop.import_rows)]
+    assert set(labels) == {"Retry import", "Skip"}
+    texts = [widget.cget("text") for widget in _widgets(desktop.import_rows) if widget.winfo_class() == "TLabel"]
+    assert any("Adele" in text and "timed out" in text for text in texts)
+    next(button for button in _buttons(desktop.import_rows) if button.cget("text") == "Skip").invoke()
+    desktop.update()
+    assert "skipped" in desktop.worker.import_attention()[0]["text"].casefold()
+    assert "Skipping the Lidarr import for Adele." == desktop.notice_var.get()
+
+
+def test_behavior_import_choices_save(tmp_path):
+    _tk_or_skip()
+    import tkinter as tk
+
+    root = tk.Tk()
+    worker = make_worker(tmp_path)
+    path = tmp_path / "config.toml"
+    saved = {}
+    form = SettingsForm(root, path, worker.cfg, lambda cfg: saved.update(cfg=cfg), root.destroy, store=worker.store)
+    form.pack()
+    root.update()
+    assert _label_named(form, "Lidarr import")
+    assert _label_named(form, "Import timeout")
+    form.fields["import_mode"].set("off")
+    form._choice_display["import_mode"].set("Off (manual)")
+    form.fields["import_timeout_minutes"].set("12")
+    assert form.save() is True
+    assert saved["cfg"].import_mode == "off"
+    assert saved["cfg"].auto_import_after_artist is False
+    assert saved["cfg"].import_timeout_minutes == 12
+    root.destroy()
+    worker.close()
+
+
 def test_auto_import_checkbox_persists(desktop):
     desktop.auto_import_var.set(1)
     desktop.on_auto_import()

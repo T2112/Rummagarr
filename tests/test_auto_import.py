@@ -116,9 +116,9 @@ def test_auto_import_does_not_block_and_skips_rename_when_lidarr_already_renames
         worker.arm_auto_import("Adele")
         assert time.monotonic() - began < 0.3
         assert started.wait(1)
-        assert worker.activity_view()[0] == "Importing Adele into Lidarr..."
+        assert worker.activity_view()[0] == "Waiting on Lidarr import for Adele (0/10 min)"
         worker.set_step(Step(kind="retry", artist="Adele", retry_seconds=5))
-        assert worker.activity_view()[0] == "Importing Adele into Lidarr..."
+        assert worker.activity_view()[0] == "Waiting on Lidarr import for Adele (0/10 min)"
         release.set()
         assert worker._import_thread is not None
         worker._import_thread.join(2)
@@ -232,7 +232,7 @@ def test_import_resyncs_that_artist_before_the_next_search(tmp_path):
         worker.close()
 
 
-def test_the_worker_searches_during_the_scan_and_waits_for_the_resync(tmp_path):
+def test_the_worker_searches_during_the_scan_and_does_not_wait_on_the_resync(tmp_path):
     import asyncio
 
     worker = make_worker(tmp_path)
@@ -270,12 +270,13 @@ def test_the_worker_searches_during_the_scan_and_waits_for_the_resync(tmp_path):
 
         async def during_resync() -> None:
             task = asyncio.create_task(worker._wait_for_import())
-            await asyncio.sleep(0.2)
-            assert not task.done()
-            release_resync.set()
-            await asyncio.wait_for(task, 2)
+            await asyncio.wait_for(task, 1)
 
         asyncio.run(during_resync())
+        release_resync.set()
+        thread = worker._import_thread
+        if thread is not None:
+            thread.join(2)
         assert worker._import_thread is None or not worker._import_thread.is_alive()
     finally:
         release.set()

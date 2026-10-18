@@ -2,7 +2,7 @@
 
 Rummagarr fills the albums and tracks Lidarr still wants. It searches Soulseek, downloads the files, and asks Lidarr to import and rename them. It is a Windows desktop app. No Docker. No slskd.
 
-**Version 1.19.0.** The GitHub repository is [T2112/rummagarr](https://github.com/T2112/rummagarr).
+**Version 1.19.1.** The GitHub repository is [T2112/rummagarr](https://github.com/T2112/rummagarr).
 
 Only download music you have the rights to. Soulseek is a peer-to-peer network, and you are responsible for what you download and what you share.
 
@@ -40,7 +40,7 @@ Unblock-File .\Rummagarr-Setup-<version>.exe
 
 ## Using the app
 
-**Start** begins searching. The line in the status card names the current search, wait, or download, and it says Idle only when nothing is selected. **Pause** holds the current work and resumes it later. **Stop** ends the run and keeps your place. **Skip** drops the album or song it is on and moves to the next one. **Auto-import to Lidarr after each artist** is off until you check it. When it is on, an empty download queue after an artist asks Lidarr to import and rename that artist's files.
+**Start** begins searching. The line in the status card names the current search, wait, or download, and it says Idle only when nothing is selected. **Pause** holds the current work and resumes it later. **Stop** ends the run and keeps your place. **Skip** drops the album or song it is on and moves to the next one. **Auto-import to Lidarr after each artist** is off until you check it. When it is on, an empty download queue after an artist asks Lidarr to import and rename that artist's files. Settings → Behavior → Lidarr import can turn that off, import after each album, or import on a timer. A slow Lidarr import shows Waiting on Lidarr import (3/10 min) and then moves on. Retry import and Skip are on that artist's row.
 
 **Wanted** opens the saved list immediately. **Sync** reads Lidarr and fills the list as each page arrives. **Artist** filters by name. Uncheck anything the worker should leave alone. The magnifying glass on a row opens **Search** for that artist, album, or song.
 
@@ -82,6 +82,12 @@ To publish a public download, push a tag `v<version>` that matches the `VERSION`
 This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs on, and Inno Setup is a Windows program. Push the branch and let that workflow produce the `.exe`.
 
 `python main.py` still runs the worker without the window, for the original script install below.
+
+## What's new in 1.19.1
+
+- Settings → Behavior → Lidarr import sets how often finished artists are imported: Off (manual), After each album, After each artist, or On a timer.
+- One artist's Lidarr import can no longer hold the worker. After the import timeout, that artist is flagged and the next artist continues. Status shows the wait, such as Waiting on Lidarr import (3/10 min), with Retry import and Skip.
+- Full changelog: [CHANGELOG.md](CHANGELOG.md)
 
 ## What's new in 1.19.0
 
