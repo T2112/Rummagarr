@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 from match import normalize
@@ -133,6 +134,9 @@ def test_queueing_a_manual_result_imports_for_the_linked_album(tmp_path):
         assert downloaded == [("vinylqueen", r"music\Ella\01.mp3")]
         assert worker.manual_state(file_id) == "downloaded"
         assert "Ella Langley" in dest and "Hungover" in dest
+        deadline = time.time() + 2
+        while not scanned and time.time() < deadline:
+            time.sleep(0.02)
         assert scanned and "Hungover" in scanned[-1]
         assert (Path(dest) / "01.mp3").is_file()
     finally:

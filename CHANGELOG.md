@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here.
 
+## [1.19.1] — 2026-10-18
+
+### Added
+
+- Settings → Behavior → Lidarr import chooses how often finished artists are imported: Off (manual), After each album, After each artist, or On a timer. Import interval is the timer. Import timeout is how long to wait for one artist.
+
+### Fixed
+
+- A Lidarr import that does not finish no longer holds the worker on that artist. After the timeout, Rummagarr logs it, flags that artist, and moves on. Status shows the wait, such as Waiting on Lidarr import (3/10 min). Status has Retry import and Skip for that artist.
+
 ## [1.19.0] — 2026-10-16
 
 ### Added

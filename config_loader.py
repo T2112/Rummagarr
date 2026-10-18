@@ -13,6 +13,7 @@ from search_order import normalize_search_direction, normalize_search_order
 log = logging.getLogger("lidarr_slsk")
 
 APP_NAME = "Rummagarr"
+IMPORT_MODES = ("off", "album", "after_artist", "interval")
 LEGACY_WINDOWS_DIR = "Lidarr Soulseek"
 LEGACY_HOME_DIR = ".lidarr-soulseek"
 
@@ -74,6 +75,9 @@ class Config:
     share_dirs: list[str] = field(default_factory=list)
     pause_uploads: bool = False
     auto_import_after_artist: bool = False
+    import_mode: str = "album"
+    import_interval_minutes: int = 30
+    import_timeout_minutes: int = 10
     theme: str = "dark"
     confirm_download_all: bool = True
     max_albums_per_run: int = 40
@@ -252,6 +256,14 @@ def default_config(**overrides) -> Config:
     download, complete = default_media_dirs()
     download = Path(overrides.pop("download_dir", download))
     complete = Path(overrides.pop("complete_dir", complete))
+    raw_mode = overrides.pop("import_mode", None)
+    import_mode, auto_import = resolve_import_settings(
+        raw_mode,
+        bool(overrides.pop("auto_import_after_artist", False)),
+        mode_was_set=raw_mode is not None and str(raw_mode).strip() != "",
+    )
+    import_interval = _bounded_minutes(overrides.pop("import_interval_minutes", 30), 30, 1, 1440)
+    import_timeout = _bounded_minutes(overrides.pop("import_timeout_minutes", 10), 10, 1, 120)
     cfg = Config(
         lidarr_url=str(overrides.pop("lidarr_url", "http://127.0.0.1:8686")),
         lidarr_api_key=str(overrides.pop("lidarr_api_key", "")),
@@ -303,7 +315,10 @@ def default_config(**overrides) -> Config:
         priority_users=set(overrides.pop("priority_users", set())),
         share_dirs=list(overrides.pop("share_dirs", [])),
         pause_uploads=bool(overrides.pop("pause_uploads", False)),
-        auto_import_after_artist=bool(overrides.pop("auto_import_after_artist", False)),
+        auto_import_after_artist=auto_import,
+        import_mode=import_mode,
+        import_interval_minutes=import_interval,
+        import_timeout_minutes=import_timeout,
         theme=normalize_theme(overrides.pop("theme", "dark")),
         confirm_download_all=bool(overrides.pop("confirm_download_all", True)),
         max_albums_per_run=int(overrides.pop("max_albums_per_run", 40)),
@@ -404,6 +419,60 @@ def _toml_bool(value: bool) -> str:
     return "true" if value else "false"
 
 
+def normalize_import_mode(value, *, legacy_auto: bool | None = None) -> str:
+    """One of off, album, after_artist, interval.
+
+    A blank value follows the old checkbox: on is after each artist, off is
+    after each album. Off means nothing is imported until Retry import.
+    """
+    text = str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "manual": "off",
+        "none": "off",
+        "disabled": "off",
+        "after_each_artist": "after_artist",
+        "artist": "after_artist",
+        "each_artist": "after_artist",
+        "timer": "interval",
+        "timed": "interval",
+        "after_each_album": "album",
+        "each_album": "album",
+        "per_album": "album",
+    }
+    text = aliases.get(text, text)
+    if text in IMPORT_MODES:
+        return text
+    if legacy_auto is True:
+        return "after_artist"
+    return "album"
+
+
+def _bounded_minutes(value, default: int, low: int, high: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    return min(high, max(low, number))
+
+
+def resolve_import_settings(mode, auto: bool, *, mode_was_set: bool) -> tuple[str, bool]:
+    """Keep the import mode and the Status checkbox on the same choice.
+
+    A saved mode wins. An older file with only the checkbox maps on to
+    after each artist and off to after each album. The checkbox is on only
+    for after each artist.
+    """
+    if not mode_was_set:
+        chosen = "after_artist" if auto else "album"
+    else:
+        chosen = normalize_import_mode(mode, legacy_auto=auto)
+        if auto and chosen == "album":
+            chosen = "after_artist"
+        if not auto and chosen == "after_artist":
+            chosen = "album"
+    return chosen, chosen == "after_artist"
+
+
 def save_config(path: Path, cfg: Config) -> None:
     """Write config.toml. The desktop app uses this instead of hand-editing."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -411,6 +480,11 @@ def save_config(path: Path, cfg: Config) -> None:
     ignored = ", ".join(_toml_str(item) for item in sorted(cfg.ignored_users))
     priority = ", ".join(_toml_str(item) for item in sorted(cfg.priority_users))
     share_dirs = ", ".join(_toml_str(item) for item in cfg.share_dirs)
+    import_mode, auto_import = resolve_import_settings(
+        cfg.import_mode,
+        bool(cfg.auto_import_after_artist),
+        mode_was_set=True,
+    )
     text = "\n".join(
         [
             "# Written by Rummagarr. You can keep editing this file,",
@@ -420,7 +494,10 @@ def save_config(path: Path, cfg: Config) -> None:
             f"url = {_toml_str(cfg.lidarr_url)}",
             f"api_key = {_toml_str(cfg.lidarr_api_key)}",
             f"scan_path = {_toml_str(cfg.lidarr_scan_path)}",
-            f"auto_import_after_artist = {_toml_bool(cfg.auto_import_after_artist)}",
+            f"auto_import_after_artist = {_toml_bool(auto_import)}",
+            f"import_mode = {_toml_str(import_mode)}",
+            f"import_interval_minutes = {_bounded_minutes(cfg.import_interval_minutes, 30, 1, 1440)}",
+            f"import_timeout_minutes = {_bounded_minutes(cfg.import_timeout_minutes, 10, 1, 120)}",
             f"active = {_toml_str(cfg.lidarr_active or 'Home')}",
             "",
             "[soulseek]",
@@ -602,6 +679,11 @@ def try_load_config(path: Path) -> Config:
 
     download_dir.mkdir(parents=True, exist_ok=True)
     complete_dir.mkdir(parents=True, exist_ok=True)
+    import_mode, auto_import = resolve_import_settings(
+        lidarr.get("import_mode", None),
+        bool(lidarr.get("auto_import_after_artist", False)),
+        mode_was_set="import_mode" in lidarr and str(lidarr.get("import_mode") or "").strip() != "",
+    )
 
     return Config(
         lidarr_url=chosen["url"],
@@ -659,7 +741,10 @@ def try_load_config(path: Path) -> Config:
         priority_users={u.lower() for u in sharing.get("priority_users", []) if u},
         share_dirs=[str(item) for item in sharing.get("share_dirs", []) if str(item).strip()],
         pause_uploads=bool(sharing.get("pause_uploads", False)),
-        auto_import_after_artist=bool(lidarr.get("auto_import_after_artist", False)),
+        auto_import_after_artist=auto_import,
+        import_mode=import_mode,
+        import_interval_minutes=_bounded_minutes(lidarr.get("import_interval_minutes", 30), 30, 1, 1440),
+        import_timeout_minutes=_bounded_minutes(lidarr.get("import_timeout_minutes", 10), 10, 1, 120),
         theme=normalize_theme(ui.get("theme", "dark")),
         confirm_download_all=bool(ui.get("confirm_download_all", True)),
         follow_metadata_profile=bool(search.get("follow_metadata_profile", True)),

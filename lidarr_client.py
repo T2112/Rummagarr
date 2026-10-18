@@ -222,12 +222,20 @@ class LidarrClient:
         payload = self._get("/metadataprofile") or []
         return payload if isinstance(payload, list) else []
 
-    def finish_command(self, result: Any, timeout: float = 900.0) -> dict[str, Any]:
+    def finish_command(
+        self,
+        result: Any,
+        timeout: float = 900.0,
+        should_cancel=None,
+        on_wait=None,
+    ) -> dict[str, Any]:
         """Wait until Lidarr finishes a command accepted by POST /command.
 
         A result with no id is returned as-is. Callers that only need the POST
         to be accepted keep working. A command that never leaves the queue
-        comes back with status ``timeout``.
+        comes back with status ``timeout``. ``should_cancel`` ends the wait
+        with status ``skipped``. ``on_wait`` is called with the seconds already
+        spent and the timeout, so the window can show the countdown.
         """
         body = result.get("body") if isinstance(result, dict) and isinstance(result.get("body"), dict) else result
         if not isinstance(body, dict):
@@ -239,16 +247,52 @@ class LidarrClient:
             command_id = None
         if not command_id:
             return body
-        deadline = time.time() + max(1.0, float(timeout))
+        limit = max(1.0, float(timeout))
+        started = time.time()
+        deadline = started + limit
         last = dict(body)
+
+        def cancelled() -> bool:
+            if not callable(should_cancel):
+                return False
+            try:
+                return bool(should_cancel())
+            except Exception:
+                log.exception("Could not check whether the Lidarr wait should stop")
+                return False
+
+        def report() -> None:
+            if not callable(on_wait):
+                return
+            try:
+                on_wait(max(0.0, time.time() - started), limit)
+            except Exception:
+                log.exception("Could not report Lidarr import progress")
+
         while time.time() < deadline:
-            payload = self._get_once(f"/command/{command_id}", timeout=20.0)
+            if cancelled():
+                last = dict(last)
+                last["status"] = "skipped"
+                return last
+            report()
+            payload = self._get_once(f"/command/{command_id}", timeout=min(20.0, max(1.0, deadline - time.time())))
             if isinstance(payload, dict) and payload.get("id"):
                 last = payload
             status = str(last.get("status") or "").casefold()
             if status in {"completed", "failed", "aborted", "cancelled", "canceled"}:
                 return last
-            time.sleep(1.0)
+            if cancelled():
+                last = dict(last)
+                last["status"] = "skipped"
+                return last
+            slept = 0.0
+            while slept < 1.0 and time.time() < deadline:
+                if cancelled():
+                    last = dict(last)
+                    last["status"] = "skipped"
+                    return last
+                time.sleep(0.2)
+                slept += 0.2
         last = dict(last)
         last["status"] = "timeout"
         return last

@@ -37,7 +37,7 @@ from aioslsk.user.model import BlockingFlag
 from activity import Step, describe_step, format_elapsed, step_from_legacy
 from audio_check import folder_fake_reason
 from audio_tags import tag_album_folder
-from config_loader import Config
+from config_loader import Config, normalize_import_mode
 from favorites import GOOD_USER_MINIMUM, daily_room
 from messages import MAX_PRIVATE_MESSAGE
 from control import WorkerControl
@@ -719,6 +719,13 @@ class Worker:
         self._visit_had_download = False
         self._import_phase = ""
         self._importing_artist = ""
+        self._import_paths: dict[str, tuple[str, str]] = {}
+        self._import_manual: set[str] = set()
+        self._import_skip_artists: set[str] = set()
+        self._import_flags: dict[str, tuple[str, str]] = {}
+        self._import_wait_started = 0.0
+        self._last_interval_import: float | None = None
+        self._interval_artists: list[str] = []
         self._free_slot_grace = _FREE_SLOT_GRACE
         self._cap_until: datetime | None = None
         self._pass_note = ""
@@ -745,25 +752,180 @@ class Worker:
     def _queue_busy(self) -> bool:
         return bool(self.active_transfers or self.manual_transfers)
 
+    def _effective_import_mode(self) -> str:
+        """off, album, after_artist, or interval.
+
+        The Status checkbox means after each artist. An older config that only
+        set that checkbox still imports after the artist visit.
+        """
+        mode = normalize_import_mode(
+            getattr(self.cfg, "import_mode", "album"),
+            legacy_auto=bool(self.cfg.auto_import_after_artist),
+        )
+        if self.cfg.auto_import_after_artist and mode == "album":
+            return "after_artist"
+        if not self.cfg.auto_import_after_artist and mode == "after_artist":
+            return "album"
+        return mode
+
+    def _import_timeout_seconds(self) -> float:
+        try:
+            minutes = int(getattr(self.cfg, "import_timeout_minutes", 10) or 10)
+        except (TypeError, ValueError):
+            minutes = 10
+        return max(60.0, min(120, minutes) * 60.0)
+
+    def _import_wait_text(self, artist: str, elapsed_seconds: float, limit_seconds: float) -> str:
+        total = max(1, int(round(float(limit_seconds) / 60.0)))
+        so_far = min(total, int(max(0.0, float(elapsed_seconds)) // 60))
+        return f"Waiting on Lidarr import for {artist} ({so_far}/{total} min)"
+
+    def _flag_import(self, artist: str, detail: str) -> None:
+        name = (artist or "").strip()
+        if not name:
+            return
+        self._import_flags[name.casefold()] = (name, detail)
+
+    def import_attention(self) -> list[dict]:
+        """Artists the Status page can retry or skip."""
+        rows: list[dict] = []
+        current = (self._importing_artist or "").strip()
+        if current:
+            text = self._import_notice or self._import_wait_text(current, 0, self._import_timeout_seconds())
+            rows.append({"artist": current, "text": text, "kind": "active"})
+        for key, (name, detail) in list(self._import_flags.items()):
+            if current and key == current.casefold():
+                continue
+            rows.append({"artist": name, "text": f"{name} — {detail}", "kind": "flagged"})
+        return rows
+
     def arm_auto_import(self, artist: str) -> None:
         """Remember an artist whose visit finished. One import runs when the queue is empty."""
+        if self._effective_import_mode() != "after_artist":
+            return
+        self._enqueue_import(artist, "")
+
+    def retry_import(self, artist: str) -> None:
+        """Import this artist now, including when automatic import is off."""
         name = (artist or "").strip()
-        if not name or not self.cfg.auto_import_after_artist:
+        if not name:
+            return
+        log.info("Retrying Lidarr import for %s", name)
+        with self._import_lock:
+            self._import_skip_artists.discard(name.casefold())
+            self._import_flags.pop(name.casefold(), None)
+        self._enqueue_import(name, "", manual=True)
+
+    def skip_import(self, artist: str = "") -> None:
+        """Stop waiting on this artist's Lidarr import and flag them."""
+        name = (artist or self._importing_artist or "").strip()
+        if not name:
             return
         with self._import_lock:
-            if name.casefold() not in {item.casefold() for item in self._import_artists}:
+            self._import_skip_artists.add(name.casefold())
+            self._import_artists = [item for item in self._import_artists if item.casefold() != name.casefold()]
+            self._import_paths.pop(name.casefold(), None)
+            self._interval_artists = [item for item in self._interval_artists if item.casefold() != name.casefold()]
+        current = (self._importing_artist or "").casefold()
+        if current != name.casefold():
+            self._note_import_skip(name)
+
+    def _import_cancel_for(self, artist: str) -> bool:
+        return (artist or "").casefold() in self._import_skip_artists
+
+    def _enqueue_import(self, artist: str, path: str, fallback: str = "", *, manual: bool = False) -> None:
+        name = (artist or "").strip()
+        if not name:
+            return
+        with self._import_lock:
+            if manual:
+                self._import_manual.add(name.casefold())
+            key = name.casefold()
+            if key not in {item.casefold() for item in self._import_artists}:
                 self._import_artists.append(name)
+            if path or fallback:
+                self._import_paths[key] = (path, fallback)
             self._import_armed = True
         self.maybe_auto_import()
 
-    def maybe_auto_import(self) -> None:
-        """Start one Lidarr import per time the queue is empty after an artist finishes.
+    def _note_interval_artist(self, artist: str) -> None:
+        name = (artist or "").strip()
+        if not name:
+            return
+        with self._import_lock:
+            if name.casefold() not in {item.casefold() for item in self._interval_artists}:
+                self._interval_artists.append(name)
 
-        A later call while the queue stays empty does nothing. The scan runs on
-        a side thread so the window stays responsive. The worker can search the
-        next artist while Lidarr is still scanning, and waits only for the resync.
+    def _artists_ready_to_import(self) -> list[str]:
+        found: list[str] = []
+        seen: set[str] = set()
+
+        def add(name: str) -> None:
+            text = (name or "").strip()
+            key = text.casefold()
+            if not text or key in seen:
+                return
+            flagged = self._import_flags.get(key)
+            if flagged and "skipped" in flagged[1].casefold():
+                return
+            if key in self._import_skip_artists:
+                return
+            seen.add(key)
+            found.append(text)
+
+        with self._import_lock:
+            waiting = list(self._interval_artists)
+            self._interval_artists.clear()
+        for name in waiting:
+            add(name)
+        try:
+            with self.store._lock:
+                rows = self.store._db.execute(
+                    "SELECT DISTINCT artist FROM jobs WHERE status IN ('staged', 'import_failed')"
+                ).fetchall()
+        except Exception:
+            rows = []
+        for (name,) in rows:
+            add(str(name or ""))
+        return found
+
+    def maybe_interval_import(self) -> None:
+        """Queue finished artists when the timer is due. The first call only starts the clock."""
+        if self._effective_import_mode() != "interval":
+            return
+        now = time.monotonic()
+        if self._last_interval_import is None:
+            self._last_interval_import = now
+            return
+        try:
+            minutes = int(getattr(self.cfg, "import_interval_minutes", 30) or 30)
+        except (TypeError, ValueError):
+            minutes = 30
+        minutes = max(1, min(1440, minutes))
+        if now - self._last_interval_import < minutes * 60:
+            return
+        artists = self._artists_ready_to_import()
+        self._last_interval_import = now
+        for artist in artists:
+            self._enqueue_import(artist, "")
+        if artists:
+            self.maybe_auto_import(due=True)
+
+    def maybe_auto_import(self, *, due: bool = False) -> None:
+        """Start queued Lidarr imports once the download queue is empty.
+
+        The scan runs on a side thread. The worker keeps searching the next
+        artist while Lidarr is still scanning or resyncing.
         """
-        if not self.cfg.auto_import_after_artist:
+        mode = self._effective_import_mode()
+        with self._import_lock:
+            manual = bool(self._import_manual)
+            queued = bool(self._import_armed and self._import_artists)
+        if not queued:
+            return
+        if mode == "off" and not manual:
+            return
+        if mode == "interval" and not manual and not due:
             return
         if self._queue_busy():
             return
@@ -773,16 +935,33 @@ class Worker:
             if self._import_thread is not None and self._import_thread.is_alive():
                 return
             artists = list(self._import_artists)
+            paths = dict(self._import_paths)
             self._import_artists.clear()
+            self._import_paths.clear()
             self._import_armed = False
             thread = threading.Thread(
                 target=self._run_auto_import,
-                args=(artists,),
+                args=(artists, paths),
                 name="lidarr-import",
                 daemon=True,
             )
             self._import_thread = thread
             thread.start()
+
+    def _schedule_folder_import(self, artist: str, folder: Path, *, visit: bool = False) -> None:
+        """Queue one folder. A visit in after-each-artist mode waits for the visit to end."""
+        mode = self._effective_import_mode()
+        if mode == "off":
+            return
+        if mode == "interval":
+            self._note_interval_artist(artist)
+            return
+        if mode == "after_artist" and visit:
+            self._visit_had_download = True
+            return
+        root = str(self.cfg.lidarr_scan_path or "").strip()
+        scan_path = str(Path(root) / folder.name) if root else str(folder)
+        self._enqueue_import(artist, scan_path, fallback=str(folder))
 
     def _publish_import(self, text: str, *, hold: bool) -> None:
         self._import_notice = text
@@ -810,12 +989,25 @@ class Worker:
             return False
         return bool(flag)
 
-    def _finish_lidarr_command(self, result):
+    def _finish_lidarr_command(self, result, artist: str = ""):
         finisher = getattr(self.lidarr, "finish_command", None)
         if not callable(finisher):
             return result if isinstance(result, dict) else {}
+        timeout = self._import_timeout_seconds()
+
+        def cancel() -> bool:
+            return bool(artist) and self._import_cancel_for(artist)
+
+        def progress(elapsed: float, limit: float) -> None:
+            if not artist:
+                return
+            self._publish_import(self._import_wait_text(artist, elapsed, limit), hold=True)
+
         try:
-            return finisher(result)
+            try:
+                return finisher(result, timeout=timeout, should_cancel=cancel, on_wait=progress)
+            except TypeError:
+                return finisher(result, timeout)
         except Exception:
             log.exception("Could not wait for a Lidarr command")
             return {"status": "failed"}
@@ -825,18 +1017,35 @@ class Worker:
             return False
         return str(result.get("status") or "").casefold() in _COMMAND_FAILED
 
-    def _import_one_artist(self, artist: str, folder: str) -> None:
-        self._publish_import(f"Importing {artist} into Lidarr...", hold=True)
+    def _import_one_artist(self, artist: str, folder: str, fallback: str = "") -> None:
+        limit = self._import_timeout_seconds()
+        self._import_wait_started = time.monotonic()
+        self._publish_import(self._import_wait_text(artist, 0, limit), hold=True)
         self._import_phase = "scan"
         self._importing_artist = artist
         scanned = False
+        follow_up = True
         try:
-            result = self.lidarr.scan_downloaded(folder)
+            if self._import_cancel_for(artist):
+                follow_up = False
+                self._note_import_skip(artist)
+                return
+            result = self._post_downloaded_scan(folder, fallback)
             scanned = True
-            waited = self._finish_lidarr_command(result)
+            waited = self._finish_lidarr_command(result, artist)
+            status = str(waited.get("status") or "").casefold() if isinstance(waited, dict) else ""
+            if status == "skipped" or self._import_cancel_for(artist):
+                follow_up = False
+                self._note_import_skip(artist)
+                return
+            if status == "timeout":
+                follow_up = False
+                self._note_import_timeout(artist)
+                return
             if self._command_failed(waited):
                 detail = f"Lidarr scan {waited.get('status') or 'failed'}"
                 self._park_failed_import(artist, detail)
+                self._flag_import(artist, detail)
                 log.error("Importing %s into Lidarr failed: %s", artist, detail)
                 self._publish_import(f"Importing {artist} into Lidarr failed: {detail}", hold=False)
                 self._summary_review(artist, detail)
@@ -845,6 +1054,7 @@ class Worker:
             if problems:
                 detail = "; ".join(problems)
                 self._park_failed_import(artist, detail)
+                self._flag_import(artist, detail)
                 log.error("Importing %s into Lidarr failed: %s", artist, detail)
                 self._publish_import(f"Importing {artist} into Lidarr failed: {detail}", hold=False)
                 self._summary_review(artist, detail)
@@ -854,26 +1064,66 @@ class Worker:
                 if not artist_id:
                     raise RuntimeError(f"Lidarr has no artist named {artist}")
                 renamed = self.lidarr.rename_artist_files(int(artist_id))
-                self._finish_lidarr_command(renamed)
+                self._finish_lidarr_command(renamed, artist)
                 log.info("Asked Lidarr to rename files for %s", artist)
             else:
                 log.info("Lidarr already renames %s on import", artist)
             log.info("Imported %s into Lidarr from %s", artist, folder)
+            self._import_flags.pop(artist.casefold(), None)
             self._publish_import(f"Imported {artist} into Lidarr", hold=False)
             self._summary_imported(artist)
             self._notify("import", f"Imported {artist}", f"Lidarr imported {artist} from {folder}")
         except Exception as exc:
             detail = str(exc).strip() or exc.__class__.__name__
             log.exception("Importing %s into Lidarr failed", artist)
+            self._flag_import(artist, detail)
             self._publish_import(f"Importing {artist} into Lidarr failed: {detail}", hold=False)
             self._summary_failed(artist, detail)
+            follow_up = False
         finally:
-            if scanned:
+            if scanned and follow_up and not self._import_cancel_for(artist):
                 self._import_phase = "resync"
                 self.resync_artist_from_lidarr(artist)
                 self._release_unimported(artist)
+            with self._import_lock:
+                self._import_skip_artists.discard(artist.casefold())
+                self._import_manual.discard(artist.casefold())
             self._import_phase = ""
             self._importing_artist = ""
+            self._import_wait_started = 0.0
+
+    def _post_downloaded_scan(self, path: str, fallback: str = ""):
+        try:
+            return self.lidarr.scan_downloaded(path)
+        except Exception:
+            if fallback and fallback != path:
+                log.info("Lidarr could not scan %s; trying %s", path, fallback)
+                return self.lidarr.scan_downloaded(fallback)
+            raise
+
+    def _note_import_timeout(self, artist: str) -> None:
+        minutes = max(1, int(self._import_timeout_seconds() // 60))
+        detail = f"Lidarr import timed out after {minutes} min"
+        log.error("Importing %s into Lidarr timed out after %s min; moving on", artist, minutes)
+        try:
+            self.store.mark_import_failed(artist, detail)
+        except Exception:
+            log.exception("Could not flag the timed-out import for %s", artist)
+        self._flag_import(artist, detail)
+        self._publish_import(f"Import timed out for {artist}. Moving on.", hold=False)
+        self._summary_review(artist, detail)
+        self._notify("review", f"Import timed out: {artist}", detail)
+
+    def _note_import_skip(self, artist: str) -> None:
+        detail = "Import skipped"
+        log.info("Skipped Lidarr import for %s", artist)
+        try:
+            self.store.mark_import_failed(artist, detail)
+        except Exception:
+            log.exception("Could not flag the skipped import for %s", artist)
+        self._flag_import(artist, detail)
+        self._publish_import(f"Skipped Lidarr import for {artist}", hold=False)
+        self._summary_review(artist, detail)
 
     def _import_problems(self, artist: str) -> list[str]:
         checker = getattr(self.lidarr, "import_failures", None)
@@ -927,13 +1177,23 @@ class Worker:
                 destination = str(review)
         return destination
 
-    def _run_auto_import(self, artists: list[str]) -> None:
+    def _run_auto_import(self, artists: list[str], paths: dict | None = None) -> None:
         folder = self._import_folder()
+        saved = paths or {}
         try:
             for artist in artists:
-                if not self.cfg.auto_import_after_artist:
-                    break
-                self._import_one_artist(artist, folder)
+                if self._import_cancel_for(artist):
+                    self._note_import_skip(artist)
+                    with self._import_lock:
+                        self._import_skip_artists.discard(artist.casefold())
+                        self._import_manual.discard(artist.casefold())
+                    continue
+                manual = artist.casefold() in self._import_manual
+                mode = self._effective_import_mode()
+                if mode == "off" and not manual:
+                    continue
+                path, fallback = saved.get(artist.casefold(), ("", ""))
+                self._import_one_artist(artist, path or folder, fallback)
         finally:
             with self._import_lock:
                 if self._import_thread is threading.current_thread():
@@ -941,20 +1201,9 @@ class Worker:
             self.maybe_auto_import()
 
     async def _wait_for_import(self) -> None:
-        """Wait for the wanted resync. A scan that is still running does not block the next search."""
-        while not self.control.is_stopped():
-            self.maybe_auto_import()
-            with self._import_lock:
-                thread = self._import_thread
-                phase = self._import_phase
-                pending = bool(self._import_armed and self._import_artists)
-            if thread is not None and thread.is_alive() and phase == "resync":
-                await asyncio.sleep(0.2)
-                continue
-            if pending and not self._queue_busy() and self.cfg.auto_import_after_artist:
-                await asyncio.sleep(0.05)
-                continue
-            return
+        """Start a due import. The worker does not wait for the scan or the resync."""
+        self.maybe_interval_import()
+        self.maybe_auto_import()
 
     def resync_artist_from_lidarr(self, artist: str) -> None:
         """Refresh one artist's wanted rows and track files from Lidarr.
@@ -1000,11 +1249,15 @@ class Worker:
         token = (artist or "").casefold().strip()
         if not token:
             return
-        with self.store._lock:
-            rows = self.store._db.execute(
-                "SELECT album_id, artist, title, status FROM jobs WHERE lower(artist) = ?",
-                (token,),
-            ).fetchall()
+        try:
+            with self.store._lock:
+                rows = self.store._db.execute(
+                    "SELECT album_id, artist, title, status FROM jobs WHERE lower(artist) = ?",
+                    (token,),
+                ).fetchall()
+        except Exception:
+            log.exception("Could not release unimported albums for %s", artist)
+            return
         for album_id, name, title, status in rows:
             if status != "staged":
                 continue
@@ -2939,15 +3192,7 @@ class Worker:
         if self.cfg.delete_sources_after_import:
             cleanup_sources(sources, self.cfg.download_dir)
         self._summary_grabbed(f"{artist} – {title}")
-        if not self.cfg.auto_import_after_artist:
-            scanned, reason = self._scan_staged_folder(folder)
-            if not scanned:
-                self.store.upsert_track(track_id, album_id, artist, title, "failed", reason)
-                self._summary_failed(f"{artist} – {title}", reason)
-                return False
-            self.ask_lidarr_rename(album)
-        else:
-            self._visit_had_download = True
+        self._schedule_folder_import(artist, folder, visit=True)
         self.store.upsert_track(track_id, album_id, artist, title, "staged", str(folder))
         log.info("Staged missing track %s into %s", title, folder)
         return True
@@ -3291,19 +3536,8 @@ class Worker:
         label = f"{artist} – {title}"
         self._summary_grabbed(f"{label} from {best.username}")
         self.store.upsert(album_id, artist, title, "staged", str(folder))
-        if self.cfg.auto_import_after_artist:
-            self._visit_had_download = True
-            return "ok", ""
-        scanned, reason = self._scan_staged_folder(folder)
-        if not scanned:
-            self._move_artist_to_review(artist)
-            return "again", reason
-        self.resync_artist_from_lidarr(artist)
-        job = self.store.get(album_id)
-        if job and job["status"] == "imported":
-            self._summary_imported(label)
-            return "ok", ""
-        log.info("Asked Lidarr to import %s", folder)
+        self._schedule_folder_import(artist, folder, visit=True)
+        log.info("Staged %s for Lidarr import", folder)
         return "ok", ""
 
     def _prepare_staged_folder(self, folder: Path, album: dict, tracks: list) -> tuple[bool, str]:
@@ -3318,18 +3552,9 @@ class Worker:
         return True, ""
 
     def _scan_staged_folder(self, folder: Path) -> tuple[bool, str]:
-        scan_path = str(Path(self.cfg.lidarr_scan_path) / folder.name)
-        try:
-            result = self.lidarr.scan_downloaded(scan_path)
-        except Exception as exc:
-            try:
-                result = self.lidarr.scan_downloaded(str(folder))
-            except Exception:
-                return False, f"scan failed: {exc}"
-        waited = self._finish_lidarr_command(result)
-        if self._command_failed(waited):
-            return False, f"Lidarr scan {waited.get('status') or 'failed'}"
-        return True, ""
+        """Queue a scan. The worker does not wait on Lidarr."""
+        self._schedule_folder_import(folder.name, folder)
+        return True, "queued"
 
     def _scored_folders(self, results, artist, title, titles, durations, gate, rejected) -> list:
         found = []
@@ -3981,9 +4206,7 @@ class Worker:
             if not complete:
                 continue
             self._prepare_staged_folder(dest, {"title": folder, "artist": {"artistName": group_artist}}, [])
-            scanned, reason = self._scan_staged_folder(dest)
-            if not scanned:
-                log.warning("Lidarr scan failed for manual download %s: %s", dest, reason)
+            self._schedule_folder_import(group_artist, dest)
         finished = {id(item) for item in transfers}
         self.manual_transfers = [item for item in self.manual_transfers if id(item) not in finished or state_name(item) not in {"COMPLETE", "FAILED", "ABORTED"}]
         self.maybe_auto_import()
@@ -4177,9 +4400,7 @@ class Worker:
                 if not staged:
                     continue
                 self._prepare_staged_folder(dest, {"title": album, "artist": {"artistName": artist}}, [])
-                scanned, reason = self._scan_staged_folder(dest)
-                if not scanned:
-                    log.warning("Lidarr scan failed for browse download %s: %s", dest, reason)
+                self._schedule_folder_import(artist, dest)
             self.maybe_auto_import()
             detail = f"Downloaded {done} of {len(specs)} file(s) from {username}, {width} at a time, {pause}s apart."
             self.store.set_meta("last_browse_download", detail)

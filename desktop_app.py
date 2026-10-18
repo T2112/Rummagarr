@@ -26,6 +26,7 @@ from config_loader import (
     default_config,
     default_media_dirs,
     desktop_config_path,
+    normalize_import_mode,
     normalize_theme,
     save_config,
     try_load_config,
@@ -795,6 +796,37 @@ BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
         "",
         "When this is on, a user who has finished 3 downloads is offered in one prompt. Add puts them in Priority users. Turn this off to stop those prompts. Don't ask again on the prompt turns this off.",
     ),
+    BehaviorField(
+        "import_mode",
+        "Lidarr import",
+        "choice",
+        "",
+        "Off (manual) waits until you press Retry import. After each album scans that album when it finishes. After each artist scans when that artist's visit ends and the download queue is empty. On a timer scans finished artists on the interval below. One slow import never stops the next artist.",
+        choices=(
+            ("off", "Off (manual)"),
+            ("album", "After each album"),
+            ("after_artist", "After each artist"),
+            ("interval", "On a timer"),
+        ),
+    ),
+    BehaviorField(
+        "import_interval_minutes",
+        "Import interval",
+        "int",
+        "minutes",
+        "How often finished artists are imported when Lidarr import is On a timer.",
+        1,
+        1440,
+    ),
+    BehaviorField(
+        "import_timeout_minutes",
+        "Import timeout",
+        "int",
+        "minutes",
+        "How long to wait for one artist's Lidarr import. After this, that artist is flagged and the next artist continues. Status shows the wait, such as Waiting on Lidarr import (3/10 min).",
+        1,
+        120,
+    ),
 )
 
 _PRIMARY_BEHAVIOR = frozenset(
@@ -808,6 +840,9 @@ _PRIMARY_BEHAVIOR = frozenset(
         "convert_bitrate",
         "confirm_download_all",
         "suggest_favorites",
+        "import_mode",
+        "import_interval_minutes",
+        "import_timeout_minutes",
     }
 )
 
@@ -832,7 +867,17 @@ _RESTART_FIELDS = frozenset(
 )
 _LAUNCH_FIELDS = frozenset({"start_on_launch", "check_updates"})
 _IMMEDIATE_FIELDS = frozenset(
-    {"theme", "confirm_download_all", "search_order", "search_order_direction", "suggest_favorites"}
+    {
+        "theme",
+        "confirm_download_all",
+        "search_order",
+        "search_order_direction",
+        "suggest_favorites",
+        "import_mode",
+        "import_interval_minutes",
+        "import_timeout_minutes",
+        "auto_import_after_artist",
+    }
 )
 _BRIDGE_FIELDS = frozenset(
     {
@@ -1732,6 +1777,10 @@ class SettingsForm(ttk.Frame):
                 values[spec.key] = normalize_search_order(self.fields[spec.key].get())
             elif spec.key == "search_order_direction":
                 values[spec.key] = normalize_search_direction(self.fields[spec.key].get())
+            elif spec.key == "import_mode":
+                mode = normalize_import_mode(self.fields[spec.key].get())
+                values[spec.key] = mode
+                values["auto_import_after_artist"] = mode == "after_artist"
             elif spec.key == "preferred_extensions":
                 parts = [part.strip().lower().lstrip(".") for part in str(self.fields[spec.key].get()).split(",")]
                 parts = [part for part in parts if part]
@@ -3668,6 +3717,8 @@ class DesktopApp(tk.Tk):
             command=self.on_auto_import,
         )
         self.auto_import.pack(anchor="w", pady=(self.px(8), 0))
+        self.import_rows = ttk.Frame(parent, style="Main.TFrame")
+        self.import_rows.pack(fill="x", pady=(self.px(4), 0))
 
         grid = ttk.Frame(parent, style="Main.TFrame")
         grid.pack(fill="both", expand=True, pady=(self.px(10), 0))
@@ -3918,11 +3969,53 @@ class DesktopApp(tk.Tk):
 
     def on_auto_import(self) -> None:
         enabled = bool(self.auto_import_var.get())
-        self.worker.cfg = replace(self.worker.cfg, auto_import_after_artist=enabled)
+        if enabled:
+            mode = "after_artist"
+        else:
+            current = normalize_import_mode(self.worker.cfg.import_mode)
+            mode = "album" if current == "after_artist" else current
+        self.worker.cfg = replace(
+            self.worker.cfg,
+            auto_import_after_artist=mode == "after_artist",
+            import_mode=mode,
+        )
         try:
             save_config(self.config_path, self.worker.cfg)
         except OSError:
             log.exception("Could not save the auto-import setting")
+        form = getattr(self, "_settings_form", None)
+        if form is not None and "import_mode" in getattr(form, "fields", {}):
+            form._set_field(next(spec for spec in BEHAVIOR_FIELDS if spec.key == "import_mode"), mode)
+            form.base = self.worker.cfg
+
+    def on_retry_import(self, artist: str) -> None:
+        self.worker.retry_import(artist)
+        self.notice_var.set(f"Retrying Lidarr import for {artist}.")
+        self.refresh_status()
+
+    def on_skip_import(self, artist: str) -> None:
+        self.worker.skip_import(artist)
+        self.notice_var.set(f"Skipping the Lidarr import for {artist}.")
+        self.refresh_status()
+
+    def _fill_import_actions(self) -> None:
+        frame = getattr(self, "import_rows", None)
+        if frame is None:
+            return
+        for child in list(frame.winfo_children()):
+            child.destroy()
+        rows = self.worker.import_attention()
+        if not rows:
+            return
+        for row in rows:
+            artist = str(row.get("artist") or "")
+            line = ttk.Frame(frame, style="Main.TFrame")
+            line.pack(fill="x", pady=(self.px(2), 0))
+            ttk.Label(line, text=str(row.get("text") or artist), style="Muted.TLabel").pack(side="left")
+            ttk.Button(line, text="Skip", command=lambda name=artist: self.on_skip_import(name)).pack(side="right")
+            ttk.Button(line, text="Retry import", command=lambda name=artist: self.on_retry_import(name)).pack(
+                side="right", padx=(0, self.px(8))
+            )
 
     def refresh_status(self) -> None:
         limit = normalize_recent_limit(self.limit_var.get())
@@ -3947,6 +4040,9 @@ class DesktopApp(tk.Tk):
             self.notice_var.set("ffmpeg was not found. Lossless files cannot be converted until it is installed.")
         self._fill_transfers(snapshot.get("transfers") or [])
         self._fill_recent(snapshot.get("recent") or [], limit)
+        self._fill_import_actions()
+        if getattr(self, "auto_import_var", None) is not None:
+            self.auto_import_var.set(self.worker.cfg.import_mode == "after_artist" or self.worker.cfg.auto_import_after_artist)
         self.refresh_notices()
         self.refresh_messages()
 
