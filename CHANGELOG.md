@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Changed
+
+- Source, docs, packaging filenames, the default log, and the logon task use the name Rummagarr. The GitHub repository stays T2112/lidarr-soulseek until it is renamed in GitHub settings. After that rename, GitHub redirects the old URL. Help → Check for updates tries https://github.com/T2112/rummagarr first, then https://github.com/T2112/lidarr-soulseek, and follows a redirect from either one.
+- A new config writes `rummagarr.log`. A config that already names `lidarr-soulseek.log` keeps that file, and a config with no log setting keeps an existing `lidarr-soulseek.log` beside it. Backups store the log as `rummagarr.log` and still restore a zip member named `lidarr-soulseek.log`. Settings, the Soulseek login, and the sync list stay in `%LOCALAPPDATA%\Rummagarr` (or `~/.rummagarr`). The first launch still copies them from `%LOCALAPPDATA%\Lidarr Soulseek` or `~/.lidarr-soulseek` when the Rummagarr folder has no config yet.
+- The Windows logon task is `RummagarrWorker`. `register-task.ps1` removes `LidarrSoulseekWorker` when it registers the new task. `uninstall.ps1` removes both. `RUMMAGARR_HOME` and `RUMMAGARR_CONFIG` override the data folder and the config file. `LIDARR_SLSK_HOME` and `LIDARR_SLSK_CONFIG` still apply when the new names are unset.
+- The installer id and the program mutex are unchanged, so this setup replaces the existing install instead of sitting beside it, and a running copy still closes for the upgrade.
+- Releases keep publishing `Rummagarr-Setup-<version>.exe` only. An installed 1.10.0 through 1.12.x looks for that file first, so it can update. A 1.9.4 or earlier install looks only for `LidarrSoulseek-Setup-<version>.exe`, which 1.19.0 stopped publishing. That install needs one manual download of the current setup.
+
 ## [1.19.1] — 2026-10-18
 
 ### Added

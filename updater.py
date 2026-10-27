@@ -18,8 +18,10 @@ import httpx
 from config_loader import app_version
 from process_launch import popen_hidden
 
-# The repository is moving to T2112/rummagarr. Until that rename, the old URL
-# still serves the release, so the check tries the new name and then the old one.
+# Try T2112/rummagarr first. Until that GitHub repo exists, it 404s and the
+# previous repository still serves the release. After the rename, GitHub 301s
+# the old URL to /repositories/<id>/...; the client follows that redirect.
+# Either order works, before or after the rename.
 RELEASE_API_URLS = (
     "https://api.github.com/repos/T2112/rummagarr/releases/latest",
     "https://api.github.com/repos/T2112/lidarr-soulseek/releases/latest",

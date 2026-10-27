@@ -11,7 +11,7 @@ from pathlib import Path
 
 from match import AUDIO_EXT, similarity
 
-log = logging.getLogger("lidarr_slsk")
+log = logging.getLogger("rummagarr")
 
 
 def release_ids(album: dict | None) -> tuple[str, str]:

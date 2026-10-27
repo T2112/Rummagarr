@@ -391,7 +391,7 @@ def test_config_round_trip_keeps_instances_bridge_and_dry_run(tmp_path: Path):
         download_dir=tmp_path / "in",
         complete_dir=tmp_path / "out",
         state_db=tmp_path / "state.sqlite3",
-        log_file=tmp_path / "lidarr-soulseek.log",
+        log_file=tmp_path / "rummagarr.log",
         lidarr_active="Cabin",
         lidarr_instances=[
             {"name": "Home", "url": "http://lidarr.home:8686", "api_key": "home-key", "scan_path": home},
@@ -569,7 +569,7 @@ def test_advertise_host_tailscale_and_remote_path(tmp_path: Path):
     assert "BridgePort" in firewall
     assert "Write-Error" not in firewall
     assert "Rummagarr.exe" in firewall
-    installer = Path("packaging/LidarrSoulseek.iss").read_text(encoding="utf-8")
+    installer = Path("packaging/Rummagarr.iss").read_text(encoding="utf-8")
     assert "open-firewall.ps1" in installer
     assert "WizardIsTaskSelected('firewall')" in installer
     assert "PrivilegesRequired=lowest" in installer

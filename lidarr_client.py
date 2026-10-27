@@ -8,7 +8,7 @@ import httpx
 
 from wanted import count_value, optional_id
 
-log = logging.getLogger("lidarr_slsk")
+log = logging.getLogger("rummagarr")
 
 # A slow Tailscale link needs a long read. Retries cover a dropped packet.
 _DEFAULT_TIMEOUT = 120.0

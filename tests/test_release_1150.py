@@ -179,15 +179,16 @@ def test_backup_round_trip_ignores_paths_outside_the_zip(tmp_path: Path):
     conn.execute("INSERT INTO meta VALUES ('keep')")
     conn.commit()
     conn.close()
-    log = tmp_path / "lidarr-soulseek.log"
+    log = tmp_path / "rummagarr.log"
     log.write_text("hello\n", encoding="utf-8")
     (tmp_path / "state-browse.sqlite3").write_bytes(b"browse")
 
     dest = tmp_path / "backups" / "Rummagarr-backup.zip"
     names = create_backup(dest, config_path=config, state_db=db, log_file=log)
-    assert names == ["config.toml", "state.sqlite3", "state-browse.sqlite3", "lidarr-soulseek.log"]
+    assert names == ["config.toml", "state.sqlite3", "state-browse.sqlite3", "rummagarr.log"]
     assert safe_member("../config.toml") is None
     assert safe_member("config.toml") == "config.toml"
+    assert safe_member("lidarr-soulseek.log") == "lidarr-soulseek.log"
 
     poisoned = tmp_path / "poison.zip"
     outside = tmp_path / "escaped.txt"
@@ -195,17 +196,34 @@ def test_backup_round_trip_ignores_paths_outside_the_zip(tmp_path: Path):
         archive.writestr("../escaped.txt", "nope")
         archive.writestr("config.toml", "restored = true\n")
     restored_config = tmp_path / "restored" / "config.toml"
-    written = restore_backup(poisoned, config_path=restored_config, state_db=tmp_path / "restored" / "state.sqlite3", log_file=tmp_path / "restored" / "lidarr-soulseek.log")
+    written = restore_backup(poisoned, config_path=restored_config, state_db=tmp_path / "restored" / "state.sqlite3", log_file=tmp_path / "restored" / "rummagarr.log")
     assert written == ["config.toml"]
     assert restored_config.read_text(encoding="utf-8") == "restored = true\n"
     assert not outside.exists()
 
-    again = restore_backup(dest, config_path=tmp_path / "again" / "config.toml", state_db=tmp_path / "again" / "state.sqlite3", log_file=tmp_path / "again" / "lidarr-soulseek.log")
+    again_log = tmp_path / "again" / "rummagarr.log"
+    again = restore_backup(dest, config_path=tmp_path / "again" / "config.toml", state_db=tmp_path / "again" / "state.sqlite3", log_file=again_log)
     assert "state.sqlite3" in again
     assert "state-browse.sqlite3" in again
+    assert "rummagarr.log" in again
+    assert again_log.read_text(encoding="utf-8") == "hello\n"
     check = sqlite3.connect(tmp_path / "again" / "state.sqlite3")
     assert check.execute("SELECT k FROM meta").fetchone()[0] == "keep"
     check.close()
+
+    legacy = tmp_path / "legacy.zip"
+    with zipfile.ZipFile(legacy, "w") as archive:
+        archive.writestr("lidarr-soulseek.log", "old log\n")
+        archive.writestr("config.toml", "kept = true\n")
+    legacy_log = tmp_path / "legacy" / "rummagarr.log"
+    restored_legacy = restore_backup(
+        legacy,
+        config_path=tmp_path / "legacy" / "config.toml",
+        state_db=tmp_path / "legacy" / "state.sqlite3",
+        log_file=legacy_log,
+    )
+    assert "lidarr-soulseek.log" in restored_legacy
+    assert legacy_log.read_text(encoding="utf-8") == "old log\n"
 
 
 def test_changelog_mentions_browse_and_the_donate_placeholder():

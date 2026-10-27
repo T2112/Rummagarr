@@ -1,5 +1,6 @@
 config.toml
 state.sqlite3
+rummagarr.log
 lidarr-soulseek.log
 __pycache__/
 .venv/

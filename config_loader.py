@@ -10,12 +10,18 @@ from pathlib import Path
 
 from search_order import normalize_search_direction, normalize_search_order
 
-log = logging.getLogger("lidarr_slsk")
+log = logging.getLogger("rummagarr")
 
 APP_NAME = "Rummagarr"
 IMPORT_MODES = ("off", "album", "after_artist", "interval")
+LOG_FILE_NAME = "rummagarr.log"
+# Written by configs saved before the rename. Still opened when config.toml names it.
+LEGACY_LOG_FILE_NAME = "lidarr-soulseek.log"
 LEGACY_WINDOWS_DIR = "Lidarr Soulseek"
 LEGACY_HOME_DIR = ".lidarr-soulseek"
+# Older installs set these. The Rummagarr names win when both are present.
+_HOME_ENV = ("RUMMAGARR_HOME", "LIDARR_SLSK_HOME")
+_CONFIG_ENV = ("RUMMAGARR_CONFIG", "LIDARR_SLSK_CONFIG")
 
 
 class ConfigError(Exception):
@@ -127,12 +133,21 @@ def normalize_theme(value) -> str:
     return "dark"
 
 
+def _first_env(*names: str) -> str:
+    """First non-empty environment variable, in the order given."""
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
 def app_data_dir() -> Path:
     """Settings, the database, and the log. An explicit home override is kept as-is."""
     if os.name == "nt":
         root = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
         return Path(root) / APP_NAME
-    override = os.environ.get("LIDARR_SLSK_HOME")
+    override = _first_env(*_HOME_ENV)
     if override:
         return Path(override)
     return Path.home() / ".rummagarr"
@@ -140,7 +155,7 @@ def app_data_dir() -> Path:
 
 def legacy_data_dir() -> Path | None:
     """Previous data folder. None when the user already pointed at a folder."""
-    if os.environ.get("LIDARR_SLSK_HOME"):
+    if _first_env(*_HOME_ENV):
         return None
     if os.name == "nt":
         root = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
@@ -236,7 +251,7 @@ def app_version() -> str:
 
 def desktop_config_path() -> Path:
     """Where the desktop app reads and writes config.toml."""
-    override = os.environ.get("LIDARR_SLSK_CONFIG")
+    override = _first_env(*_CONFIG_ENV)
     if override:
         return Path(override)
     if getattr(sys, "frozen", False):
@@ -277,7 +292,7 @@ def default_config(**overrides) -> Config:
         complete_dir=complete,
         share_dir=str(overrides.pop("share_dir", "")),
         state_db=Path(overrides.pop("state_db", "state.sqlite3")),
-        log_file=Path(overrides.pop("log_file", "lidarr-soulseek.log")),
+        log_file=Path(overrides.pop("log_file", LOG_FILE_NAME)),
         search_wait_seconds=float(overrides.pop("search_wait_seconds", 12)),
         max_albums_per_cycle=int(overrides.pop("max_albums_per_cycle", 1)),
         max_tracks_per_cycle=int(overrides.pop("max_tracks_per_cycle", 5)),
@@ -663,11 +678,16 @@ def try_load_config(path: Path) -> Config:
     complete_dir = Path(paths["complete_dir"])
     instances, active, chosen = _lidarr_instances(lidarr, str(complete_dir))
     state_db = Path(paths.get("state_db", "state.sqlite3"))
-    log_file = Path(paths.get("log_file", "lidarr-soulseek.log"))
+    log_file = Path(paths.get("log_file", LOG_FILE_NAME))
     if not state_db.is_absolute():
         state_db = base / state_db
     if not log_file.is_absolute():
         log_file = base / log_file
+    # A config saved before log_file existed used the old default name on disk.
+    if "log_file" not in paths:
+        legacy_log = base / LEGACY_LOG_FILE_NAME
+        if legacy_log.is_file() and not log_file.exists():
+            log_file = legacy_log
 
     for key, value in (
         ("lidarr.api_key", lidarr.get("api_key", "")),

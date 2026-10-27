@@ -26,7 +26,7 @@ $work = Join-Path $Root "packaging\pyi-build"
 if (Test-Path $work) {
     Remove-Item -Recurse -Force $work
 }
-python -m PyInstaller --noconfirm --clean --distpath (Join-Path $Root "dist") --workpath $work "$Root\packaging\lidarr_soulseek.spec"
+python -m PyInstaller --noconfirm --clean --distpath (Join-Path $Root "dist") --workpath $work "$Root\packaging\rummagarr.spec"
 
 function Find-InnoCompiler {
     $candidates = @(
@@ -48,7 +48,7 @@ function Find-InnoCompiler {
 
 $iscc = Find-InnoCompiler
 $version = (Get-Content (Join-Path $Root "VERSION") -Raw).Trim()
-& $iscc "/DMyAppVersion=$version" (Join-Path $Root "packaging\LidarrSoulseek.iss")
+& $iscc "/DMyAppVersion=$version" (Join-Path $Root "packaging\Rummagarr.iss")
 if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup failed with exit code $LASTEXITCODE"
 }
