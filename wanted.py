@@ -7,7 +7,7 @@ import re
 import threading
 from dataclasses import dataclass, field
 
-log = logging.getLogger("lidarr_slsk.wanted")
+log = logging.getLogger("rummagarr.wanted")
 
 # "A1", "B12", "1a", "10". Lidarr sends trackNumber as text because of vinyl.
 _POSITION = re.compile(r"^([A-Za-z]*)(\d*)(.*)$")

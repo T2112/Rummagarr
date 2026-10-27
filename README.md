@@ -2,14 +2,14 @@
 
 Rummagarr is a Windows desktop app that fills Lidarr's missing albums and tracks from Soulseek.
 
-[![Release](https://img.shields.io/github/v/release/T2112/lidarr-soulseek)](https://github.com/T2112/lidarr-soulseek/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/T2112/lidarr-soulseek/total)](https://github.com/T2112/lidarr-soulseek/releases)
+[![Release](https://img.shields.io/github/v/release/T2112/Rummagarr)](https://github.com/T2112/Rummagarr/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/T2112/Rummagarr/total)](https://github.com/T2112/Rummagarr/releases)
 [![License: personal use](https://img.shields.io/badge/license-personal%20use-blue)](LICENSE.txt)
-[![CI](https://img.shields.io/github/actions/workflow/status/T2112/lidarr-soulseek/windows-installer.yml?branch=main&label=CI)](https://github.com/T2112/lidarr-soulseek/actions/workflows/windows-installer.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/T2112/Rummagarr/windows-installer.yml?branch=main&label=CI)](https://github.com/T2112/Rummagarr/actions/workflows/windows-installer.yml)
 
-**Version 1.19.1.** Rummagarr is published in the repository T2112/lidarr-soulseek (it will move to T2112/rummagarr).
+**Version 1.19.1.** The public repository is [T2112/Rummagarr](https://github.com/T2112/Rummagarr).
 
-[Sponsor Rummagarr](https://github.com/sponsors/T2112) · [Latest release](https://github.com/T2112/lidarr-soulseek/releases/latest) · [Issues](https://github.com/T2112/lidarr-soulseek/issues)
+[Sponsor Rummagarr](https://github.com/sponsors/T2112) · [Latest release](https://github.com/T2112/Rummagarr/releases/latest) · [Issues](https://github.com/T2112/Rummagarr/issues)
 
 ## What it is
 
@@ -38,7 +38,7 @@ A demo GIF of Status, then Wanted, then Search is not in this repository yet.
 
 ## Download and install
 
-Download `Rummagarr-Setup-<version>.exe` from the [latest release](https://github.com/T2112/lidarr-soulseek/releases/latest). No GitHub account is required. The installer adds a Start Menu shortcut and a desktop shortcut, both named Rummagarr. An older install is upgraded in place.
+Download `Rummagarr-Setup-<version>.exe` from the [latest release](https://github.com/T2112/Rummagarr/releases/latest). No GitHub account is required. The installer adds a Start Menu shortcut and a desktop shortcut, both named Rummagarr. An older install is upgraded in place.
 
 ### Windows SmartScreen
 
@@ -62,15 +62,15 @@ Unblock-File .\Rummagarr-Setup-<version>.exe
 ## Architecture
 
 - `desktop_app.py` is the window. The worker searches, downloads, and talks to Lidarr.
-- Config, the database, and `lidarr-soulseek.log` stay in `%LOCALAPPDATA%\Rummagarr`.
+- Config, the database, and `rummagarr.log` stay in `%LOCALAPPDATA%\Rummagarr`. A config that already names `lidarr-soulseek.log` keeps that file.
 - Bridge mode (`lidarr_bridge.py`) serves Torznab and a qBittorrent 2.11.2-compatible API on this PC.
-- The installed app updates itself from GitHub Releases. The check prefers the planned repository name and uses this repository while that name is unpublished. The client follows a redirect if the repository is renamed.
+- The installed app updates itself from GitHub Releases on this repository. The check still tries the previous API address if needed, and the client follows a redirect.
 - Pull requests and pushes to `main` run the tests and upload `Rummagarr-Setup-<version>.exe` as a workflow artifact. A `v<version>` tag publishes that installer on the release.
 
 ## Changelog and issues
 
 - [CHANGELOG.md](CHANGELOG.md)
-- [GitHub Issues](https://github.com/T2112/lidarr-soulseek/issues)
+- [GitHub Issues](https://github.com/T2112/Rummagarr/issues)
 - [Sponsor Rummagarr](https://github.com/sponsors/T2112)
 - Portfolio, LinkedIn, and GitHub profile copy: [docs/showcase.md](docs/showcase.md)
 
@@ -95,11 +95,11 @@ Unblock-File .\Rummagarr-Setup-<version>.exe
 The installed app checks GitHub Releases when it opens. **Help → Check for updates** runs that check immediately. Config, the database, and the log live in `%LOCALAPPDATA%\Rummagarr\`.
 
 A custom Lidarr import list of MusicBrainz IDs is at  
-https://raw.githubusercontent.com/T2112/lidarr-soulseek/main/lists/lidarr-custom-list.json
+https://raw.githubusercontent.com/T2112/Rummagarr/main/lists/lidarr-custom-list.json
 
 ## Help
 
-Questions, bugs, and ideas go to [GitHub Issues](https://github.com/T2112/lidarr-soulseek/issues). Include the app version from **Help → About**. For a crash, attach the zip from **Help → Open crash folder**.
+Questions, bugs, and ideas go to [GitHub Issues](https://github.com/T2112/Rummagarr/issues). Include the app version from **Help → About**. For a crash, attach the zip from **Help → Open crash folder**.
 
 ## Sponsor
 
@@ -113,7 +113,7 @@ On a Windows machine, from this folder:
 powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 ```
 
-That installs the Python dependencies and PyInstaller, freezes `desktop_app.py`, and compiles `packaging\LidarrSoulseek.iss` with Inno Setup 6. If Inno Setup is not already installed, the script downloads it. The setup program is written to:
+That installs the Python dependencies and PyInstaller, freezes `desktop_app.py`, and compiles `packaging\Rummagarr.iss` with Inno Setup 6. If Inno Setup is not already installed, the script downloads it. The setup program is written to:
 
 ```text
 dist\Rummagarr-Setup-1.11.0.exe
@@ -230,7 +230,7 @@ In Lidarr:
 
 ## What working looks like
 
-Log file: `lidarr-soulseek.log`
+Log file: `rummagarr.log` (a config that still names `lidarr-soulseek.log` keeps writing that file)
 
 ```
 Lidarr OK
@@ -272,10 +272,10 @@ Use only one Soulseek client on this account while the worker runs.
 ## Daily commands
 
 ```powershell
-Get-Content .\lidarr-soulseek.log -Wait -Tail 30
-Get-ScheduledTask -TaskName LidarrSoulseekWorker
-Stop-ScheduledTask -TaskName LidarrSoulseekWorker
-Start-ScheduledTask -TaskName LidarrSoulseekWorker
+Get-Content .\rummagarr.log -Wait -Tail 30
+Get-ScheduledTask -TaskName RummagarrWorker
+Stop-ScheduledTask -TaskName RummagarrWorker
+Start-ScheduledTask -TaskName RummagarrWorker
 ```
 
 Uninstall the logon task:

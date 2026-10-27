@@ -35,14 +35,13 @@ def test_build_and_workflow_do_not_publish_the_old_installer_name():
     assert "LidarrSoulseek-Setup" not in readme
     assert "Rummagarr-Setup-*.exe" in workflow
     assert "Rummagarr-Setup-$version.exe" in script
-    assert "https://github.com/T2112/lidarr-soulseek" in readme
-    assert "https://github.com/T2112/rummagarr" not in readme
-    assert "it will move to T2112/rummagarr" in readme
+    assert "https://github.com/T2112/Rummagarr" in readme
+    assert "T2112/lidarr-soulseek" not in readme
     assert "Lidarr Soulseek" not in readme
 
 
 def test_installer_id_and_old_data_folder_stay():
-    installer = (ROOT / "packaging" / "LidarrSoulseek.iss").read_text(encoding="utf-8")
+    installer = (ROOT / "packaging" / "Rummagarr.iss").read_text(encoding="utf-8")
     assert "AppId={{7C3E9A2B-5F14-4D8E-9A6C-2B1F0E4D8A77}" in installer
     assert "AppMutex=LidarrSoulseekMutex" in installer
     assert 'AppName={#MyAppName}' in installer

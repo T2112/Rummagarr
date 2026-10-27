@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from config_loader import (
@@ -23,7 +24,7 @@ def test_round_trip_keeps_secrets_and_windows_paths(tmp_path: Path):
         download_dir=tmp_path / "in",
         complete_dir=tmp_path / "out",
         state_db=tmp_path / "state.sqlite3",
-        log_file=tmp_path / "lidarr-soulseek.log",
+        log_file=tmp_path / "rummagarr.log",
         start_on_launch=True,
         ignored_users={"badpeer"},
         preferred_extensions=["flac", "mp3"],
@@ -199,3 +200,47 @@ def test_lidarr_track_concurrency_defaults_and_clamps(tmp_path: Path):
     assert try_load_config(path).lidarr_track_concurrency == 8
     path.write_text(text.replace("lidarr_track_concurrency = 6", "lidarr_track_concurrency = 0"), encoding="utf-8")
     assert try_load_config(path).lidarr_track_concurrency == 1
+
+
+def test_new_config_uses_the_rummagarr_log_and_keeps_a_saved_legacy_name(tmp_path: Path):
+    assert default_config().log_file.name == "rummagarr.log"
+    cfg = default_config(
+        lidarr_api_key="abc123",
+        slsk_username="souluser",
+        slsk_password="soulpass",
+        download_dir=tmp_path / "in",
+        complete_dir=tmp_path / "out",
+        log_file=tmp_path / "lidarr-soulseek.log",
+    )
+    path = tmp_path / "config.toml"
+    save_config(path, cfg)
+    assert try_load_config(path).log_file.name == "lidarr-soulseek.log"
+    lines = [line for line in path.read_text(encoding="utf-8").splitlines() if not line.startswith("log_file")]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    legacy = tmp_path / "lidarr-soulseek.log"
+    legacy.write_text("kept", encoding="utf-8")
+    assert try_load_config(path).log_file == legacy
+    legacy.unlink()
+    assert try_load_config(path).log_file.name == "rummagarr.log"
+
+
+def test_config_location_accepts_the_new_names_and_the_old_ones(monkeypatch, tmp_path: Path):
+    from config_loader import app_data_dir, desktop_config_path, legacy_data_dir
+
+    new_config = tmp_path / "new.toml"
+    old_config = tmp_path / "old.toml"
+    monkeypatch.setenv("RUMMAGARR_CONFIG", str(new_config))
+    monkeypatch.setenv("LIDARR_SLSK_CONFIG", str(old_config))
+    assert desktop_config_path() == new_config
+    monkeypatch.delenv("RUMMAGARR_CONFIG")
+    assert desktop_config_path() == old_config
+
+    if os.name == "nt":
+        return
+    monkeypatch.delenv("RUMMAGARR_HOME", raising=False)
+    monkeypatch.setenv("LIDARR_SLSK_HOME", str(tmp_path / "old-home"))
+    assert app_data_dir() == tmp_path / "old-home"
+    assert legacy_data_dir() is None
+    monkeypatch.setenv("RUMMAGARR_HOME", str(tmp_path / "new-home"))
+    assert app_data_dir() == tmp_path / "new-home"
+    assert legacy_data_dir() is None

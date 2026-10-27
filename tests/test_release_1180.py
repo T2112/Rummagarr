@@ -85,7 +85,7 @@ def test_crash_bundle_is_local_and_redacts_secrets(tmp_path: Path):
     assert redact('password = "soulpass"\napi_key = "abc"\nslsk_password = "hide"') == (
         'password = "[redacted]"\napi_key = "[redacted]"\nslsk_password = "[redacted]"'
     )
-    log_path = tmp_path / "lidarr-soulseek.log"
+    log_path = tmp_path / "rummagarr.log"
     log_path.write_text('password = "soulpass"\nworker started\n', encoding="utf-8")
     config_path = tmp_path / "config.toml"
     config_path.write_text('api_key = "abc123"\nusername = "souluser"\n', encoding="utf-8")

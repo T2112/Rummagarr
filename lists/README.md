@@ -2,7 +2,7 @@
 
 ## Main custom list
 
-https://raw.githubusercontent.com/T2112/lidarr-soulseek/main/lists/lidarr-custom-list.json
+https://raw.githubusercontent.com/T2112/Rummagarr/main/lists/lidarr-custom-list.json
 
 Curated popular / widely recorded artists across rock, pop, hip-hop, country, jazz, blues, metal, R&B/soul, electronic, folk, punk, indie, reggae, Latin, funk, classical, goth, emo, women artists, game soundtracks, electro-swing, and more.
 
@@ -10,7 +10,7 @@ Curated popular / widely recorded artists across rock, pop, hip-hop, country, ja
 
 ## Festival list (Woodstock + Qlimax + Ozzfest)
 
-https://raw.githubusercontent.com/T2112/lidarr-soulseek/main/lists/festivals-woodstock-qlimax-ozzfest.json
+https://raw.githubusercontent.com/T2112/Rummagarr/main/lists/festivals-woodstock-qlimax-ozzfest.json
 
 Separate import list of musicians, DJs, and groups that played:
 - Woodstock 1969, 1994, and 1999

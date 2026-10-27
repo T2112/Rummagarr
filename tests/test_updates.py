@@ -207,8 +207,14 @@ def test_update_check_tries_rummagarr_then_the_previous_repository():
     assert status.error == "GitHub rate limit reached. Try again in a little while."
 
 
-def test_the_update_client_follows_a_renamed_repository_redirect(monkeypatch):
-    """GitHub redirects a renamed repository. The checker follows that redirect."""
+def test_update_client_follows_a_renamed_repository_redirect(monkeypatch):
+    """GitHub 301s a renamed repo to /repositories/<id>. The checker follows it.
+
+    Confirmed against api.github.com on 2026-10-27: GET
+    /repos/github/gh-cli/releases/latest returned 301 to
+    /repositories/212613049/releases/latest, and httpx with
+    follow_redirects=True read the release JSON (tag v2.103.3).
+    """
     import updater
 
     seen: list[str] = []
@@ -216,12 +222,23 @@ def test_the_update_client_follows_a_renamed_repository_redirect(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         seen.append(url)
-        if "/T2112/rummagarr/" in url:
+        if "/T2112/rummagarr/releases/latest" in url:
+            return httpx.Response(404, json={"message": "Not Found"})
+        if "/T2112/lidarr-soulseek/releases/latest" in url:
             return httpx.Response(
                 301,
-                headers={"Location": "https://api.github.com/repos/T2112/lidarr-soulseek/releases/latest"},
+                headers={"Location": "https://api.github.com/repositories/1/releases/latest"},
             )
-        return httpx.Response(200, json=_payload("v1.19.1"))
+        body = _payload("v1.19.2")
+        body["assets"].insert(
+            0,
+            {
+                "name": "Rummagarr-Setup-1.19.2.exe",
+                "browser_download_url": "https://example.test/Rummagarr-Setup-1.19.2.exe",
+                "size": 11,
+            },
+        )
+        return httpx.Response(200, json=body)
 
     real_client = httpx.Client
 
@@ -231,12 +248,13 @@ def test_the_update_client_follows_a_renamed_repository_redirect(monkeypatch):
         return real_client(*args, **kwargs)
 
     monkeypatch.setattr(updater.httpx, "Client", factory)
-    status = check_for_update("1.19.0")
+    status = check_for_update("1.19.1", installed=True, platform="nt")
     assert status.error is None
-    assert status.latest == "1.19.1"
+    assert status.latest == "1.19.2"
+    assert status.asset_name == "Rummagarr-Setup-1.19.2.exe"
     assert any("/T2112/rummagarr/" in url for url in seen)
     assert any("/T2112/lidarr-soulseek/" in url for url in seen)
-    assert status.page_url.startswith("https://github.com/T2112/lidarr-soulseek/releases/tag/")
+    assert any(url.endswith("/repositories/1/releases/latest") for url in seen)
 
 
 def test_check_reports_rate_limit_and_network_errors():

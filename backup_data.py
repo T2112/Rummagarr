@@ -11,7 +11,16 @@ import sqlite3
 import zipfile
 from pathlib import Path
 
-_EXACT = {"config.toml", "state.sqlite3", "state.sqlite3-wal", "state.sqlite3-shm", "lidarr-soulseek.log"}
+from config_loader import LEGACY_LOG_FILE_NAME, LOG_FILE_NAME
+
+_EXACT = {
+    "config.toml",
+    "state.sqlite3",
+    "state.sqlite3-wal",
+    "state.sqlite3-shm",
+    LOG_FILE_NAME,
+    LEGACY_LOG_FILE_NAME,
+}
 
 
 def safe_member(name: str) -> str | None:
@@ -57,7 +66,7 @@ def create_backup(dest: Path, *, config_path: Path, state_db: Path, log_file: Pa
                 members.append((f"{db.stem}{extra_suffix}", extra))
     log = Path(log_file)
     if log.is_file():
-        members.append(("lidarr-soulseek.log", log))
+        members.append((LOG_FILE_NAME, log))
     if not members:
         raise ValueError("Nothing to back up yet. Save settings first.")
     written = []
@@ -90,7 +99,8 @@ def restore_backup(zip_path: Path, *, config_path: Path, state_db: Path, log_fil
         "state.sqlite3": Path(state_db),
         "state.sqlite3-wal": Path(str(state_db) + "-wal"),
         "state.sqlite3-shm": Path(str(state_db) + "-shm"),
-        "lidarr-soulseek.log": Path(log_file),
+        LOG_FILE_NAME: Path(log_file),
+        LEGACY_LOG_FILE_NAME: Path(log_file),
     }
     db = Path(state_db)
     written = []

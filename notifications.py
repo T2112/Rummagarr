@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-log = logging.getLogger("lidarr_slsk")
+log = logging.getLogger("rummagarr")
 
 
 def deliver(cfg, kind: str, title: str, body: str, *, client: httpx.Client | None = None) -> list[str]:

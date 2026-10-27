@@ -69,7 +69,7 @@ def make_config(tmp_path: Path) -> Config:
         complete_dir=complete,
         share_dir="",
         state_db=tmp_path / "state.sqlite3",
-        log_file=tmp_path / "lidarr-soulseek.log",
+        log_file=tmp_path / "rummagarr.log",
         search_wait_seconds=12,
         max_albums_per_cycle=5,
         max_tracks_per_cycle=5,
