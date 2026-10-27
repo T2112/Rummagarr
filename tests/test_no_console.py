@@ -91,7 +91,7 @@ def test_every_subprocess_goes_through_the_hidden_helper():
 
 
 def test_the_windowed_build_and_entry_points_hide_child_consoles():
-    spec = (ROOT / "packaging" / "lidarr_soulseek.spec").read_text(encoding="utf-8")
+    spec = (ROOT / "packaging" / "rummagarr.spec").read_text(encoding="utf-8")
     assert "console=False" in spec
     assert "console=True" not in spec
     for name in ("desktop_app.py", "main.py"):

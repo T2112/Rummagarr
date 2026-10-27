@@ -104,7 +104,7 @@ def test_a_timed_out_import_flags_the_artist_and_continues(tmp_path, caplog):
     folder.mkdir()
     (folder / "01.flac").write_bytes(b"flac")
     try:
-        with caplog.at_level(logging.ERROR, logger="lidarr_slsk"):
+        with caplog.at_level(logging.ERROR, logger="rummagarr"):
             worker.arm_auto_import("Adele")
             worker.arm_auto_import("Beyoncé")
             assert worker._import_thread is not None

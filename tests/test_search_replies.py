@@ -60,7 +60,7 @@ async def _wait_for_file(request, seconds: float = 3.0) -> list:
 
 
 def test_peer_reply_is_listed_for_manual_and_automatic_search(tmp_path, monkeypatch, caplog):
-    caplog.set_level("INFO", logger="lidarr_slsk")
+    caplog.set_level("INFO", logger="rummagarr")
 
     async def scenario():
         mock = MockSoulseek()
@@ -230,7 +230,7 @@ def test_share_query_does_not_block_our_search(tmp_path, monkeypatch):
 
 
 def test_search_receipt_separates_no_answer_from_filtered(caplog):
-    caplog.set_level("INFO", logger="lidarr_slsk")
+    caplog.set_level("INFO", logger="rummagarr")
     from tests.test_manual_search import Item, Result
     from worker import Worker
 

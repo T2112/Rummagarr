@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-log = logging.getLogger("lidarr_slsk.ui")
+log = logging.getLogger("rummagarr.ui")
 
 # The page used to show every recent row the status payload included, with no
 # size control and no hardcoded count. 10 is the default selection.

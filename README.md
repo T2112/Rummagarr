@@ -69,7 +69,7 @@ On a Windows machine, from this folder:
 powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 ```
 
-That installs the Python dependencies and PyInstaller, freezes `desktop_app.py`, and compiles `packaging\LidarrSoulseek.iss` with Inno Setup 6. If Inno Setup is not already installed, the script downloads it. The setup program is written to:
+That installs the Python dependencies and PyInstaller, freezes `desktop_app.py`, and compiles `packaging\Rummagarr.iss` with Inno Setup 6. If Inno Setup is not already installed, the script downloads it. The setup program is written to:
 
 ```text
 dist\Rummagarr-Setup-1.11.0.exe
@@ -361,7 +361,7 @@ In Lidarr:
 
 ## What working looks like
 
-Log file: `lidarr-soulseek.log`
+Log file: `rummagarr.log` (a config that still names `lidarr-soulseek.log` keeps writing that file)
 
 ```
 Lidarr OK
@@ -403,10 +403,10 @@ Use only one Soulseek client on this account while the worker runs.
 ## Daily commands
 
 ```powershell
-Get-Content .\lidarr-soulseek.log -Wait -Tail 30
-Get-ScheduledTask -TaskName LidarrSoulseekWorker
-Stop-ScheduledTask -TaskName LidarrSoulseekWorker
-Start-ScheduledTask -TaskName LidarrSoulseekWorker
+Get-Content .\rummagarr.log -Wait -Tail 30
+Get-ScheduledTask -TaskName RummagarrWorker
+Stop-ScheduledTask -TaskName RummagarrWorker
+Start-ScheduledTask -TaskName RummagarrWorker
 ```
 
 Uninstall the logon task:

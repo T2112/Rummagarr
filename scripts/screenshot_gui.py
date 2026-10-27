@@ -73,8 +73,8 @@ def _shoot(app, path: Path) -> None:
 def main() -> None:
     stay = "--stay" in sys.argv
     os.environ.setdefault("RUMMAGARR_UI_SCALE", "2")
-    out = Path(next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "/tmp/lidarr-soulseek-shots"))
-    data = Path("/tmp/lidarr-soulseek-shot-data")
+    out = Path(next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "/tmp/rummagarr-shots"))
+    data = Path("/tmp/rummagarr-shot-data")
     data.mkdir(parents=True, exist_ok=True)
     worker = make_worker(data)
     items = build_catalog(

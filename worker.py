@@ -104,7 +104,7 @@ from sharing import (
 )
 from state import JobStore
 
-log = logging.getLogger("lidarr_slsk")
+log = logging.getLogger("rummagarr")
 
 
 def safe_name(text: str) -> str:

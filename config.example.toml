@@ -38,7 +38,7 @@ complete_dir = "D:\\Media\\Incoming\\Soulseek"
 # Leave empty to share nothing. Sharing at least something is recommended.
 share_dir = ""
 state_db = "state.sqlite3"
-log_file = "lidarr-soulseek.log"
+log_file = "rummagarr.log"
 
 [search]
 search_wait_seconds = 12

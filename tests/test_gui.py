@@ -539,7 +539,7 @@ def test_wait_before_next_artist_is_visible_and_the_behavior_tab_scrolls(tmp_pat
 
 def test_wait_field_is_part_of_the_pyinstaller_script():
     root = Path(__file__).resolve().parents[1]
-    spec = (root / "packaging" / "lidarr_soulseek.spec").read_text(encoding="utf-8")
+    spec = (root / "packaging" / "rummagarr.spec").read_text(encoding="utf-8")
     assert "desktop_app.py" in spec
     source = (root / "desktop_app.py").read_text(encoding="utf-8")
     assert '"cycle_seconds"' in source
@@ -905,7 +905,7 @@ def test_download_all_wanted_without_a_selected_user(desktop, caplog):
         ],
     )
     desktop.update()
-    with caplog.at_level(logging.INFO, logger="lidarr_slsk.desktop"):
+    with caplog.at_level(logging.INFO, logger="rummagarr.desktop"):
         desktop.download_all_wanted()
         desktop.finish_bulk()
     summary = "2 wanted items matched from 2 users, and 0 wanted items not found."

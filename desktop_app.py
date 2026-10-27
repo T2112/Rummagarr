@@ -120,7 +120,7 @@ from wanted import (
 )
 from worker import Worker
 
-log = logging.getLogger("lidarr_slsk.desktop")
+log = logging.getLogger("rummagarr.desktop")
 
 DONE_TRANSFER = {"COMPLETE", "FAILED", "ABORTED"}
 # 200,000 pages × 250 albums. Enough for a multi-million wanted list.
@@ -155,6 +155,7 @@ def hold_single_instance() -> None:
     try:
         import ctypes
 
+        # Same name as the 1.9.4 installer mutex, so an upgrade closes this window.
         ctypes.windll.kernel32.CreateMutexW(None, False, "LidarrSoulseekMutex")
     except Exception:
         log.exception("Could not create the single-instance mutex")
@@ -3913,7 +3914,7 @@ class DesktopApp(tk.Tk):
             finally:
                 self._run_lock.release()
 
-        self._thread = threading.Thread(target=run, name="lidarr-soulseek", daemon=True)
+        self._thread = threading.Thread(target=run, name="rummagarr", daemon=True)
         self._thread.start()
         self.refresh_status()
 
@@ -6522,7 +6523,7 @@ class DesktopApp(tk.Tk):
 
         def work() -> None:
             try:
-                folder = Path(tempfile.mkdtemp(prefix="lidarr-soulseek-update-"))
+                folder = Path(tempfile.mkdtemp(prefix="rummagarr-update-"))
                 dest = folder / (status.asset_name or "Rummagarr-Setup.exe")
                 download_verified(status, dest, on_progress=on_progress)
             except Exception as exc:

@@ -318,7 +318,7 @@ def test_auto_import_failure_is_logged_and_shown(tmp_path, caplog):
     renamed: list[int] = []
     _wire(worker, scanned, renamed, scan_result=RuntimeError("lidarr down"))
     try:
-        with caplog.at_level(logging.ERROR, logger="lidarr_slsk"):
+        with caplog.at_level(logging.ERROR, logger="rummagarr"):
             worker.arm_auto_import("Adele")
             assert worker._import_thread is not None
             worker._import_thread.join(2)

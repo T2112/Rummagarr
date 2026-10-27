@@ -30,7 +30,7 @@ from urllib.parse import parse_qs, quote, urlparse
 
 from bridge_net import child_path
 
-log = logging.getLogger("lidarr_slsk")
+log = logging.getLogger("rummagarr")
 
 WEBAPI_VERSION = "2.11.2"
 APP_VERSION = "v4.6.0"
