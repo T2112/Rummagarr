@@ -34,7 +34,21 @@ def test_readme_is_written_for_someone_new():
     assert "More info" in text
     assert "Run anyway" in text
     assert "Unblock-File" in text
-    assert "https://github.com/T2112/rummagarr/issues" in text
+    assert "https://github.com/T2112/Rummagarr/issues" in text
+    assert "The public repository is [T2112/Rummagarr](https://github.com/T2112/Rummagarr)." in text
+    assert "T2112/lidarr-soulseek" not in text
+    assert "private repository" not in text.lower()
+    head, legal = text.split("## Legal", 1)
+    assert "Only download music you have the rights to" not in head
+    assert "This worker is provided as-is for personal use." in legal
+    assert "Key features" in text
+    assert "docs/showcase.md" in text
+    showcase = (ROOT / "docs" / "showcase.md").read_text(encoding="utf-8")
+    assert "https://github.com/T2112/Rummagarr" in showcase
+    assert "lidarr-soulseek" not in showcase
+    assert "public repository" in showcase.lower()
+    assert "LinkedIn" in showcase
+    assert "personal project" in showcase.lower()
     assert "Soulseek username" in text
     assert "API key" in text
     for name in ("docs/status.png", "docs/wanted.png", "docs/settings.png"):
