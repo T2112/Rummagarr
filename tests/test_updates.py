@@ -207,6 +207,38 @@ def test_update_check_tries_rummagarr_then_the_previous_repository():
     assert status.error == "GitHub rate limit reached. Try again in a little while."
 
 
+def test_the_update_client_follows_a_renamed_repository_redirect(monkeypatch):
+    """GitHub redirects a renamed repository. The checker follows that redirect."""
+    import updater
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        seen.append(url)
+        if "/T2112/rummagarr/" in url:
+            return httpx.Response(
+                301,
+                headers={"Location": "https://api.github.com/repos/T2112/lidarr-soulseek/releases/latest"},
+            )
+        return httpx.Response(200, json=_payload("v1.19.1"))
+
+    real_client = httpx.Client
+
+    def factory(*args, **kwargs):
+        assert kwargs.get("follow_redirects") is True
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(updater.httpx, "Client", factory)
+    status = check_for_update("1.19.0")
+    assert status.error is None
+    assert status.latest == "1.19.1"
+    assert any("/T2112/rummagarr/" in url for url in seen)
+    assert any("/T2112/lidarr-soulseek/" in url for url in seen)
+    assert status.page_url.startswith("https://github.com/T2112/lidarr-soulseek/releases/tag/")
+
+
 def test_check_reports_rate_limit_and_network_errors():
     def rate_limit(request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, json={"message": "API rate limit exceeded for 203.0.113.4."})

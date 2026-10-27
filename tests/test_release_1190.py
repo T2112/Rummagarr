@@ -35,8 +35,9 @@ def test_build_and_workflow_do_not_publish_the_old_installer_name():
     assert "LidarrSoulseek-Setup" not in readme
     assert "Rummagarr-Setup-*.exe" in workflow
     assert "Rummagarr-Setup-$version.exe" in script
-    assert "https://github.com/T2112/rummagarr" in readme
-    assert "T2112/lidarr-soulseek" not in readme
+    assert "https://github.com/T2112/lidarr-soulseek" in readme
+    assert "https://github.com/T2112/rummagarr" not in readme
+    assert "it will move to T2112/rummagarr" in readme
     assert "Lidarr Soulseek" not in readme
 
 
