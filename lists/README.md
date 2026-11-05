@@ -6,7 +6,7 @@ https://raw.githubusercontent.com/T2112/lidarr-soulseek/main/lists/lidarr-custom
 
 Curated popular / widely recorded artists across rock, pop, hip-hop, country, jazz, blues, metal, R&B/soul, electronic, folk, punk, indie, reggae, Latin, funk, classical, goth, emo, women artists, game soundtracks, electro-swing, and more.
 
-**Current status (2026-11-04):** **1058** unique MusicBrainz artist IDs. All names from artists.txt are covered via exact match, accent/variant, or known alias (e.g. Jackson 5 = The Jacksons, Debbie Harry = Deborah Harry, Mos Def = Yasiin Bey, Charlie Pride = Charley Pride, Damian Marley = Damian “Jr. Gong” Marley, Tchaikovsky = Пётр Ильич Чайковский, Go-Go's = The Go-Go’s / Go‐Go’s, Kitten & The Hip = Kitten and the Hip, D'Angelo = D’Angelo, etc.). 0 new IDs this run (39 exact-name variants queried; all acceptable matches already present; frequent MusicBrainz 503s with backoff).
+**Current status (2026-11-05):** **1058** unique MusicBrainz artist IDs. All names from artists.txt are covered via exact match, accent/variant, or known alias (e.g. Jackson 5 = The Jacksons, Debbie Harry = Deborah Harry, Mos Def = Yasiin Bey, Charlie Pride = Charley Pride, Damian Marley = Damian “Jr. Gong” Marley, Tchaikovsky = Пётр Ильич Чайковский, Go-Go's = The Go-Go’s / Go‐Go’s, Kitten & The Hip = Kitten and the Hip, D'Angelo = D’Angelo, etc.). 0 new IDs this run (39 exact-name variants queried; all acceptable matches already present; frequent MusicBrainz 503s with backoff).
 
 ## Festival list (Woodstock + Qlimax + Ozzfest)
 
