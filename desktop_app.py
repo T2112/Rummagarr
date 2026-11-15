@@ -828,6 +828,31 @@ BEHAVIOR_FIELDS: tuple[BehaviorField, ...] = (
         1,
         120,
     ),
+    BehaviorField(
+        "smarter_queue",
+        "Skip users who need a reply",
+        "bool",
+        "",
+        "When a user denies or stalls a download, or sends a private message that asks you to prove you are human, hold their queue and try another user. Rummagarr does not answer that message. Turn this off to leave the queue as it is.",
+    ),
+    BehaviorField(
+        "hold_minutes",
+        "Hold those users for",
+        "int",
+        "minutes",
+        "How long a held user stays out of the queue. After this, their albums and tracks are searched again. Release on Status does it sooner.",
+        1,
+        10080,
+    ),
+    BehaviorField(
+        "queue_stall_minutes",
+        "Queued with no progress",
+        "int",
+        "minutes",
+        "A download that stays queued this long, with no bytes moving, is treated as stalled. The next user is tried. This is shorter than the download timeout so one queue does not hold the batch.",
+        1,
+        240,
+    ),
 )
 
 _PRIMARY_BEHAVIOR = frozenset(
@@ -844,6 +869,9 @@ _PRIMARY_BEHAVIOR = frozenset(
         "import_mode",
         "import_interval_minutes",
         "import_timeout_minutes",
+        "smarter_queue",
+        "hold_minutes",
+        "queue_stall_minutes",
     }
 )
 
@@ -1440,6 +1468,37 @@ class SettingsForm(ttk.Frame):
         buttons.pack(anchor="w", pady=(8, 0))
         ttk.Button(buttons, text="Remove selected", command=self._remove_block).pack(side="left")
         ttk.Button(buttons, text="Clear blocklist", command=self._clear_blocklist).pack(side="left", padx=(8, 0))
+        ttk.Label(parent, text="Needs a reply", style="Title.TLabel").pack(anchor="w", pady=(16, 0))
+        ttk.Label(
+            parent,
+            text=(
+                "These users asked for a human check, or their uploads were refused or sat queued with no progress. "
+                "Rummagarr does not answer them. Their other files are tried from someone else. "
+                "Release tries this user's albums and tracks again. They also come back when the hold time ends."
+            ),
+            style="Muted.TLabel",
+            wraplength=860,
+        ).pack(anchor="w", pady=(4, 0))
+        hold_frame = ttk.Frame(parent)
+        hold_frame.pack(fill="both", expand=True, pady=(8, 0))
+        hold_columns = ("user", "reason", "message", "since", "until")
+        self.hold_tree = ttk.Treeview(hold_frame, columns=hold_columns, show="headings", height=6)
+        for key, heading, width in (
+            ("user", "User", 140),
+            ("reason", "Reason", 220),
+            ("message", "Message", 280),
+            ("since", "Since", 180),
+            ("until", "Until", 180),
+        ):
+            self.hold_tree.heading(key, text=heading)
+            self.hold_tree.column(key, width=width, anchor="w")
+        self.hold_tree.pack(side="left", fill="both", expand=True)
+        hold_scroll = ttk.Scrollbar(hold_frame, orient="vertical", command=self.hold_tree.yview)
+        hold_scroll.pack(side="right", fill="y")
+        self.hold_tree.configure(yscrollcommand=hold_scroll.set)
+        hold_buttons = ttk.Frame(parent)
+        hold_buttons.pack(anchor="w", pady=(8, 0))
+        ttk.Button(hold_buttons, text="Release selected", command=self._release_selected_hold).pack(side="left")
         self._fill_blocklist()
 
     def _fill_blocklist(self) -> None:
@@ -1454,6 +1513,38 @@ class SettingsForm(ttk.Frame):
                 iid=str(row["id"]),
                 values=(row["username"], row["folder"], row["reason"], row["created_at"]),
             )
+        self._fill_holds()
+
+    def _fill_holds(self) -> None:
+        tree = getattr(self, "hold_tree", None)
+        if tree is None or self.store is None:
+            return
+        tree.delete(*tree.get_children())
+        rows = self.store.held_users() if hasattr(self.store, "held_users") else []
+        for row in rows:
+            tree.insert(
+                "",
+                "end",
+                iid=str(row.get("username") or ""),
+                values=(
+                    row.get("display") or row.get("username") or "",
+                    row.get("detail") or row.get("reason") or "",
+                    row.get("message") or "",
+                    row.get("held_at") or "",
+                    row.get("until_at") or "",
+                ),
+            )
+
+    def _release_selected_hold(self) -> None:
+        tree = getattr(self, "hold_tree", None)
+        if tree is None:
+            return
+        for item in tree.selection():
+            if self.worker is not None and hasattr(self.worker, "release_held_user"):
+                self.worker.release_held_user(item)
+            elif self.store is not None and hasattr(self.store, "release_user"):
+                self.store.release_user(item)
+        self._fill_holds()
 
     def _remove_block(self) -> None:
         if self.store is None or not getattr(self, "block_tree", None):
@@ -4741,6 +4832,16 @@ class DesktopApp(tk.Tk):
                 text="Dismiss",
                 command=lambda event_id=event_id: self._dismiss_notice(event_id),
             ).pack(side="right")
+            if str(event.get("kind") or "") == "hold" and event.get("username"):
+                name = str(event["username"])
+                ttk.Button(
+                    row,
+                    text="Release",
+                    command=lambda name=name: self._release_held_user(name),
+                ).pack(side="right", padx=(0, 8))
+        form = getattr(self, "_settings_form", None)
+        if form is not None and hasattr(form, "_fill_holds"):
+            form._fill_holds()
 
     def _sync_favorite_prompt(self, events: list[dict]) -> None:
         """One prompt lists everyone waiting. A closed prompt stays closed until that list changes."""
@@ -4805,6 +4906,17 @@ class DesktopApp(tk.Tk):
     def _dismiss_notice(self, event_id: int) -> None:
         self.worker.store.dismiss_event(event_id)
         self.refresh_notices()
+
+    def _release_held_user(self, username: str) -> None:
+        """Let this user's albums and tracks be searched again. No chat message is sent."""
+        self.worker.release_held_user(username)
+        form = getattr(self, "_settings_form", None)
+        if form is not None and hasattr(form, "_fill_holds"):
+            form._fill_holds()
+        if hasattr(self, "status_line"):
+            self.refresh_status()
+        else:
+            self.refresh_notices()
 
     def add_suggested_favorite(self, username: str) -> None:
         """Priority users is the favorite list. Add is the only way in."""

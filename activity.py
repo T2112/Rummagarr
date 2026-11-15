@@ -180,6 +180,18 @@ def _downloads_are_running(snapshot: dict) -> bool:
     return activity.startswith("downloading")
 
 
+def hold_phrase(holds) -> str:
+    """Short status text for users who need a reply. Empty when nobody is held."""
+    rows = [item for item in holds or [] if isinstance(item, dict)]
+    if not rows:
+        return ""
+    name = str(rows[0].get("display") or rows[0].get("username") or "a user")
+    if len(rows) == 1:
+        return f"Holding {name} (needs reply)"
+    extra = len(rows) - 1
+    return f"Holding {name} and {extra} more (needs reply)"
+
+
 def format_status_line(snapshot: dict) -> str:
     labels = {"running": "Running", "paused": "Paused", "stopped": "Stopped"}
     state = labels.get(snapshot.get("run_state") or "stopped", "Stopped")
@@ -199,6 +211,9 @@ def format_status_line(snapshot: dict) -> str:
         if (snapshot.get("run_state") or "stopped") == "stopped" and activity == "Idle – nothing selected":
             activity = "Stopped"
     parts = [state, connected, activity]
+    held = hold_phrase(snapshot.get("holds"))
+    if held:
+        parts.append(held)
     elapsed = int(snapshot.get("elapsed") or 0)
     if elapsed > 0:
         parts.append(format_elapsed(elapsed))

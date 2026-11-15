@@ -7,7 +7,7 @@ Rummagarr is a Windows desktop app that fills Lidarr's missing albums and tracks
 [![License: personal use](https://img.shields.io/badge/license-personal%20use-blue)](LICENSE.txt)
 [![CI](https://img.shields.io/github/actions/workflow/status/T2112/Rummagarr/windows-installer.yml?branch=main&label=CI)](https://github.com/T2112/Rummagarr/actions/workflows/windows-installer.yml)
 
-**Version 1.19.1.** The public repository is [T2112/Rummagarr](https://github.com/T2112/Rummagarr).
+**Version 1.20.0.** The public repository is [T2112/Rummagarr](https://github.com/T2112/Rummagarr).
 
 [Sponsor Rummagarr](https://github.com/sponsors/T2112) · [Latest release](https://github.com/T2112/Rummagarr/releases/latest) · [Issues](https://github.com/T2112/Rummagarr/issues)
 
@@ -23,6 +23,7 @@ Rummagarr runs on Windows next to a Lidarr you already have. It searches Soulsee
 - Search, Browse, and Messages on the same Soulseek login as the worker.
 - Download all missing and long queues, with a progress count and Cancel.
 - Lidarr import after each album, after each artist, on a timer, or left manual. A slow import shows Waiting on Lidarr import (3/10 min), then the next artist continues. That row has Retry import and Skip.
+- A user who asks for a human check, or whose upload is refused or sits queued with no progress, is held. The file is tried from another user. Rummagarr does not answer the private message. Status shows the user and the message. Settings can turn this off.
 - Optional bridge: Lidarr searches a local Torznab indexer and grabs through a qBittorrent-compatible API. The standalone worker still runs with the bridge off.
 - Help → Check for updates installs a newer release. Sharing limits, favorite-user suggestions, and an optional local crash bundle are included.
 
@@ -128,6 +129,8 @@ This cannot be cross-compiled from Linux. PyInstaller builds for the OS it runs 
 `python main.py` still runs the worker without the window, for the original script install below.
 
 ## Recent changes
+
+Version 1.20.0 holds a Soulseek user who asks for a human check, or whose upload is refused or sits queued with no bytes. Their files are tried from another user. Rummagarr does not answer the message. Status shows who is held and what they wrote. Release, or the hold timer, searches their albums and tracks again. Settings → Behavior → Skip users who need a reply turns this off.
 
 Version 1.19.1 sets how often finished artists are imported: off (manual), after each album, after each artist, or on a timer. One slow Lidarr import no longer holds the worker. Status shows Waiting on Lidarr import (3/10 min), with Retry import and Skip.
 

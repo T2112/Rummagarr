@@ -86,6 +86,13 @@ from match import (
 from process_launch import run_hidden
 from search_order import album_sort_key, normalize_search_direction, normalize_search_order, order_wanted_items
 from run_summary import RunSummary
+from source_hold import (
+    HoldSignal,
+    TransferView,
+    batch_hold_signal,
+    looks_like_human_challenge,
+    repeated_failure_signal,
+)
 from sharing import (
     IDLE_FLOOR_SECONDS,
     Decision,
@@ -1738,6 +1745,7 @@ class Worker:
             "current_key": self.current_key or "",
             "run_summary": self.run_summary.line(),
             "run_summary_path": str(self._summary_path or ""),
+            "holds": self.store.held_users() if self._smarter_queue() else [],
         }
 
     def _mark_album(self, album_id: int, artist: str, title: str, signal: str) -> None:
@@ -1811,6 +1819,210 @@ class Worker:
     def _past_daily_cap(self, username: str) -> bool:
         cap = max(0, int(getattr(self.cfg, "browse_daily_files", 20) or 0))
         return daily_room(self.store.user_day_files(username), cap) <= 0
+
+    def _smarter_queue(self) -> bool:
+        return bool(getattr(self.cfg, "smarter_queue", True))
+
+    def _hold_minutes(self) -> int:
+        try:
+            value = int(getattr(self.cfg, "hold_minutes", 180) or 180)
+        except (TypeError, ValueError):
+            value = 180
+        return min(10080, max(1, value))
+
+    def _queue_stall_minutes(self) -> int:
+        try:
+            value = int(getattr(self.cfg, "queue_stall_minutes", 15) or 15)
+        except (TypeError, ValueError):
+            value = 15
+        return min(240, max(1, value))
+
+    def _clock(self) -> float:
+        clock = getattr(self, "_monotonic", None)
+        if clock is not None:
+            return float(clock())
+        return time.monotonic()
+
+    def _user_on_hold(self, username: str) -> bool:
+        if not self._smarter_queue():
+            return False
+        return self.store.user_is_held(username)
+
+    def _transfer_view(self, transfer, since: dict, now: float) -> TransferView:
+        state = state_name(transfer)
+        raw = getattr(transfer, "bytes_transfered", None)
+        if raw is None:
+            raw = getattr(transfer, "bytes_transferred", None)
+        try:
+            done = int(raw or 0)
+        except (TypeError, ValueError):
+            done = 0
+        ident = id(transfer)
+        queued_for = 0.0
+        if state in {"QUEUED", "VIRGIN", "INITIALIZING"} and done <= 0:
+            since.setdefault(ident, now)
+            queued_for = max(0.0, now - float(since[ident]))
+        else:
+            since.pop(ident, None)
+        return TransferView(
+            state=state,
+            fail_reason=getattr(transfer, "fail_reason", None),
+            abort_reason=getattr(transfer, "abort_reason", None),
+            bytes_done=done,
+            queued_seconds=queued_for,
+        )
+
+    def _watch_user(self, username: str, transfers, since: dict) -> HoldSignal | None:
+        """None when smarter queueing is off, so the download loop is unchanged."""
+        if not self._smarter_queue() or not (username or "").strip():
+            return None
+        now = self._clock()
+        views = [self._transfer_view(item, since, now) for item in transfers]
+        already = None
+        row = self.store.held_user(username)
+        if row is not None:
+            already = HoldSignal(str(row.get("reason") or "denied"), str(row.get("detail") or "Needs a reply"))
+        count = self.store.recent_user_failures(username, self._hold_minutes())
+        return batch_hold_signal(
+            views,
+            stall_minutes=self._queue_stall_minutes(),
+            failure_count=count,
+            already=already,
+        )
+
+    def _apply_hold(
+        self,
+        username: str,
+        signal: HoldSignal,
+        *,
+        message: str = "",
+        item: dict | None = None,
+    ) -> None:
+        """Record the hold and the notice. Does not send a private message."""
+        if not self._smarter_queue():
+            return
+        display = (username or "").strip()
+        if not display or signal is None:
+            return
+        self.store.hold_user(
+            display,
+            signal.reason,
+            signal.detail,
+            message,
+            minutes=self._hold_minutes(),
+        )
+        if item:
+            self.store.add_held_item(
+                display,
+                kind=str(item.get("kind") or "album"),
+                album_id=item.get("album_id"),
+                track_id=item.get("track_id"),
+                artist=str(item.get("artist") or ""),
+                title=str(item.get("title") or ""),
+                filename=str(item.get("filename") or ""),
+                remote_dir=str(item.get("remote_dir") or ""),
+            )
+        body = signal.detail
+        stored = self.store.held_user(display)
+        text = (message or (stored or {}).get("message") or "").strip()
+        if text:
+            body = f"{signal.detail} They wrote: {text}"
+        self.store.set_hold_notice(display, f"{display} needs a reply", body)
+        log.info("Holding %s (%s). No reply will be sent.", display, signal.detail)
+
+    def _note_attempt_failure(self, username: str) -> int:
+        if not self._smarter_queue():
+            return 0
+        return self.store.note_user_failure(username, window_minutes=self._hold_minutes())
+
+    def release_held_user(self, username: str) -> list[dict]:
+        """Thomas released this user. Their unfinished albums and tracks can be searched again."""
+        items = self.store.release_user(username)
+        self._resume_held_items(items)
+        self.store.dismiss_user_events(username, "hold")
+        return items
+
+    def release_expired_holds(self) -> int:
+        if not self._smarter_queue():
+            return 0
+        batches = self.store.release_expired()
+        for username, items in batches:
+            self._resume_held_items(items)
+            self.store.dismiss_user_events(username, "hold")
+        return len(batches)
+
+    def _resume_held_items(self, items: list[dict]) -> None:
+        for item in items:
+            if str(item.get("status") or "") == "replaced":
+                continue
+            kind = str(item.get("kind") or "")
+            if kind == "album" and item.get("album_id") is not None:
+                job = self.store.get(int(item["album_id"]))
+                if job and job.get("status") in {"failed", "no_match", "downloading"}:
+                    self.store.upsert(
+                        int(item["album_id"]),
+                        str(job.get("artist") or item.get("artist") or ""),
+                        str(job.get("title") or item.get("title") or ""),
+                        "not_sent",
+                        "released hold",
+                    )
+            elif kind == "track" and item.get("track_id") is not None:
+                job = self.store.get_track(int(item["track_id"]))
+                if job and job.get("status") in {"failed", "no_match", "downloading"}:
+                    self.store.upsert_track(
+                        int(item["track_id"]),
+                        int(job.get("album_id") or item.get("album_id") or 0),
+                        str(job.get("artist") or item.get("artist") or ""),
+                        str(job.get("title") or item.get("title") or ""),
+                        "not_sent",
+                        "released hold",
+                    )
+
+    async def _abort_open(self, transfers) -> None:
+        if self.client is None:
+            return
+        for transfer in list(transfers or []):
+            if state_name(transfer) in {"COMPLETE", "FAILED", "ABORTED"}:
+                continue
+            await abort_transfer(self.client, transfer)
+
+    def _drop_held_specs(self, specs: list[dict]) -> list[dict]:
+        """Leave specs unchanged when smarter queueing is off."""
+        if not self._smarter_queue():
+            return specs
+        kept = []
+        for spec in specs:
+            name = str(spec.get("username") or "")
+            if name and self.store.user_is_held(name):
+                log.info("Skip %s from %s: that user needs a reply", spec.get("filename") or "file", name)
+                continue
+            kept.append(spec)
+        return kept
+
+    async def _release_held_batch(self, paired, since: dict, settled: set[int]) -> None:
+        """Abort one user's open files when they are blocking us. Other users keep going."""
+        if not self._smarter_queue():
+            return
+        by_user: dict[str, list] = {}
+        for row in paired:
+            transfer = row[1]
+            user = transfer_username(transfer) or str(getattr(transfer, "username", "") or "")
+            by_user.setdefault(user, []).append(transfer)
+        for user, transfers in by_user.items():
+            if not user:
+                continue
+            signal = self._watch_user(user, transfers, since)
+            if signal is None:
+                continue
+            self._apply_hold(
+                user,
+                signal,
+                item={"kind": "file", "filename": transfer_filename(transfers[0])},
+            )
+            await self._abort_open(transfers)
+            for transfer in transfers:
+                if state_name(transfer) != "COMPLETE":
+                    settled.add(id(transfer))
 
     async def cancel_downloads(self, all_items: bool = False, index: int | None = None) -> None:
         self.cancel_requested = True
@@ -1935,6 +2147,8 @@ class Worker:
         body = str(getattr(message, "message", "") or "")
         chat_id = getattr(message, "id", None)
         self.store.add_private_message(user, body, "in", soulseek_id=chat_id, seen=0)
+        if self._smarter_queue() and looks_like_human_challenge(body):
+            self._apply_hold(user, HoldSignal("challenge", "Asked for a human check"), message=body)
 
     async def send_private_message(self, username: str, body: str) -> str:
         """Send one private message. Rooms are not used."""
@@ -2766,6 +2980,8 @@ class Worker:
     async def cycle(self) -> None:
         if self.control.is_stopped():
             return
+        if self._smarter_queue():
+            self.release_expired_holds()
         self._cycle_attempted_search = False
         self._cycle_unsent_search = False
         self._pass_note = ""
@@ -3037,14 +3253,31 @@ class Worker:
         queries = build_track_queries(artist, album_title, title, aliases_from_album(album))
         log.info("Track search: %s", " | ".join(queries))
 
+        researched = False
+        while True:
+            outcome = await self._search_and_grab_track(
+                hole, key, track, album, track_id, album_id, artist, album_title, title, year, queries
+            )
+            if outcome == "research" and self._smarter_queue() and not researched:
+                researched = True
+                log.info("Searching again for %s – %s after holding a user", artist, title)
+                continue
+            return outcome == "ok"
+
+    async def _search_and_grab_track(
+        self, hole, key, track, album, track_id, album_id, artist, album_title, title, year, queries
+    ) -> str:
+        """Search once and download the best file. ``research`` asks for one more search."""
         best_item = None
         best_user = ""
         best_score = 0.0
+        held_seen = ""
+        options: list[tuple[float, str, object]] = []
         for index, query in enumerate(queries, start=1):
             signal = await self.control.gate(key)
             if signal != "ok":
                 self._mark_track(hole, signal)
-                return False
+                return "halt"
             self.set_step(
                 Step(
                     kind="searching",
@@ -3059,7 +3292,7 @@ class Worker:
                 request = await self._send_search(query)
             except SearchNotSent:
                 self.store.upsert_track(track_id, album_id, artist, title, "not_sent", "search was not sent")
-                return False
+                return "halt"
             signal = await self._await_results(
                 request, key, self.cfg.search_wait_seconds, artist, album_title, index, len(queries)
             )
@@ -3070,7 +3303,7 @@ class Worker:
                 except Exception:
                     pass
                 self._mark_track(hole, signal)
-                return False
+                return "halt"
             self.set_step(
                 Step(
                     kind="matching",
@@ -3085,6 +3318,9 @@ class Worker:
             for result in request.results:
                 username = getattr(result, "username", "") or ""
                 if username.lower() in self.cfg.ignored_users:
+                    continue
+                if self._user_on_hold(username):
+                    held_seen = held_seen or username
                     continue
                 for item in list(getattr(result, "shared_items", None) or []):
                     score, reason = score_track_item(
@@ -3101,6 +3337,8 @@ class Worker:
                     )
                     if reason != "ok":
                         continue
+                    if self._smarter_queue():
+                        options.append((score, username, item))
                     if score > best_score:
                         best_score = score
                         best_item = item
@@ -3113,34 +3351,96 @@ class Worker:
                 break
 
         if best_item is None:
+            if held_seen:
+                if held_seen:
+                    self.store.add_held_item(
+                        held_seen,
+                        kind="track",
+                        album_id=album_id,
+                        track_id=track_id,
+                        artist=artist,
+                        title=title,
+                    )
+                self.store.upsert_track(track_id, album_id, artist, title, "failed", "needs a reply")
+                return "research"
             self.store.upsert_track(track_id, album_id, artist, title, "no_match", "no file passed filters")
-            return False
+            return "again"
 
-        log.info(
-            "Picked track %s from %s :: %s (score %.1f)",
-            title,
-            best_user,
-            getattr(best_item, "filename", ""),
-            best_score,
-        )
+        choices = [(best_score, best_user, best_item)]
+        if self._smarter_queue() and options:
+            seen: set[str] = set()
+            choices = []
+            for score, username, item in sorted(options, key=lambda row: row[0], reverse=True):
+                folded = username.casefold()
+                if folded in seen or self._user_on_hold(username):
+                    continue
+                seen.add(folded)
+                choices.append((score, username, item))
+            if not choices:
+                self.store.upsert_track(track_id, album_id, artist, title, "failed", "needs a reply")
+                return "research"
+
+        for score, username, item in choices:
+            log.info(
+                "Picked track %s from %s :: %s (score %.1f)",
+                title,
+                username,
+                getattr(item, "filename", ""),
+                score,
+            )
+            outcome = await self._grab_track(
+                hole, key, track, album, track_id, album_id, artist, album_title, title, year, username, item
+            )
+            if outcome == "ok":
+                self.store.mark_held_replaced(track_id=track_id)
+                return "ok"
+            if outcome == "halt":
+                return "halt"
+            if outcome == "hold":
+                continue
+            return "again"
+        self.store.upsert_track(track_id, album_id, artist, title, "failed", "needs a reply")
+        return "research"
+
+    async def _grab_track(
+        self, hole, key, track, album, track_id, album_id, artist, album_title, title, year, best_user, best_item
+    ) -> str:
         self.store.upsert_track(track_id, album_id, artist, title, "downloading", best_user)
         if self.cfg.dry_run:
             detail = f"dry run: would grab 1 file(s) from {best_user}"
             self.store.upsert_track(track_id, album_id, artist, title, "skipped", detail)
             self.store.note_dry_run(f"{artist} – {title}: {detail}")
             log.info(detail)
-            return False
+            return "again"
         self.cancel_requested = False
         self.set_step(Step(kind="queued", artist=artist, album=album_title, title=title, file_total=1, username=best_user))
         signal = await self.control.gate(key)
         if signal != "ok":
             self._mark_track(hole, signal)
-            return False
+            return "halt"
         transfer = await self.client.transfers.download(best_user, best_item.filename)
         self.active_transfers = [transfer]
         self._visit_had_download = True
         deadline = [asyncio.get_running_loop().time() + min(self.cfg.download_timeout_minutes, 30) * 60]
+        since: dict[int, float] = {}
+        hold_item = {
+            "kind": "track",
+            "album_id": album_id,
+            "track_id": track_id,
+            "artist": artist,
+            "title": title,
+            "filename": str(getattr(best_item, "filename", "") or ""),
+        }
         while asyncio.get_running_loop().time() < deadline[0]:
+            watched = self._watch_user(best_user, [transfer], since)
+            if watched is not None:
+                self._apply_hold(best_user, watched, item=hold_item)
+                if state_name(transfer) != "COMPLETE":
+                    await self._abort_open([transfer])
+                    self.discard_failed_downloads([transfer])
+                    self.active_transfers = []
+                    self.cancel_requested = False
+                    return "hold"
             name = state_name(transfer)
             if name in {"COMPLETE", "FAILED", "ABORTED"}:
                 break
@@ -3164,7 +3464,7 @@ class Worker:
             if signal != "ok":
                 await self._abandon_transfers([transfer])
                 self._mark_track(hole, signal)
-                return False
+                return "halt"
 
         self.remember_completed([transfer], artist, title, "track")
         self.active_transfers = []
@@ -3174,28 +3474,34 @@ class Worker:
             self.store.upsert_track(track_id, album_id, artist, title, "failed", detail)
             self.discard_failed_downloads([transfer])
             self.cancel_requested = False
-            return False
+            if self._smarter_queue() and detail != "cancelled":
+                count = self._note_attempt_failure(best_user)
+                repeated = repeated_failure_signal(count)
+                if repeated is not None:
+                    self._apply_hold(best_user, repeated, item=hold_item)
+                    return "hold"
+            return "again"
         self.cancel_requested = False
 
         folder, sources = stage_album_folder(self.cfg, artist, album_title, year, [transfer])
         audio_count = sum(1 for p in folder.iterdir() if p.suffix.lower() in AUDIO_EXT)
         if audio_count == 0:
             self.store.upsert_track(track_id, album_id, artist, title, "failed", "no file staged")
-            return False
+            return "again"
 
         ready, reason = self._prepare_staged_folder(folder, album, [track])
         if not ready:
             self.store.block_source(best_user, "", reason)
             self.store.upsert_track(track_id, album_id, artist, title, "failed", reason)
             self._summary_failed(f"{artist} – {title}", reason)
-            return False
+            return "again"
         if self.cfg.delete_sources_after_import:
             cleanup_sources(sources, self.cfg.download_dir)
         self._summary_grabbed(f"{artist} – {title}")
         self._schedule_folder_import(artist, folder, visit=True)
         self.store.upsert_track(track_id, album_id, artist, title, "staged", str(folder))
         log.info("Staged missing track %s into %s", title, folder)
-        return True
+        return "ok"
 
     def _load_quality_profiles(self) -> dict[int, dict]:
         if self._quality_profiles is not None:
@@ -3226,6 +3532,8 @@ class Worker:
             if (folder.username or "").lower() in rejected:
                 continue
             if self.store.source_blocked(folder.username, folder.remote_dir):
+                continue
+            if self._user_on_hold(folder.username):
                 continue
             scored = score_folder(
                 folder,
@@ -3304,14 +3612,40 @@ class Worker:
         queries = build_queries(artist, title, year, aliases_from_album(album))
         log.info("Searching: %s", " | ".join(queries))
 
+        counted = [False]
+
+        async def search_again():
+            return await self._search_album_candidates(
+                key, album_id, artist, title, titles, durations, gate, rejected, queries, counted
+            )
+
+        first = await search_again()
+        if first is None:
+            return False
+        return await self._download_album_with_research(
+            first,
+            search_again,
+            album,
+            key,
+            album_id,
+            artist,
+            title,
+            year,
+            needed_tracks,
+            rejected,
+        )
+
+    async def _search_album_candidates(
+        self, key, album_id, artist, title, titles, durations, gate, rejected, queries, counted: list
+    ):
+        """One Soulseek pass. None means the pass was stopped. A second pass does not recount the album cap."""
         best = None
         ranked = []
-        counted = False
         for index, query in enumerate(queries, start=1):
             signal = await self.control.gate(key)
             if signal != "ok":
                 self._mark_album(album_id, artist, title, signal)
-                return False
+                return None
             self.set_step(
                 Step(kind="searching", artist=artist, album=title, query_index=index, query_total=len(queries))
             )
@@ -3319,10 +3653,10 @@ class Worker:
                 request = await self._send_search(query)
             except SearchNotSent:
                 self.store.upsert(album_id, artist, title, "not_sent", "search was not sent")
-                return False
-            if not counted:
+                return None
+            if not counted[0]:
                 self._claim_album_search()
-                counted = True
+                counted[0] = True
             signal = await self._await_results(
                 request,
                 key,
@@ -3341,7 +3675,7 @@ class Worker:
                 except Exception:
                     pass
                 self._mark_album(album_id, artist, title, signal)
-                return False
+                return None
             self.set_step(
                 Step(
                     kind="matching",
@@ -3362,14 +3696,32 @@ class Worker:
                 pass
             if best and best.score >= 20:
                 break
+        return ranked or ([best] if best is not None else [])
 
-        candidates = ranked or ([best] if best is not None else [])
+    async def _download_album_with_research(
+        self, candidates, search_again, album, key, album_id, artist, title, year, needed_tracks, rejected
+    ) -> bool:
+        """Download, and when a user is held search once more for someone else."""
+        needs = [False]
+        ok = await self._download_candidates(
+            candidates, album, key, album_id, artist, title, year, needed_tracks, rejected, needs
+        )
+        if ok or not self._smarter_queue() or not needs[0]:
+            return ok
+        log.info("Searching again for %s – %s after holding a user", artist, title)
+        fresh = await search_again()
+        if fresh is None:
+            return False
         return await self._download_candidates(
-            candidates, album, key, album_id, artist, title, year, needed_tracks, rejected
+            fresh, album, key, album_id, artist, title, year, needed_tracks, rejected, [False]
         )
 
-    async def _download_candidates(self, candidates, album, key, album_id, artist, title, year, needed_tracks, rejected) -> bool:
+    async def _download_candidates(
+        self, candidates, album, key, album_id, artist, title, year, needed_tracks, rejected, needs: list | None = None
+    ) -> bool:
         """Download the best folder, then the next user when that download fails."""
+        if self._smarter_queue():
+            self.release_expired_holds()
         if not candidates:
             self.store.upsert(album_id, artist, title, "no_match", "no folder passed filters")
             self._summary_failed(f"{artist} – {title}", "no folder passed filters")
@@ -3377,6 +3729,7 @@ class Worker:
         tried: set[tuple[str, str]] = set()
         last = "no folder passed filters"
         capped_name = ""
+        held_name = ""
         for _attempt in range(max(1, _DOWNLOAD_ATTEMPTS)):
             best = None
             for item in sorted(candidates, key=lambda row: row.score, reverse=True):
@@ -3384,22 +3737,37 @@ class Worker:
                 pair = (user, item.remote_dir or "")
                 if user in rejected or pair in tried or self.store.source_blocked(item.username, item.remote_dir):
                     continue
+                if self._smarter_queue() and user in self.cfg.ignored_users:
+                    continue
                 if self._past_daily_cap(item.username):
                     capped_name = item.username or user
+                    continue
+                if self._user_on_hold(item.username):
+                    held_name = item.username or user
+                    if needs is not None:
+                        needs[0] = True
                     continue
                 best = item
                 break
             if best is None:
-                if capped_name and not tried:
+                if capped_name and not tried and not held_name:
                     last = f"The daily cap for {capped_name} is already used."
                     self.store.add_event("daily", f"Daily cap for {capped_name}", last, capped_name)
+                elif held_name and not tried:
+                    last = f"{held_name} needs a reply"
                 break
             tried.add(((best.username or "").lower(), best.remote_dir or ""))
             outcome, last = await self._download_one(best, album, key, album_id, artist, title, year, needed_tracks)
             if outcome == "ok":
+                self.store.mark_held_replaced(album_id=album_id)
                 return True
             if outcome == "halt":
                 return False
+            if outcome == "hold":
+                if needs is not None:
+                    needs[0] = True
+                log.info("Holding %s and trying another user for %s – %s", best.username, artist, title)
+                continue
             self.store.block_source(best.username, best.remote_dir, last)
             self.store.reject_usernames({best.username}, album_id=album_id, artist=artist)
             rejected.add((best.username or "").lower())
@@ -3477,7 +3845,27 @@ class Worker:
                     sources.append(src)
 
         deadline = [asyncio.get_running_loop().time() + self.cfg.download_timeout_minutes * 60]
+        since: dict[int, float] = {}
+        needed_now = max(1, len(best.files) - self.cfg.track_count_tolerance)
+        hold_item = {
+            "kind": "album",
+            "album_id": album_id,
+            "artist": artist,
+            "title": title,
+            "remote_dir": getattr(best, "remote_dir", "") or "",
+        }
         while asyncio.get_running_loop().time() < deadline[0]:
+            watched = self._watch_user(best.username, transfers, since)
+            if watched is not None:
+                complete_now = sum(1 for item in transfers if state_name(item) == "COMPLETE")
+                self._apply_hold(best.username, watched, item=hold_item)
+                if complete_now < needed_now:
+                    await self._abort_open(transfers)
+                    self.discard_failed_downloads([item for item in transfers if state_name(item) != "COMPLETE"])
+                    self.active_transfers = []
+                    self.cancel_requested = False
+                    return "hold", watched.detail
+                await self._abort_open(transfers)
             names = [state_name(t) for t in transfers]
             await stage_finished()
             done = all(n in {"COMPLETE", "FAILED", "ABORTED"} for n in names)
@@ -3521,6 +3909,12 @@ class Worker:
                 leftovers = transfers
             self.discard_failed_downloads(leftovers)
             self.cancel_requested = False
+            if self._smarter_queue() and detail != "cancelled":
+                count = self._note_attempt_failure(best.username)
+                repeated = repeated_failure_signal(count)
+                if repeated is not None:
+                    self._apply_hold(best.username, repeated, item=hold_item)
+                    return "hold", repeated.detail
             return "again", detail
         self.cancel_requested = False
 
@@ -3562,6 +3956,8 @@ class Worker:
             if (folder.username or "").lower() in rejected:
                 continue
             if self.store.source_blocked(folder.username, folder.remote_dir):
+                continue
+            if self._user_on_hold(folder.username):
                 continue
             scored = score_folder(
                 folder,
@@ -4119,7 +4515,7 @@ class Worker:
                 self._set_manual_state(str(spec.get("id") or ""), "skipped")
             queued(0)
             return detail
-        specs = self._skip_queued_specs(specs, link)
+        specs = self._drop_held_specs(self._skip_queued_specs(specs, link))
         if not specs:
             log.info("Nothing new to queue; those files are already queued or in the download folder")
             queued(0)
@@ -4165,9 +4561,14 @@ class Worker:
                 )
             )
         deadline = time.monotonic() + max(30, int(self.cfg.download_timeout_minutes or 1) * 60)
+        since: dict[int, float] = {}
+        settled: set[int] = set()
         while time.monotonic() < deadline:
+            await self._release_held_batch(paired, since, settled)
             names = [state_name(item) for _, item, _link in paired]
-            if names and all(name in {"COMPLETE", "FAILED", "ABORTED"} for name in names):
+            if names and all(
+                name in {"COMPLETE", "FAILED", "ABORTED"} or id(item) in settled for (_, item, _link), name in zip(paired, names)
+            ):
                 break
             if self.control.is_stopped():
                 for _, transfer, _link in paired:
@@ -4317,6 +4718,10 @@ class Worker:
             self.store.set_meta("last_browse_download", detail)
             log.info(detail)
             return detail
+        if self._smarter_queue() and self.store.user_is_held(username):
+            detail = f"{username} needs a reply. Nothing was queued."
+            self.store.set_meta("last_browse_download", detail)
+            return detail
         self._paced_busy = True
         try:
             specs = self._skip_queued_specs(specs, None)
@@ -4359,9 +4764,18 @@ class Worker:
                     if on_progress is not None:
                         on_progress(started_count, total)
                 deadline = time.monotonic() + per_file
+                since: dict[int, float] = {}
+                settled: set[int] = set()
+                held_batch = False
                 while time.monotonic() < deadline:
+                    await self._release_held_batch(started, since, settled)
+                    if settled:
+                        held_batch = True
                     names = [state_name(item) for _, item, _link in started]
-                    if names and all(name in {"COMPLETE", "FAILED", "ABORTED"} for name in names):
+                    if names and all(
+                        name in {"COMPLETE", "FAILED", "ABORTED"} or id(item) in settled
+                        for (_, item, _link), name in zip(started, names)
+                    ):
                         break
                     if self.control.is_stopped():
                         for _, transfer, _link in started:
@@ -4372,7 +4786,7 @@ class Worker:
                         break
                     await asyncio.sleep(0.05)
                 paired.extend(started)
-                if self.control.is_stopped() or (should_cancel is not None and should_cancel()):
+                if held_batch or self.control.is_stopped() or (should_cancel is not None and should_cancel()):
                     break
                 if start + width < len(specs) and pause and not self.control.is_stopped():
                     remaining = pause

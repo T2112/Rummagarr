@@ -123,6 +123,9 @@ class Config:
     browse_daily_files: int = 20
     crash_bundle: bool = False
     suggest_favorites: bool = True
+    smarter_queue: bool = True
+    hold_minutes: int = 180
+    queue_stall_minutes: int = 15
 
 
 def normalize_theme(value) -> str:
@@ -373,6 +376,9 @@ def default_config(**overrides) -> Config:
         browse_daily_files=max(1, int(overrides.pop("browse_daily_files", 20) or 20)),
         crash_bundle=bool(overrides.pop("crash_bundle", False)),
         suggest_favorites=bool(overrides.pop("suggest_favorites", True)),
+        smarter_queue=bool(overrides.pop("smarter_queue", True)),
+        hold_minutes=_bounded_minutes(overrides.pop("hold_minutes", 180), 180, 1, 10080),
+        queue_stall_minutes=_bounded_minutes(overrides.pop("queue_stall_minutes", 15), 15, 1, 240),
     )
     if overrides:
         cfg = replace(cfg, **overrides)
@@ -551,6 +557,9 @@ def save_config(path: Path, cfg: Config) -> None:
             f"max_tracks_per_cycle = {int(cfg.max_tracks_per_cycle)}",
             f"cycle_seconds = {int(cfg.cycle_seconds)}",
             f"retry_hours = {int(cfg.retry_hours)}",
+            f"smarter_queue = {_toml_bool(bool(cfg.smarter_queue))}",
+            f"hold_minutes = {_bounded_minutes(cfg.hold_minutes, 180, 1, 10080)}",
+            f"queue_stall_minutes = {_bounded_minutes(cfg.queue_stall_minutes, 15, 1, 240)}",
             f"min_filename_ratio = {cfg.min_filename_ratio}",
             f"track_count_tolerance = {int(cfg.track_count_tolerance)}",
             f"preferred_extensions = [{extensions}]",
@@ -800,4 +809,7 @@ def try_load_config(path: Path) -> Config:
         browse_daily_files=max(1, int(limits.get("browse_daily_files", 20) or 20)),
         crash_bundle=bool(ui.get("crash_bundle", False)),
         suggest_favorites=bool(ui.get("suggest_favorites", True)),
+        smarter_queue=bool(search.get("smarter_queue", True)),
+        hold_minutes=_bounded_minutes(search.get("hold_minutes", 180), 180, 1, 10080),
+        queue_stall_minutes=_bounded_minutes(search.get("queue_stall_minutes", 15), 15, 1, 240),
     )
