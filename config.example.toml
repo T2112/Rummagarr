@@ -68,6 +68,14 @@ fill_missing_tracks = true
 max_tracks_per_cycle = 5
 cycle_seconds = 300
 retry_hours = 12
+# When a user asks you to prove you are human, or their upload is refused or
+# sits queued with no progress, hold that user and try another source.
+# Rummagarr does not answer the private message. false leaves the queue as it is.
+smarter_queue = true
+# How long a held user stays out of the queue, in minutes. 180 is 3 hours.
+hold_minutes = 180
+# A download that stays queued this long, with no bytes, is treated as stalled.
+queue_stall_minutes = 15
 min_filename_ratio = 0.5
 track_count_tolerance = 2
 # Tried in order. MP3 folders win when both exist; FLAC/WAV are allowed as fallback.

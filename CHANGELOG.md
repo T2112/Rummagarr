@@ -12,6 +12,12 @@ All notable changes to this project are documented here.
 - The installer id and the program mutex are unchanged, so this setup replaces the existing install instead of sitting beside it, and a running copy still closes for the upgrade.
 - Releases keep publishing `Rummagarr-Setup-<version>.exe` only. An installed 1.10.0 through 1.12.x looks for that file first, so it can update. A 1.9.4 or earlier install looks only for `LidarrSoulseek-Setup-<version>.exe`, which 1.19.0 stopped publishing. That install needs one manual download of the current setup.
 
+## [1.20.0] — 2026-11-15
+
+### Added
+
+- Settings → Behavior → Skip users who need a reply is on until turned off. When a Soulseek user asks Thomas to prove he is human, or refuses a transfer, or leaves it queued with no bytes, Rummagarr holds that user and tries the file from another user. It does not send a chat reply. Status marks that user needs a reply and shows the message they sent. Release, or the hold timer, puts their albums and tracks back in the queue. Hold those users for and Queued with no progress set the timer and how long a silent queue waits. The ban list, blocklist, daily cap, and per-user wait are unchanged. Turning the option off leaves downloads as they were.
+
 ## [1.19.1] — 2026-10-18
 
 ### Added

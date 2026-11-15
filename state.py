@@ -181,6 +181,49 @@ class JobStore:
             """
         )
         self._db.commit()
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS held_users (
+                username TEXT PRIMARY KEY,
+                display TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                message TEXT NOT NULL DEFAULT '',
+                held_at TEXT NOT NULL,
+                until_at TEXT NOT NULL
+            )
+            """
+        )
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS held_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                album_id INTEGER,
+                track_id INTEGER,
+                artist TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                filename TEXT NOT NULL DEFAULT '',
+                remote_dir TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                held_at TEXT NOT NULL
+            )
+            """
+        )
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_failures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_failures_name ON user_failures(username, created_at)"
+        )
+        self._db.commit()
         self._ensure_catalog_schema()
         self._load_catalog_flag()
 
@@ -2155,6 +2198,304 @@ class JobStore:
             self._db.execute("DELETE FROM blocklist")
             self._db.commit()
 
+    def hold_user(
+        self,
+        username: str,
+        reason: str,
+        detail: str,
+        message: str = "",
+        *,
+        minutes: int,
+        now: datetime | None = None,
+    ) -> dict | None:
+        """Mark a user blocked/needs reply until ``minutes`` from now.
+
+        A second hold keeps the original time and refreshes the deadline.
+        An empty message leaves a message that was already stored.
+        """
+        display = (username or "").strip()
+        key = display.casefold()
+        if not key:
+            return None
+        moment = now or datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        until = moment + timedelta(minutes=max(1, int(minutes or 1)))
+        with self._lock:
+            row = self._db.execute(
+                "SELECT held_at, message FROM held_users WHERE username = ?",
+                (key,),
+            ).fetchone()
+            kept_message = (message or "").strip()
+            if row is not None:
+                held_at = str(row[0])
+                if not kept_message:
+                    kept_message = str(row[1] or "")
+            else:
+                held_at = moment.isoformat()
+            self._db.execute(
+                """
+                INSERT INTO held_users(username, display, reason, detail, message, held_at, until_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(username) DO UPDATE SET
+                    display = excluded.display,
+                    reason = excluded.reason,
+                    detail = excluded.detail,
+                    message = excluded.message,
+                    until_at = excluded.until_at
+                """,
+                (key, display, reason or "denied", detail or reason or "needs a reply", kept_message, held_at, until.isoformat()),
+            )
+            self._db.commit()
+        return self.held_user(display, now=moment)
+
+    def held_user(self, username: str, *, now: datetime | None = None) -> dict | None:
+        key = (username or "").strip().casefold()
+        if not key:
+            return None
+        moment = now or datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        with self._lock:
+            row = self._db.execute(
+                """
+                SELECT username, display, reason, detail, message, held_at, until_at
+                FROM held_users WHERE username = ?
+                """,
+                (key,),
+            ).fetchone()
+        if row is None:
+            return None
+        record = _held_record(row)
+        until = _cooldown_stamp(record["until_at"])
+        if until is None or until <= moment:
+            return None
+        return record
+
+    def user_is_held(self, username: str, *, now: datetime | None = None) -> bool:
+        return self.held_user(username, now=now) is not None
+
+    def held_users(self, *, now: datetime | None = None) -> list[dict]:
+        moment = now or datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT username, display, reason, detail, message, held_at, until_at
+                FROM held_users
+                ORDER BY held_at, username
+                """
+            ).fetchall()
+        active = []
+        for row in rows:
+            record = _held_record(row)
+            until = _cooldown_stamp(record["until_at"])
+            if until is not None and until > moment:
+                active.append(record)
+        return active
+
+    def add_held_item(
+        self,
+        username: str,
+        *,
+        kind: str,
+        album_id: int | None = None,
+        track_id: int | None = None,
+        artist: str = "",
+        title: str = "",
+        filename: str = "",
+        remote_dir: str = "",
+        now: datetime | None = None,
+    ) -> None:
+        key = (username or "").strip().casefold()
+        if not key:
+            return
+        moment = now or datetime.now(timezone.utc)
+        album = int(album_id) if album_id is not None else None
+        track = int(track_id) if track_id is not None else None
+        with self._lock:
+            existing = self._db.execute(
+                """
+                SELECT id FROM held_items
+                WHERE username = ? AND status = 'held' AND kind = ?
+                  AND ifnull(album_id, -1) = ifnull(?, -1)
+                  AND ifnull(track_id, -1) = ifnull(?, -1)
+                  AND filename = ?
+                """,
+                (key, kind or "album", album, track, filename or ""),
+            ).fetchone()
+            if existing:
+                return
+            self._db.execute(
+                """
+                INSERT INTO held_items(
+                    username, kind, album_id, track_id, artist, title, filename, remote_dir, status, held_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'held', ?)
+                """,
+                (
+                    key,
+                    kind or "album",
+                    album,
+                    track,
+                    artist or "",
+                    title or "",
+                    filename or "",
+                    remote_dir or "",
+                    moment.isoformat(),
+                ),
+            )
+            self._db.commit()
+
+    def mark_held_replaced(self, *, album_id: int | None = None, track_id: int | None = None) -> None:
+        """Another source finished this album or track. Release will not search it again."""
+        with self._lock:
+            if album_id is not None:
+                self._db.execute(
+                    "UPDATE held_items SET status = 'replaced' WHERE status = 'held' AND album_id = ?",
+                    (int(album_id),),
+                )
+            if track_id is not None:
+                self._db.execute(
+                    "UPDATE held_items SET status = 'replaced' WHERE status = 'held' AND track_id = ?",
+                    (int(track_id),),
+                )
+            self._db.commit()
+
+    def release_user(self, username: str) -> list[dict]:
+        """Drop the hold now and return the items that were still waiting."""
+        key = (username or "").strip().casefold()
+        if not key:
+            return []
+        with self._lock:
+            items = self._held_item_rows_locked(key)
+            self._db.execute("DELETE FROM held_users WHERE username = ?", (key,))
+            self._db.execute("DELETE FROM user_failures WHERE username = ?", (key,))
+            self._db.execute(
+                "UPDATE held_items SET status = 'resumed' WHERE username = ? AND status = 'held'",
+                (key,),
+            )
+            self._db.commit()
+        return items
+
+    def release_expired(self, *, now: datetime | None = None) -> list[tuple[str, list[dict]]]:
+        """Release every user whose cooldown has ended. Returns (username, items) pairs."""
+        moment = now or datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        released: list[tuple[str, list[dict]]] = []
+        with self._lock:
+            rows = self._db.execute("SELECT username, until_at FROM held_users").fetchall()
+            for username, until_at in rows:
+                until = _cooldown_stamp(str(until_at or ""))
+                if until is None or until > moment:
+                    continue
+                items = self._held_item_rows_locked(str(username))
+                self._db.execute("DELETE FROM held_users WHERE username = ?", (username,))
+                self._db.execute("DELETE FROM user_failures WHERE username = ?", (username,))
+                self._db.execute(
+                    "UPDATE held_items SET status = 'resumed' WHERE username = ? AND status = 'held'",
+                    (username,),
+                )
+                released.append((str(username), items))
+            self._db.commit()
+        return released
+
+    def _held_item_rows_locked(self, username: str) -> list[dict]:
+        rows = self._db.execute(
+            """
+            SELECT id, username, kind, album_id, track_id, artist, title, filename, remote_dir, status, held_at
+            FROM held_items
+            WHERE username = ? AND status = 'held'
+            ORDER BY id
+            """,
+            (username,),
+        ).fetchall()
+        keys = (
+            "id",
+            "username",
+            "kind",
+            "album_id",
+            "track_id",
+            "artist",
+            "title",
+            "filename",
+            "remote_dir",
+            "status",
+            "held_at",
+        )
+        return [dict(zip(keys, row)) for row in rows]
+
+    def note_user_failure(self, username: str, *, now: datetime | None = None, window_minutes: int = 180) -> int:
+        """Record one failed attempt and return how many fall inside the window."""
+        key = (username or "").strip().casefold()
+        if not key:
+            return 0
+        moment = now or datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        window = max(1, int(window_minutes or 1))
+        cutoff = (moment - timedelta(minutes=window)).isoformat()
+        with self._lock:
+            self._db.execute("DELETE FROM user_failures WHERE created_at < ?", (cutoff,))
+            self._db.execute(
+                "INSERT INTO user_failures(username, created_at) VALUES(?, ?)",
+                (key, moment.isoformat()),
+            )
+            row = self._db.execute(
+                "SELECT COUNT(*) FROM user_failures WHERE username = ? AND created_at >= ?",
+                (key, cutoff),
+            ).fetchone()
+            self._db.commit()
+        return int(row[0] or 0)
+
+    def recent_user_failures(self, username: str, window_minutes: int = 180, *, now: datetime | None = None) -> int:
+        key = (username or "").strip().casefold()
+        if not key:
+            return 0
+        moment = now or datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        cutoff = (moment - timedelta(minutes=max(1, int(window_minutes or 1)))).isoformat()
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COUNT(*) FROM user_failures WHERE username = ? AND created_at >= ?",
+                (key, cutoff),
+            ).fetchone()
+        return int(row[0] or 0)
+
+    def set_hold_notice(self, username: str, title: str, body: str) -> None:
+        """One unseen hold notice per user. A later message replaces the text."""
+        user = (username or "").strip().lower()
+        title = (title or "").strip()
+        if not user or not title:
+            return
+        with self._lock:
+            row = self._db.execute(
+                """
+                SELECT id FROM events
+                WHERE seen = 0 AND kind = 'hold' AND username = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (user,),
+            ).fetchone()
+            if row:
+                self._db.execute(
+                    "UPDATE events SET title = ?, body = ? WHERE id = ?",
+                    (title, body or "", int(row[0])),
+                )
+            else:
+                now = datetime.now(timezone.utc).isoformat()
+                self._db.execute(
+                    """
+                    INSERT INTO events(kind, title, body, username, created_at, seen)
+                    VALUES('hold', ?, ?, ?, ?, 0)
+                    """,
+                    (title, body or "", user, now),
+                )
+            self._db.commit()
+
     def _artist_has_tag_locked(self, token: str, tag: str) -> bool:
         rows = self._db.execute(
             """
@@ -2913,6 +3254,11 @@ UPDATE wanted_rows SET
     content_hash = ?, payload = ?, track_json = ?, fold = ?
 WHERE key = ? AND content_hash != ?
 """
+
+
+def _held_record(row) -> dict:
+    keys = ("username", "display", "reason", "detail", "message", "held_at", "until_at")
+    return dict(zip(keys, row))
 
 
 def _row_tuple(row: dict) -> tuple:

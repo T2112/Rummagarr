@@ -88,9 +88,24 @@ async function load(){
   const elapsed = d.elapsed_text ? (' \\u00b7 ' + d.elapsed_text) : '';
   const mark = d.busy ? '\\u25cf ' : '\\u25cb ';
   const link = d.connected_label || (d.logged_in ? 'Soulseek connected' : 'Soulseek offline');
-  document.getElementById('job').textContent = mark + [link, activity].filter(Boolean).join(' \\u00b7 ') + elapsed;
+  const holds = Array.isArray(d.holds) ? d.holds : [];
+  let holdText = '';
+  if (holds.length) {
+    const name = holds[0].display || holds[0].username || 'a user';
+    holdText = holds.length === 1
+      ? (' \\u00b7 Holding ' + name + ' (needs reply)')
+      : (' \\u00b7 Holding ' + name + ' and ' + (holds.length - 1) + ' more (needs reply)');
+  }
+  document.getElementById('job').textContent = mark + [link, activity].filter(Boolean).join(' \\u00b7 ') + holdText + elapsed;
   const detail = document.getElementById('detail');
-  if (detail) detail.textContent = d.soulseek_detail || '';
+  if (detail) {
+    const notes = holds.map(function(row) {
+      const who = row.display || row.username || '';
+      const text = row.message || row.detail || '';
+      return text ? (who + ': ' + text) : '';
+    }).filter(Boolean);
+    detail.textContent = [d.soulseek_detail || '', notes.join(' | ')].filter(Boolean).join(' \\u00b7 ');
+  }
   const body=document.getElementById('rows'); body.innerHTML='';
   (d.transfers||[]).forEach((t,i)=>{
     const tr=document.createElement('tr');
